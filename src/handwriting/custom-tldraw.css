@@ -1,0 +1,385 @@
+/* 
+#_r7__more > button:nth-child(10) {
+  display: none !important;
+}
+#_r7__more > button:nth-child(9) {
+  display: none !important;
+}
+#radix-\:r2\: > div:nth-child(1) > button:nth-child(5) {
+  display: none !important;
+} */
+.tl-container {
+  --layer-above: 1;
+  --layer-focused-input: 10;
+  --layer-menu-click-capture: 250;
+  --layer-panels: 1;
+  --layer-menus: 400;
+  --layer-toasts: 650;
+  --layer-cursor: 700;
+  --layer-header-footer: 999;
+  --layer-following-indicator: 1000;
+}
+
+
+/* 添加以下样式 */
+.tldraw__editor {
+  .protyle-gutters {
+    /* top: 50px !important; */
+    /* left: 8px !important; */
+    display: none;
+  }
+
+  /* .protyle-content {
+    overflow: auto;
+    flex: 1;
+    scrollbar-gutter: stable;
+  } */
+
+  .protyle-toolbar {
+    top: 0 !important;
+    left: 0 !important;
+  }
+
+  .protyle-title {
+    margin: 15px 26px 0px !important;
+  }
+
+  .protyle-wysiwyg {
+    position: relative;
+    padding: 0px 0px 0px 8px !important;
+  }
+}
+
+
+
+[custom-st-tldraw="1"] {
+  background-color: #398ecd57;
+  color: #f9f9f985 !important;
+}
+
+/* 变扁一点：减少高度与字体 */
+[custom-st-tldraw="1"][data-subtype="h6"] {
+  display: inline-flex;
+  padding: 2px 6px;
+  /* 减少上下内边距以变矮 */
+  min-height: 20px;
+  max-height: 20px;
+  line-height: 16px;
+  /* pointer-events: auto; */
+  /* isolation: isolate; */
+  font-size: 12px !important;
+  /* 更小的字号 */
+  border-radius: 4px;
+  /* 更平的圆角 */
+  box-sizing: border-box;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.slide-name-input {
+  margin: 8px;
+  font-size: 16px;
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+  text-align: center;
+  /* Ensure visible despite global .tlui-input height:0 */
+  height: 28px !important;
+  line-height: 28px !important;
+  padding: 0 8px !important;
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--color-divider);
+  border-radius: 6px;
+  background-color: var(--color-panel);
+}
+
+.tl-html-container {
+  .protyle-wysiwyg [data-node-id].render-node {
+    min-height: auto !important;
+  }
+}
+
+
+
+.slides-panel {
+  /* ... 其他现有样式 ... */
+  max-height: 400px;
+  /* 设置一个最大高度，例如 400px */
+  overflow-y: auto;
+  /* 当内容超出最大高度时显示垂直滚动条 */
+  max-width: 120px;
+  /* 设置最大宽度，例如 320px */
+  word-break: break-all;
+  /* 长单词或URL换行 */
+  white-space: normal;
+  /* 允许文本换行 */
+  /* 根据主题设置背景色 */
+  background-color: var(--color-low);
+}
+
+
+
+/* 如果 'scroll-light' 类没有定义滚动条样式，你可以添加类似下面的规则 (适用于 Webkit 浏览器) */
+.slides-panel::-webkit-scrollbar {
+  width: 6px;
+  /* 滚动条宽度 */
+}
+
+.slides-panel::-webkit-scrollbar-thumb {
+  background-color: var(--color-muted-1);
+  /* 滚动条滑块颜色 */
+  border-radius: 3px;
+  /* 滚动条滑块圆角 */
+}
+
+.slides-panel::-webkit-scrollbar-track {
+  background-color: transparent;
+  /* 滚动条轨道背景色 */
+}
+
+.tlui-layout {
+  z-index: 1 !important;
+}
+
+/* 美化单块 (single-block) 的复选框行 */
+.tlui-style-panel__section .single-block-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: background-color 0.12s ease, transform 0.08s ease;
+}
+
+.tlui-style-panel__section .single-block-toggle:hover {
+  background-color: rgba(0, 0, 0, 0.03);
+}
+
+.single-block-checkbox {
+  width: 13px;
+  height: 13px;
+  margin: 4px;
+  padding: 0;
+  cursor: pointer;
+  accent-color: var(--color-primary, #398ecd);
+  border-radius: 4px;
+  flex: none;
+}
+
+.single-block-label {
+  font-size: 13px;
+  user-select: none;
+}
+
+/* 兼容较暗主题的细微样式 */
+@media (prefers-color-scheme: dark) {
+  .tlui-style-panel__section .single-block-toggle:hover {
+    background-color: rgba(255, 255, 255, 0.02);
+  }
+}
+
+.tl-background {
+  background: var(--b3-theme-background);
+}
+
+/* .tlui-main-toolbar__tools {
+  background: var(--b3-theme-surface)
+} */
+
+.tlui-main-toolbar__tools,
+.tlui-navigation-panel:before,
+.tlui-menu-zone,
+.tlui-menu,
+.tlui-popover__content,
+.tlui-style-panel__wrapper {
+  background-color: var(--b3-theme-surface);
+  box-shadow: 0px 0px 2px hsl(0, 0%, 0%, 16%), 0px 2px 3px hsl(0, 0%, 0%, 24%), 0px 2px 6px hsl(0, 0%, 0%, .1), inset 0px 0px 0px 1px var(--b3-theme-surface);
+  border-bottom: none;
+  border-right: none;
+  border-top: none;
+  border-right: none;
+}
+
+:root {
+  --tl-color-panel-contrast: var(--b3-theme-surface) !important;
+  /* 改成半透明黑色 */
+}
+
+/* 素材库面板样式 */
+.shape-library-panel {
+  background-color: var(--b3-theme-surface);
+  box-shadow: 0px 0px 2px hsl(0, 0%, 0%, 16%), 0px 2px 3px hsl(0, 0%, 0%, 24%), 0px 2px 6px hsl(0, 0%, 0%, .1), inset 0px 0px 0px 1px var(--b3-theme-surface);
+}
+
+.shape-library-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.shape-library-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.shape-library-panel::-webkit-scrollbar-thumb {
+  background-color: var(--b3-scroll-color);
+  border-radius: 3px;
+}
+
+.shape-library-panel input[type="text"] {
+  background-color: var(--b3-theme-background);
+  color: var(--b3-theme-on-background);
+  border: 1px solid var(--b3-border-color);
+}
+
+.shape-library-panel input[type="text"]:focus {
+  border-color: var(--b3-theme-primary);
+}
+
+.shape-library-panel button {
+  transition: all 0.15s ease;
+}
+
+.shape-library-panel button:hover {
+  opacity: 0.8;
+}
+
+/* 贝塞尔连接器端口样式：小型实心点 */
+/* Small visible dot + larger clickable area (pseudo element) */
+.bezier-connector-port {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  /* 默认实心颜色 - 使用 tldraw 主题变量作为回退值而非自定义十六进制颜色 */
+  background: var(--color-text-3, var(--color-text));
+  border: none;
+  /* 去掉外边框，使用实心点 */
+  box-sizing: border-box;
+  z-index: 999;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  flex: 0 0 auto;
+  transition: transform 0.08s ease-in-out, background-color 0.12s ease, opacity 0.12s ease;
+  cursor: crosshair;
+  /* pointer events controlled by inline styles in the Port component so that the
+   * ports are only interactive when they should be (e.g. parentHovered or connected)
+   */
+}
+
+/* 输入端口（左侧） */
+.bezier-connector-port--input {
+  /* 保留类，定位由组件内联样式控制 */
+  /* 在需要的情况下保留微调位移（覆盖内联时使用） */
+  left: -7px;
+}
+
+/* 输出端口（右侧） */
+.bezier-connector-port--output {
+  right: -7px;
+}
+
+/* 被指向时高亮 */
+.bezier-connector-port--hinting {
+  background: var(--color-selected, #3d8aff);
+  transform: translateY(-50%) scale(1.6);
+  box-shadow: 0 0 0 4px rgba(61, 138, 255, 0.12);
+}
+
+/* 可连接目标高亮 */
+.bezier-connector-port--eligible {
+  background: var(--color-selected, #3d8aff);
+  box-shadow: 0 0 0 6px rgba(61, 138, 255, 0.12);
+}
+
+/* 端口覆盖层容器 */
+.bezier-connector-ports-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 10;
+}
+
+/* 贝塞尔连接器形状样式 */
+.BezierConnectorShape path {
+  stroke-linecap: round;
+  fill: none;
+}
+
+/* 标签交互层：用于拖拽与双击编辑 */
+.tl-shape[data-shape-type='bezier-connector'] .bezier-connector-label-overlay {
+  /* 不遮挡编辑态的输入框：编辑态时由内联 pointerEvents 控制 */
+  z-index: 2;
+}
+
+.tl-shape[data-shape-type='bezier-connector'] .bezier-connector-label-overlay:active {
+  cursor: grabbing;
+}
+
+/* ========== 贝塞尔连接器文字标签样式 ========== */
+/* 模拟 tldraw 箭头形状的标签定位方式 */
+.tl-shape[data-shape-type='bezier-connector'] .tl-text-label {
+  position: absolute;
+  /* 从一个小参考点开始，由 transform 控制实际位置 */
+  top: -1px;
+  left: -1px;
+  width: 2px;
+  height: 2px;
+  padding: 0px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  color: var(--tl-color-text);
+}
+
+.tl-shape[data-shape-type='bezier-connector'] .tl-text-label__inner {
+  border-radius: var(--tl-radius-1);
+  box-sizing: content-box;
+  height: max-content;
+  width: max-content;
+}
+
+.tl-shape[data-shape-type='bezier-connector'] .tl-text {
+  height: max-content;
+}
+
+/* Expand hit area using a transparent pseudo-element so that the small visible dot
+ * stays the same size, but the clickable/touch target becomes easier to hit.
+ */
+.bezier-connector-port::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  /* Accessible hit area: 28px (approx 11mm on typical displays) */
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: transparent;
+  /* Allow pointer events on the pseudo element (the parent controls whether
+   * the port should be interactive via inline style), this expands the target.
+   */
+  pointer-events: inherit;
+}
+
+/* Slightly enlarge the hit area when hinting/eligible for better UX */
+.bezier-connector-port--eligible::after,
+.bezier-connector-port--hinting::after {
+  width: 40px;
+  height: 40px;
+}
+
+/* 成功连接后短暂高亮效果 */
+.bezier-connector-port--flash {
+  box-shadow: 0 0 0 10px rgba(61, 138, 255, 0.18), 0 1px 2px rgba(0, 0, 0, 0.12);
+  background: var(--color-selected, #3d8aff);
+}
+
+.bezier-connector-port--flash::after {
+  width: 48px;
+  height: 48px;
+}

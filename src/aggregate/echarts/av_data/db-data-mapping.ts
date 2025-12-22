@@ -1,0 +1,172 @@
+/**
+ * 数据库模式下的数据映射逻辑（纯函数，不依赖 DOM）。
+ * 将可视化选择（xKey、排序、合并/非合并、系列聚合）映射为 x 轴与各系列的表达式字符串。
+ */
+
+import { FilterCondition, buildFilterExpression } from '../ui/filter-manager';
+
+export type SortOrder = 'none' | 'asc' | 'desc';
+export type SeriesAgg = 'raw' | 'count' | 'sum' | 'avg' | 'min' | 'max';
+
+// 重新导出 FilterCondition 以保持向后兼容
+export type { FilterCondition };
+
+export interface SeriesItem {
+  name: string;
+  expr: string;
+  type?: 'line' | 'bar' | 'scatter' | 'pie';
+  axisIndex?: number;
+  valueKey?: string;
+  agg?: SeriesAgg;
+  filter?: string; // 数据筛选表达式，例如："r.created > '2024-01-01'"
+  filters?: FilterCondition[]; // 可视化筛选条件
+  label?: { show?: boolean; position?: string };
+}
+
+export interface MappingInput {
+  visualMode: boolean;
+  mergeMode: boolean;
+  sort: SortOrder;
+  xKey: string;
+  bucket?: 'none' | 'year' | 'month' | 'day' | 'hour';
+  series: SeriesItem[];
+}
+
+export interface MappingOutput {
+  xExpr: string;
+  series: SeriesItem[];
+}
+
+/**
+ * 基于可视化配置构建 x 轴表达式与每个系列的数据表达式。
+ * 保持与原 UI 实现一致的字符串模板（包括 toNum 与排序逻辑）。
+ */
+export function buildDbMappingExpressions(input: MappingInput): MappingOutput {
+  const { visualMode, mergeMode, sort, xKey, series } = input;
+  const bucket = input.bucket || 'none';
+
+  // 将时间戳/日期字符串转为桶键与可读标签
+  const bucketFns = {
+    year: `function __bucketKey(v){ var n=Number(v); if(!isFinite(n)){ var d=new Date(String(v)); if(isNaN(+d)) return null; n=d.getTime(); } var d=new Date(n); return String(d.getFullYear()); };
+           function __bucketLabel(k){ return k; }`,
+    month: `function __bucketKey(v){ var n=Number(v); if(!isFinite(n)){ var d=new Date(String(v)); if(isNaN(+d)) return null; n=d.getTime(); } var d=new Date(n); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); };
+             function __bucketLabel(k){ return k; }`,
+    day: `function __bucketKey(v){ var n=Number(v); if(!isFinite(n)){ var d=new Date(String(v)); if(isNaN(+d)) return null; n=d.getTime(); } var d=new Date(n); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
+           function __bucketLabel(k){ return k; }`,
+    hour: `function __bucketKey(v){ var n=Number(v); if(!isFinite(n)){ var d=new Date(String(v)); if(isNaN(+d)) return null; n=d.getTime(); } var d=new Date(n); return String(d.getHours()).padStart(2,'0'); };
+      function __bucketLabel(k){ return String(k).padStart(2,'0')+':00'; }`
+  } as const;
+
+  if (!visualMode) {
+    // 可视化关闭时不改写表达式，沿用原 series.expr 与外部 xExpr
+    return { xExpr: '', series: series.slice() };
+  }
+
+  if (mergeMode) {
+    const bucketPrelude = bucket==='none' ? '' : bucketFns[bucket as 'year'|'month'|'day'|'hour'];
+    // 合并模式：唯一化并聚合
+    const xExprRaw = (!xKey)
+      ? 'rows.map((_, i) => String(i+1))'
+      : (bucket==='none'
+        ? `Array.from(new Set(rows.flatMap(function(r){ var xv = r[${JSON.stringify(xKey)}]; if (Array.isArray(xv)) return xv.map(function(it){ return String(it); }); return [String(xv)]; })))`
+        : `(()=>{ ${bucketPrelude} var set = new Set(); rows.forEach(function(r){ var xv=r[${JSON.stringify(xKey)}]; if(Array.isArray(xv)) xv.forEach(function(it){ var k=__bucketKey(it); if(k!=null) set.add(k); }); else { var k=__bucketKey(xv); if(k!=null) set.add(k); } }); return Array.from(set); })()`);
+
+    const xExprSorted = (() => {
+      if (sort === 'none') return xExprRaw;
+      const asc = sort === 'asc';
+      return `(()=>{ var arr = (${xExprRaw}).slice(); arr.sort(function(a,b){ if(a===b) return 0; return (a>b?1:-1)*${asc ? 1 : -1}; }); return arr; })()`;
+    })();
+
+    const catsDef = (bucket==='none')
+      ? `(function(){ var cats = (${xExprSorted}); return cats; })()`
+      : `(function(){ var raw=(${xExprSorted}); ${bucketPrelude} return raw.map(function(k){ return __bucketLabel(k); }); })()`;
+
+    const mapped = series.map((s) => {
+      const key = s.valueKey || xKey;
+      const agg = s.agg || 'count';
+      let dataExpr = '';
+      // 优先使用可视化筛选条件，否则使用手动表达式
+      const filterCondition = s.filters && s.filters.length > 0 ? buildFilterExpression(s.filters) : s.filter;
+      const filterExpr = filterCondition ? `.filter(function(r){ try { return (${filterCondition}); } catch(e) { return true; } })` : '';
+      if (!key) {
+        dataExpr = `${catsDef}.map(()=>0)`;
+      } else if (agg === 'count') {
+        if (bucket==='none') {
+          dataExpr = `${catsDef}.map(function(c){ return rows${filterExpr}.filter(function(r){ var xv = r[${JSON.stringify(xKey)}]; return Array.isArray(xv) ? xv.some(function(it){ return String(it)===c; }) : String(xv)===c; }).length; })`;
+        } else {
+          dataExpr = `(function(){ ${bucketPrelude} var cats = (${xExprSorted}); var filteredRows = rows${filterExpr}; return cats.map(function(k){ var cnt=0; filteredRows.forEach(function(r){ var xv=r[${JSON.stringify(xKey)}]; if(Array.isArray(xv)) xv.forEach(function(it){ if(__bucketKey(it)===k) cnt++; }); else { if(__bucketKey(xv)===k) cnt++; } }); return cnt; }); })()`;
+        }
+      } else if (agg === 'sum') {
+        const filterExpr = s.filter ? `.filter(function(r){ try { return (${s.filter}); } catch(e) { return true; } })` : '';
+        if (bucket==='none') {
+          dataExpr = `(function(){ var cats = (${xExprSorted}); function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(c){ return rows${filterExpr}.filter(function(r){ var xv=r[${JSON.stringify(xKey)}]; return Array.isArray(xv)? xv.some(function(it){return String(it)===c;}) : String(xv)===c; }).reduce(function(a,b){ var n=toNum(b[${JSON.stringify(key)}]); return a + (n==null?0:n); },0); }); })()`;
+        } else {
+          dataExpr = `(function(){ ${bucketPrelude} var cats = (${xExprSorted}); var filteredRows = rows${filterExpr}; function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(k){ var sum=0; filteredRows.forEach(function(r){ var xv=r[${JSON.stringify(xKey)}]; var ok=false; if(Array.isArray(xv)) ok=xv.some(function(it){ return __bucketKey(it)===k; }); else ok=__bucketKey(xv)===k; if(ok){ var n=toNum(r[${JSON.stringify(key)}]); sum += (n==null?0:n); } }); return sum; }); })()`;
+        }
+      } else if (agg === 'avg') {
+        const filterExpr = s.filter ? `.filter(function(r){ try { return (${s.filter}); } catch(e) { return true; } })` : '';
+        if (bucket==='none') {
+          dataExpr = `(function(){ var cats = (${xExprSorted}); function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(c){ var arr = rows${filterExpr}.filter(function(r){ var xv=r[${JSON.stringify(xKey)}]; return Array.isArray(xv)? xv.some(function(it){return String(it)===c;}) : String(xv)===c; }).map(function(b){ return toNum(b[${JSON.stringify(key)}]); }).filter(function(v){ return v!=null; }); return arr.length? (arr.reduce(function(a,b){return a+b;},0)/arr.length):0; }); })()`;
+        } else {
+          dataExpr = `(function(){ ${bucketPrelude} var cats = (${xExprSorted}); var filteredRows = rows${filterExpr}; function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(k){ var arr = []; filteredRows.forEach(function(r){ var xv=r[${JSON.stringify(xKey)}]; var ok=false; if(Array.isArray(xv)) ok=xv.some(function(it){ return __bucketKey(it)===k; }); else ok=__bucketKey(xv)===k; if(ok){ var n=toNum(r[${JSON.stringify(key)}]); if(n!=null) arr.push(n); } }); return arr.length? (arr.reduce(function(a,b){return a+b;},0)/arr.length):0; }); })()`;
+        }
+      } else if (agg === 'min') {
+        const filterExpr = s.filter ? `.filter(function(r){ try { return (${s.filter}); } catch(e) { return true; } })` : '';
+        if (bucket==='none') {
+          dataExpr = `(function(){ var cats = (${xExprSorted}); function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(c){ var arr = rows${filterExpr}.filter(function(r){ var xv=r[${JSON.stringify(xKey)}]; return Array.isArray(xv)? xv.some(function(it){return String(it)===c;}) : String(xv)===c; }).map(function(b){ return toNum(b[${JSON.stringify(key)}]); }).filter(function(v){ return v!=null; }); return arr.length? Math.min.apply(null, arr):0; }); })()`;
+        } else {
+          dataExpr = `(function(){ ${bucketPrelude} var cats = (${xExprSorted}); var filteredRows = rows${filterExpr}; function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(k){ var arr = []; filteredRows.forEach(function(r){ var xv=r[${JSON.stringify(xKey)}]; var ok=false; if(Array.isArray(xv)) ok=xv.some(function(it){ return __bucketKey(it)===k; }); else ok=__bucketKey(xv)===k; if(ok){ var n=toNum(r[${JSON.stringify(key)}]); if(n!=null) arr.push(n); } }); return arr.length? Math.min.apply(null, arr):0; }); })()`;
+        }
+      } else if (agg === 'max') {
+        const filterExpr = s.filter ? `.filter(function(r){ try { return (${s.filter}); } catch(e) { return true; } })` : '';
+        if (bucket==='none') {
+          dataExpr = `(function(){ var cats = (${xExprSorted}); function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(c){ var arr = rows${filterExpr}.filter(function(r){ var xv=r[${JSON.stringify(xKey)}]; return Array.isArray(xv)? xv.some(function(it){return String(it)===c;}) : String(xv)===c; }).map(function(b){ return toNum(b[${JSON.stringify(key)}]); }).filter(function(v){ return v!=null; }); return arr.length? Math.max.apply(null, arr):0; }); })()`;
+        } else {
+          dataExpr = `(function(){ ${bucketPrelude} var cats = (${xExprSorted}); var filteredRows = rows${filterExpr}; function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return cats.map(function(k){ var arr = []; filteredRows.forEach(function(r){ var xv=r[${JSON.stringify(xKey)}]; var ok=false; if(Array.isArray(xv)) ok=xv.some(function(it){ return __bucketKey(it)===k; }); else ok=__bucketKey(xv)===k; if(ok){ var n=toNum(r[${JSON.stringify(key)}]); if(n!=null) arr.push(n); } }); return arr.length? Math.max.apply(null, arr):0; }); })()`;
+        }
+      } else {
+        // 原值在合并模式下不提供
+        dataExpr = `${catsDef}.map(()=>0)`;
+      }
+      return { ...s, expr: dataExpr } as SeriesItem;
+    });
+
+    return { xExpr: xExprSorted, series: mapped };
+  }
+
+  // 非合并模式：逐行（原值），支持排序时的重排
+  const baseArr = (!xKey)
+    ? 'rows.map((_, i) => String(i+1))'
+    : (bucket==='none'
+      ? `rows.map(function(r){ var xv = r[${JSON.stringify(xKey)}]; return Array.isArray(xv) ? xv.join(',') : xv; })`
+      : `(()=>{ ${bucketFns[bucket as 'year'|'month'|'day'|'hour']} return rows.map(function(r){ var xv=r[${JSON.stringify(xKey)}]; if(Array.isArray(xv)){ var set=new Set(); xv.forEach(function(it){ var k=__bucketKey(it); if(k!=null) set.add(k); }); return Array.from(set).join(','); } var k=__bucketKey(xv); return k==null?null:k; })()`) ;
+
+  let xExprFinal = baseArr;
+  let idxsExpr = '';
+  if (sort !== 'none') {
+    const asc = sort === 'asc';
+    idxsExpr = `(()=>{ var a = (${baseArr}); var idx = a.map(function(_,i){return i}); idx.sort(function(i,j){ var x=a[i], y=a[j]; if(x===y) return 0; return (x>y?1:-1)*${asc ? 1 : -1}; }); return idx; })()`;
+    xExprFinal = `(()=>{ var a = (${baseArr}); var idx = ${idxsExpr}; return idx.map(function(i){ return a[i]; }); })()`;
+  }
+
+  const catsDef = (bucket==='none')
+    ? `(function(){ var cats = (${xExprFinal}); return cats; })()`
+    : `(function(){ var raw = (${xExprFinal}); ${bucketFns[bucket as 'year'|'month'|'day'|'hour']} return (raw||[]).map(function(k){ return __bucketLabel(k); }); })()`;
+  const mapped = series.map((s) => {
+    const key = s.valueKey || xKey;
+    // 优先使用可视化筛选条件，否则使用手动表达式
+    const filterCondition = s.filters && s.filters.length > 0 ? buildFilterExpression(s.filters) : s.filter;
+    const filterExpr = filterCondition ? `.filter(function(r){ try { return (${filterCondition}); } catch(e) { return true; } })` : '';
+    let dataExpr = '';
+    if (!key) {
+      dataExpr = `${catsDef}.map(()=>0)`;
+    } else if (idxsExpr) {
+      dataExpr = `(function(){ var filteredRows = rows${filterExpr}; var a = (${baseArr}); var idx = a.map(function(_,i){return i}); idx.sort(function(i,j){ var x=a[i], y=a[j]; if(x===y) return 0; return (x>y?1:-1)*${sort === 'asc' ? 1 : -1}; }); function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } var result=[]; for(var i=0;i<idx.length;i++){ var origIdx=idx[i]; var foundInFiltered=false; for(var j=0;j<filteredRows.length;j++){ if(filteredRows[j]===rows[origIdx]){ foundInFiltered=true; break; } } if(foundInFiltered){ var v=rows[origIdx][${JSON.stringify(key)}]; var n=toNum(v); result.push(n==null?0:n); } else { result.push(0); } } return result; })()`;
+    } else {
+      dataExpr = `(function(){ var filteredRows = rows${filterExpr}; function toNum(x){ if(x==null) return null; if(Array.isArray(x)) return x.length; if(typeof x==='number') return isFinite(x)?x:null; if(typeof x==='boolean') return x?1:0; var s=String(x).trim(); if(!s) return null; s=s.replace(/,/g,''); var m=s.match(/^(-?\\d+(?:\\.\\d+)?)(%)$/); if(m) return parseFloat(m[1])/100; var n=Number(s); if(!isNaN(n)) return n; var m2=s.match(/-?\\d+(?:\\.\\d+)?/); return m2?parseFloat(m2[0]):null; } return rows.map(function(r){ var foundInFiltered=false; for(var i=0;i<filteredRows.length;i++){ if(filteredRows[i]===r){ foundInFiltered=true; break; } } if(!foundInFiltered) return 0; var n=toNum(r[${JSON.stringify(key)}]); return n==null?0:n; }); })()`;
+    }
+    return { ...s, agg: 'raw', expr: dataExpr } as SeriesItem;
+  });
+
+  return { xExpr: xExprFinal, series: mapped };
+}

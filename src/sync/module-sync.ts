@@ -1,0 +1,80 @@
+import steveTools from "@/index";
+import * as api from "@/api/api"
+import { showMessage } from "siyuan";
+declare const siyuan: any;
+
+let url = "";
+let token = "";
+
+//TODO: 目前只能单向感知，即只能docker端感知到本地端的变化，不能本地端感知到docker端的变化
+export class M_sync {
+    private plugin: steveTools;
+    constructor(plugin: steveTools) {
+        this.plugin = plugin;
+    }
+
+    init = async (settingdata) => {
+        // steveTools.outlog("同步模块初始化中...");
+        // this.settingdata = settingdata;
+        url = settingdata["sync-url"];
+        token = settingdata["sync-token"];
+        // console.log("url: ", url);
+        // console.log("token: ", token);
+        siyuan.ws.ws.addEventListener('message', async (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.cmd === "syncing") {
+                // console.log(msg);
+                if (msg.msg && msg.msg.startsWith('上传')) {
+                    console.log("同步结束");
+                    //延时1s再同步
+                    const currentHost = window.location.host;
+                    if (url.includes(currentHost)) {
+                        console.log("取消感知");
+                    } else {
+                        setTimeout(async () => {
+                            try {
+                                let originalIcon = "";
+                                const iconElement = document.querySelector('#plugin_siyuan-steve-tools_0 svg use');
+                                if (iconElement) {
+                                    // 临时改变图标
+                                    originalIcon = iconElement.getAttribute('xlink:href');
+                                    iconElement.setAttribute('xlink:href', '#iconHistory');
+                                }
+                                const state = await api.URLsync(url, token);
+                                // console.log("state: ", state);
+                                if (state) {
+                                    console.log("docker感知成功");//OK：后面改为图标交互
+                                    if (originalIcon) { // 确保 originalIcon 不为空
+                                        iconElement.setAttribute('xlink:href', originalIcon);
+                                    }
+                                } else {
+                                    showMessage("docker同步感知失败");
+                                }
+                            }
+                            catch (e) {
+                                showMessage("docker感知同步失败: " + e, -1, "error");
+                            }
+                        }, 1000);
+                    }
+
+                }
+
+            }
+            // console.log(msg);
+        });
+
+        // steveTools.outlog("同步模块初始化完成");
+    }
+
+    async testSync() {
+        // steveTools.outlog("测试同步...");
+        let res: any = await api.testSync(url, token);
+        console.log("res: ", res);
+        if (res) {
+            showMessage("成功");
+        } else {
+            showMessage("失败");
+        }
+    }
+
+}
