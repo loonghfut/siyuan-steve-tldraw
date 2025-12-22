@@ -14,16 +14,16 @@ STEVETOOLS—TLDRAW
 
 #### 使用方式（[更多使用细节](https://ld246.com/search?q=STtools%20%E6%8F%92%E4%BB%B6%EF%BC%9A%E7%99%BD%E6%9D%BF)）
 1. 打开插件
-![alt text](image.png)
+![alt text](https://github.com/loonghfut/siyuan-steve-tldraw/blob/main-2/image.png?raw=true)
 
 2. 点击文档右上角按钮，进入白板
-![alt text](image-1.png)
+![alt text](https://github.com/loonghfut/siyuan-steve-tldraw/blob/main-2/image-1.png?raw=true)
 
 3. 基本用法和tldraw白板一致
 
 4. 删除白板
 要删除白板应先删除对应的文档，然后在设置面板里删除
-![alt text](image-2.png)
+![alt text](https://github.com/loonghfut/siyuan-steve-tldraw/blob/main-2/image-2.png?raw=true)
 
 #### 打赏
 如果你觉得这个项目对你有帮助，欢迎打赏，以激励我更好的维护和更新这个项目。  

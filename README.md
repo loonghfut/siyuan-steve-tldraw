@@ -14,16 +14,16 @@ STEVETOOLS—TLDRAW
 
 #### Usage ([More usage details](https://ld246.com/search?q=STtools%20%E6%8F%92%E4%BB%B6%EF%BC%9A%E7%99%BD%E6%9D%BF))
 1. Open the plugin  
-![alt text](image.png)
+![alt text](https://github.com/loonghfut/siyuan-steve-tldraw/blob/main-2/image.png?raw=true)
 
 2. Click the button at the top-right of the document to enter the whiteboard  
-![alt text](image-1.png)
+![alt text](https://github.com/loonghfut/siyuan-steve-tldraw/blob/main-2/image-1.png?raw=true)
 
 3. Basic usage is the same as the tldraw whiteboard
 
 4. Delete a whiteboard
 To delete a whiteboard, first delete the associated document, then remove it from the Settings panel.  
-![alt text](image-2.png)
+![alt text](https://github.com/loonghfut/siyuan-steve-tldraw/blob/main-2/image-2.png?raw=true)
 
 #### Support / Donate
 If you find this project helpful, donations are welcome to encourage better maintenance and updates.  
