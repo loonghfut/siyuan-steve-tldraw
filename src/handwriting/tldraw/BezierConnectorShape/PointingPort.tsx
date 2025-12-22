@@ -54,15 +54,15 @@ export class PointingPort extends StateNode {
 
 	override onPointerMove(info: TLPointerEventInfo): void {
 		if (!this.info) {
-			console.log('[PointingPort] onPointerMove: no info')
+			//console.log('[PointingPort] onPointerMove: no info')
 			return
 		}
 		if (!this.editor.inputs.isDragging) {
-			console.log('[PointingPort] onPointerMove: not dragging yet')
+			//console.log('[PointingPort] onPointerMove: not dragging yet')
 			return
 		}
 
-		console.log('[PointingPort] onPointerMove: isDragging=true, creating connection')
+		//console.log('[PointingPort] onPointerMove: isDragging=true, creating connection')
 		const currentPoint = this.editor.inputs.currentPagePoint
 
 		// 查找当前位置的端口
@@ -106,12 +106,12 @@ export class PointingPort extends StateNode {
 		const connectingTerminal = this.info.terminal
 		const draggingTerminal = connectingTerminal === 'start' ? 'end' : 'start'
 
-		console.log('[PointingPort] Creating bezier-connector shape:', connectionShapeId)
+		//console.log('[PointingPort] Creating bezier-connector shape:', connectionShapeId)
 
 		// 获取源端口的页面位置作为连接起点
 		const sourceShape = this.editor.getShape(this.info.shapeId)
 		if (!sourceShape) {
-			console.log('[PointingPort] Source shape not found!')
+			//console.log('[PointingPort] Source shape not found!')
 			return
 		}
 
@@ -120,7 +120,7 @@ export class PointingPort extends StateNode {
 		const ports = getShapePorts(this.editor, sourceShape)
 		const sourcePort = ports?.[this.info.portId]
 		if (!sourcePort) {
-			console.log('[PointingPort] Source port not found!')
+			//console.log('[PointingPort] Source port not found!')
 			return
 		}
 		const sourcePortPagePos = sourceShapeTransform.applyToPoint(sourcePort)
@@ -146,7 +146,7 @@ export class PointingPort extends StateNode {
 			},
 		})
 
-		console.log('[PointingPort] Shape created, getting handles')
+		//console.log('[PointingPort] Shape created, getting handles')
 
 		// 绑定一端到起始端口
 		createOrUpdateConnectorBinding(this.editor, connectionShapeId, this.info.shapeId, {
@@ -154,19 +154,19 @@ export class PointingPort extends StateNode {
 			terminal: connectingTerminal,
 		})
 
-		console.log('[PointingPort] Binding created')
+		//console.log('[PointingPort] Binding created')
 
 		// 切换到拖动另一端
 		const handles = this.editor.getShapeHandles(connectionShapeId)
-		console.log('[PointingPort] Handles:', handles)
+		//console.log('[PointingPort] Handles:', handles)
 		const handle = handles?.find((h) => h.id === draggingTerminal)
-		console.log('[PointingPort] Target handle:', handle)
+		//console.log('[PointingPort] Target handle:', handle)
 
 		if (handle) {
 			const connectionShape = this.editor.getShape(connectionShapeId)
-			console.log('[PointingPort] Connection shape:', connectionShape)
+			//console.log('[PointingPort] Connection shape:', connectionShape)
 			if (connectionShape) {
-				console.log('[PointingPort] Transitioning to dragging_handle')
+				//console.log('[PointingPort] Transitioning to dragging_handle')
 				this.parent.transition('dragging_handle', {
 					...info,
 					target: 'handle',
@@ -177,7 +177,7 @@ export class PointingPort extends StateNode {
 				})
 			}
 		} else {
-			console.log('[PointingPort] No handle found!')
+			//console.log('[PointingPort] No handle found!')
 		}
 	}
 
