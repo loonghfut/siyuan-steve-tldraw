@@ -21,7 +21,9 @@ STEVETOOLS—TLDRAW
 
 3. Basic usage is the same as the tldraw whiteboard
 
-
+4. Delete a whiteboard
+To delete a whiteboard, first delete the associated document, then remove it from the Settings panel.  
+![alt text](image-2.png)
 
 #### Support / Donate
 If you find this project helpful, donations are welcome to encourage better maintenance and updates.  
