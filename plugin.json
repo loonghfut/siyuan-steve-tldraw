@@ -1,8 +1,8 @@
 {
-  "name": "siyuan-steve-tools",
+  "name": "siyuan-steve-tldraw",
   "author": "steve",
-  "url": "https://github.com/loonghfut/siyuan-steve-tools",
-  "version": "0.30.0",
+  "url": "https://github.com/loonghfut/siyuan-steve-tldraw",
+  "version": "1.0.0",
   "minAppVersion": "3.5.1",
   "disabledInPublish": true,
   "backends": [
@@ -12,12 +12,12 @@
     "all"
   ],
   "displayName": {
-    "default": "STtools",
-    "zh_CN": "STtools"
+    "default": "STtldraw",
+    "zh_CN": "ST白板"
   },
   "description": {
-    "default": "schedule management, docker sync awareness, ai sidebar",
-    "zh_CN": "互联日程管理（基于数据库的看板视图和日历视图）支持ics，qq邮箱日历，滴答清单双向联动, docker同步感知, ai侧边栏, 资源压缩, 白板, WPS联动, （SQL，数据库）聚合可视化, 随机题头图背景图。"
+    "default": "(Split from STtools plugin) Integrate tldraw whiteboard tool, deeply linked with Siyuan Note, with interaction part borrowed from affine",
+    "zh_CN": "(拆分自STtools插件)集成 tldraw 白板工具，深度联动思源笔记，交互部分借鉴affine"
   },
   "readme": {
     "default": "README.md",
@@ -29,9 +29,11 @@
     ]
   },
   "keywords": [
-    "tools",
-    "schedule",
-    "calendar",
-    "st"
+    "白板",
+    "whiteboard",
+    "handwriting",
+    "drawing",
+    "sketch",
+    "mindmap"
   ]
 }
