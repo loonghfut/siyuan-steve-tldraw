@@ -41,13 +41,13 @@ import { setupShapeLibraryDropHandler } from './shapelibrary/ShapeLibraryPanel';
 import { buildTldrawLink } from './utils/link-builder';
 import { setInteracting } from './utils/idle-scheduler';
 const assetUrls = getAssetUrls({
-    baseUrl: 'plugins/siyuan-steve-tools/asset/',
+    baseUrl: 'plugins/siyuan-steve-tldraw/asset/',
 })
 
 // 为返回的 assetUrls 添加自定义图标映射（运行时赋值以避免类型定义冲突）
 try {
-    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tools/asset/icons/custom/mindmap.svg';
-    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tools/asset/icons/custom/iconParagraph.svg';
+    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/mindmap.svg';
+    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/iconParagraph.svg';
 } catch (err) {
     console.warn('无法在 assetUrls 上添加 custom-icon 映射', err);
 }

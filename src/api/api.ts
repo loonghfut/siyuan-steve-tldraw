@@ -7,7 +7,7 @@
  */
 
 import { fetchPost, fetchSyncPost, IOperation, IWebSocketData, Protyle, showMessage } from "siyuan";
-import { ISelectOption } from "@/calendar/interface";
+// import { ISelectOption } from "@/calendar/interface";
 import { settingdata } from "..";
 import { AVManager } from "./db_pro";
 // 创建 AVManager 实例 - 可以根据需要进行配置
@@ -916,7 +916,7 @@ export async function updateAttrViewCell_pro(
     avID: string,
     keyID: string,
     itemID: string,
-    value: string | Date | ISelectOption[] | boolean | {
+    value: string | Date  | boolean | {
         itemID: string,
         content: string,
         oldrelation: {
@@ -1094,7 +1094,7 @@ async function handlePostBatchUpdateActions(avID: string) {
 // 刷新属性视图
 async function refreshAttributeView(avID: string) {
     try {
-        refreshKanban();
+        // refreshKanban();
         // console.log(`🔄 [视图刷新] 成功刷新视图，avID: ${avID}`);
     } catch (error) {
         console.warn(`⚠️ [视图刷新] 刷新视图失败，avID: ${avID}`, error);
@@ -1137,7 +1137,7 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
 
         case 'select':
             processedValue = {
-                mSelect: (value as ISelectOption[]).map(option => ({
+                mSelect: (value as any[]).map(option => ({
                     content: option.content,
                     color: option.color
                 }))
@@ -1146,7 +1146,7 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
 
         case 'mSelect':
             processedValue = {
-                mSelect: (value as ISelectOption[]).map(option => ({
+                mSelect: (value as any[]).map(option => ({
                     content: option.content,
                     color: option.color
                 }))
@@ -1290,7 +1290,7 @@ async function getDateTimestamps(dateStr: string): Promise<{ start: number, end:
     }
 }
 
-import { refreshKanban } from "@/calendar/kanban";
+// import { refreshKanban } from "@/calendar/kanban";
 
 
 
