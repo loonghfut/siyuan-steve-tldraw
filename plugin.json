@@ -16,7 +16,7 @@
     "zh_CN": "ST白板"
   },
   "description": {
-    "default": "(Split from STtools plugin) Integrate tldraw whiteboard tool, deeply linked with Siyuan Note, with interaction part borrowed from affine",
+    "default": "(Split from STtools plugin) Integrate tldraw whiteboard tool, deeply linked with SiYuan Note, with interaction part borrowed from affine",
     "zh_CN": "(拆分自STtools插件)集成 tldraw 白板工具，深度联动思源笔记，交互部分借鉴affine"
   },
   "readme": {
