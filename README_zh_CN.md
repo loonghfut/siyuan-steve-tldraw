@@ -7,3 +7,5 @@ STEVETOOLS—TLDRAW
 
 #### 拆分自STtools插件
 
+## 请不要把此插件和STtools插件共用，可能会有未知BUG
+
