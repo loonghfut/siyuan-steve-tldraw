@@ -85,7 +85,7 @@ export async function restoreBackup(path: string, id: string): Promise<boolean> 
     try {
         // 获取备份文件内容
         let data = await api.getFile(path);
-        //console.log('备份文件内容:', data);
+        console.debug('备份文件内容:', data);
         // 转化JSON对象为字符串
         if (typeof data === 'object') {
             data = JSON.stringify(data);
@@ -118,7 +118,7 @@ export async function getBackupPreview(path: string): Promise<BackupPreview> {
         }
 
         // Normalize candidate document object
-        const doc = (data as any)?.document ?? data;
+        const doc = data?.document ?? data;
 
         // TLDraw snapshots may use different layouts.
         // 1) Newer snapshots often put shapes/pages under `doc.store` as keys like 'shape:ID' / 'page:ID'.

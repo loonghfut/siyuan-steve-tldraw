@@ -40,14 +40,15 @@ import { tldrawkey } from '@/../my/key';
 import { setupShapeLibraryDropHandler } from './shapelibrary/ShapeLibraryPanel';
 import { buildTldrawLink } from './utils/link-builder';
 import { setInteracting } from './utils/idle-scheduler';
+import { whiteboardFilesUpdated } from './whiteboards.store';
 const assetUrls = getAssetUrls({
-    baseUrl: 'plugins/siyuan-steve-tldraw/asset/',
+    baseUrl: 'plugins/siyuan-steve-tools/asset/',
 })
 
 // 为返回的 assetUrls 添加自定义图标映射（运行时赋值以避免类型定义冲突）
 try {
-    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/mindmap.svg';
-    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/iconParagraph.svg';
+    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tools/asset/icons/custom/mindmap.svg';
+    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tools/asset/icons/custom/iconParagraph.svg';
 } catch (err) {
     console.warn('无法在 assetUrls 上添加 custom-icon 映射', err);
 }
@@ -85,6 +86,12 @@ export class TldrawManager {
     private applyingRemoteChanges = false;
     private title: string;
     private themeObserver: MutationObserver | null = null;
+    private _whiteboardDeleteUnsub: (() => void) | null = null;
+    private _autosaveUnsub: (() => void) | null = null;
+    private _realtimeUnsub: (() => void) | null = null;
+    private _broadcastChannel: BroadcastChannel | null = null;
+    private _destroying = false;
+    private _destroyed = false;
 
     constructor(id: string, container: HTMLElement, blockIds?: string[], title?: string) {
         this.id = id;
@@ -97,14 +104,40 @@ export class TldrawManager {
             bindingUtils: customBindingUtils,
         });
 
+        // 监听白板数据文件删除事件：若当前实例对应数据被删除，自动销毁实例
+        this.setupWhiteboardDeletionListener();
+
         // 初始化tldraw
         this.initialize();
+    }
+
+    private setupWhiteboardDeletionListener() {
+        if (this._whiteboardDeleteUnsub) return;
+        try {
+            this._whiteboardDeleteUnsub = whiteboardFilesUpdated.subscribe(({ action, fileName, drawingId }) => {
+                if (action !== 'delete') return;
+                // 事件中可能携带 fileName 或 drawingId，任一匹配即可
+                const expectedFileName = `${this.storageKey}.json`;
+                const hit = (drawingId && drawingId === this.id) || (fileName && fileName === expectedFileName);
+                if (!hit) return;
+
+                // 数据已被删除：不要再保存（否则会把文件写回去）
+                try {
+                    showMessage(`画板数据已删除，已自动销毁实例：${this.title}`, 4000, 'info');
+                } catch { /* ignore */ }
+
+                void this.destroy({ skipSave: true, reason: 'data-deleted' });
+            });
+        } catch (err) {
+            console.warn('Failed to setup whiteboard deletion listener', err);
+        }
     }
 
     /**
      * 初始化tldraw组件
      */
     private async initialize() {
+        if (this._destroyed) return;
         const root = document.createElement('div');
         root.style.width = '100%';
         root.style.height = '100%';
@@ -112,9 +145,10 @@ export class TldrawManager {
         try {
             // 加载之前保存的数据
             await this.loadData();
+            if (this._destroyed) return;
             // 原先每次初始化自动清理未被任何 shape 引用的 asset，改为手动触发以避免在初始化时误删
             // 只有在加载成功后才渲染
-            //console.log("加载数据成功，开始渲染Tldraw");
+            console.debug("加载数据成功，开始渲染Tldraw");
             this.renderTldraw(root);
         } catch (error) {
             // 加载数据失败，停止初始化并显示错误信息
@@ -235,7 +269,7 @@ export class TldrawManager {
 
             const unused = assetIds.filter(id => !referenced.has(id));
             if (unused.length > 0) {
-                //console.log(`Pruning ${unused.length} unused asset(s) from TLStore`, unused);
+                console.debug(`Pruning ${unused.length} unused asset(s) from TLStore`, unused);
                 try {
                     // 类型系统方面，强制转换为 any[] 以便调用 remove
                     this.store.remove(unused as any);
@@ -260,11 +294,11 @@ export class TldrawManager {
             const data = await api.getFile(`/data/storage/petal/sttools/${this.storageKey}.json`);
 
             if (data) {
-                //console.log("加载到数据", data);
+                console.debug("加载到数据", data);
                 // 尝试解析和加载快照
                 try {
                     loadSnapshot(this.store, data);
-                    //console.log('已加载保存的画布数据');
+                    console.debug('已加载保存的画布数据');
                     return true; // 加载成功
                 } catch (parseError) {
                     console.error('解析或加载快照失败', parseError);
@@ -288,7 +322,7 @@ export class TldrawManager {
             // 保存到思源笔记的存储中
             const blob = new Blob([jsonData], { type: 'application/json' });
             await api.putFile(`/data/storage/petal/sttools/${this.storageKey}.json`, false, blob);
-            //console.log('画布数据已保存');
+            console.debug('画布数据已保存');
         } catch (error) {
             console.error('保存画布数据失败', error);
         }
@@ -442,25 +476,25 @@ export class TldrawManager {
 
                             // 解析拖拽数据
                             const blockIdo_rigin = e.dataTransfer!.types[0];
-                            //console.log('拖拽的数据类型', e);
-                            //console.log('拖拽的数据类型', blockIdo_rigin);
+                            console.debug('拖拽的数据类型', e);
+                            console.debug('拖拽的数据类型', blockIdo_rigin);
                             // 使用正则表达式提取块ID
                             let blockId = '';
                             if (blockIdo_rigin.startsWith('application/siyuan')) {
                                 const matches = blockIdo_rigin.match(/(\d{14}-\w{7})/g);
                                 if (matches && matches.length > 0) {
                                     blockId = matches[0]; // 获取第一个匹配的块ID
-                                    //console.log('从数据类型中提取的块ID', blockId);
+                                    console.debug('从数据类型中提取的块ID', blockId);
                                 }
                             }
                             if (blockIdo_rigin.startsWith('application/siyuan-file') && (window as any).__st_dragNodeId) {
                                 blockId = (window as any).__st_dragNodeId;
                             }
                             if (!blockId) {
-                                //console.log('未能识别拖拽的块ID');
+                                console.debug('未能识别拖拽的块ID');
                                 return;
                             }
-                            //console.log('识别到的块ID', blockId);
+                            console.debug('识别到的块ID', blockId);
                             // 获取鼠标在画布上的位置
                             const { x, y } = editor.screenToPage({
                                 x: e.clientX,
@@ -477,7 +511,7 @@ export class TldrawManager {
                              */
                             // Use class-level helper to create updated content with link to avoid adding link inside IAL/attribute block
                             const appendLinkToKramdown = this.appendLinkToKramdown.bind(this);
-                            //console.log("拖拽块的内容", content);
+                            console.debug("拖拽块的内容", content);
                             if (blockIdo_rigin.includes('nodeheading')) {
                                 aproblock = blockId;
                                 const link = buildTldrawLink(this.id, aproblock, this.title);
@@ -498,7 +532,7 @@ export class TldrawManager {
 {: id="${idid}" custom-st-tldraw="1" custom-tldraw-link="${link}"}`, blockId)
                             }
                             // 创建新的Card形状
-                            // //console.log("创建新的卡片形状",  aproblock[0].doOperations[0].id);
+                            // console.debug("创建新的卡片形状",  aproblock[0].doOperations[0].id);
                             if (blockIdo_rigin.startsWith('application/siyuan-file')) {
                                 editor.createShape({
                                     type: 'card',
@@ -542,7 +576,7 @@ export class TldrawManager {
                             // api.setBlockAttrs(blockId, {
                             //     'custom-st-tldraw': '1',
                             // });
-                            // //console.log(`已在(${x}, ${y})位置创建包含块ID ${blockId} 的卡片`);
+                            // console.debug(`已在(${x}, ${y})位置创建包含块ID ${blockId} 的卡片`);
                         };
 
                         // 注册最小 dragstart/dragend，用于捕获同页拖拽元素的 data-node-id
@@ -596,16 +630,17 @@ export class TldrawManager {
      */
     private setupRealtimeSync(Meditor: Editor) {
         if (!this.store || !this.editor) return;
-        // //console.log("设置实时同步功能");
+        // console.debug("设置实时同步功能");
         // 创建一个专用于此TLDraw实例的广播频道
         const channelName = `tldraw-sync-${this.id}`;
         const broadcastChannel = new BroadcastChannel(channelName);
+        this._broadcastChannel = broadcastChannel;
 
         // 为识别消息源，生成一个唯一的会话ID
         const sessionId = Date.now().toString() + Math.random().toString(36).slice(2);
 
         // 监听本地变更并广播
-        this.store.listen(
+        this._realtimeUnsub = this.store.listen(
             (update) => {
                 // 如果当前正在应用远程更改，不广播以避免循环
                 if (this.applyingRemoteChanges) return;
@@ -623,9 +658,9 @@ export class TldrawManager {
         // 监听来自其他页签的更新
         broadcastChannel.onmessage = (event) => {
             // 忽略自己发出的事件
-            // //console.log("收到远程TLDraw更改:", event.data);
+            // console.debug("收到远程TLDraw更改:", event.data);
             if (event.data.source === sessionId) {
-                // //console.log("忽略自己发出的事件AAAA:", event.data.source, sessionId);
+                // console.debug("忽略自己发出的事件AAAA:", event.data.source, sessionId);
                 return;
             }
 
@@ -634,7 +669,7 @@ export class TldrawManager {
 
                 // 应用远程更改到本地存储
                 Meditor.store.mergeRemoteChanges(() => {
-                    // //console.log("应用远程TLDraw更改:", event.data.changes.changes);
+                    // console.debug("应用远程TLDraw更改:", event.data.changes.changes);
                     // 应用收到的变更
                     Meditor.store.applyDiff(event.data.changes.changes);
                 });
@@ -645,7 +680,7 @@ export class TldrawManager {
                 this.applyingRemoteChanges = false;
             }
         };
-        // //console.log('已设置实时同步功能');
+        // console.debug('已设置实时同步功能');
     }
     /**
      * 将 linkMarkdown 插入到 kramdown 内容末尾（但在 IAL/attribute block 之前）
@@ -834,7 +869,7 @@ export class TldrawManager {
         }, 3000); // 3秒节流
 
         // 监听存储变化
-        this.store.listen(throttledSave);
+        this._autosaveUnsub = this.store.listen(throttledSave);
     }
 
     private applyThemeToEditor() {
@@ -1013,7 +1048,7 @@ export class TldrawManager {
             // 获取当前数据
             const snapshot = getSnapshot(this.store);
             const jsonData = JSON.stringify(snapshot);
-            //console.log('备份数据:', jsonData);
+            console.debug('备份数据:', jsonData);
 
             // 生成备份文件名
             const trashFileName = `${this.storageKey}-${reason}-${Date.now()}.json`;
@@ -1082,9 +1117,18 @@ export class TldrawManager {
     /**
      * 销毁tldraw实例和清理资源
      */
-    public async destroy() {
-        // 销毁前保存当前状态
-        await this.saveData();
+    public async destroy(options?: { skipSave?: boolean; reason?: string }) {
+        if (this._destroyed || this._destroying) return;
+        this._destroying = true;
+
+        // 销毁前保存当前状态（数据文件已被删除时必须跳过，否则会被重新写回）
+        if (!options?.skipSave) {
+            try {
+                await this.saveData();
+            } catch (err) {
+                console.warn('destroy(): saveData failed', err);
+            }
+        }
 
         // 清理交互状态监听器
         try {
@@ -1096,6 +1140,32 @@ export class TldrawManager {
         } catch (err) {
             console.warn('清理交互状态监听器出错', err);
         }
+
+        // 取消订阅 store listeners / 广播频道
+        try {
+            if (this._autosaveUnsub) {
+                this._autosaveUnsub();
+                this._autosaveUnsub = null;
+            }
+        } catch { /* ignore */ }
+        try {
+            if (this._realtimeUnsub) {
+                this._realtimeUnsub();
+                this._realtimeUnsub = null;
+            }
+        } catch { /* ignore */ }
+        try {
+            if (this._broadcastChannel) {
+                this._broadcastChannel.close();
+                this._broadcastChannel = null;
+            }
+        } catch { /* ignore */ }
+        try {
+            if (this._whiteboardDeleteUnsub) {
+                this._whiteboardDeleteUnsub();
+                this._whiteboardDeleteUnsub = null;
+            }
+        } catch { /* ignore */ }
 
         // 清空容器
         this.container.innerHTML = '';
@@ -1126,6 +1196,29 @@ export class TldrawManager {
         }
 
         this.tldrawComponent = null;
+
+        // 如果是因为数据被删除而销毁，向用户展示说明而不是简单清空容器
+        if (options?.reason === 'data-deleted') {
+            try {
+                // 清空并展示说明文字
+                this.container.innerHTML = `
+                    <div style="display:flex;align-items:center;justify-content:center;height:100%;padding:16px;box-sizing:border-box;">
+                        <div style="max-width:640px;text-align:center;color:var(--b3-theme-secondary);">
+                            <h3 style="margin:0 0 8px 0;color:var(--b3-theme-on-surface);">画板数据已被删除</h3>
+                            <div>此画板对应的数据文件已从存储中删除。已为您关闭画板实例以避免出现未定义行为。</div>
+                            <div style="margin-top:8px;font-size:0.85em;color:var(--b3-theme-secondary);">如果需要，可重新创建新画板或从回收站恢复备份文件。</div>
+                        </div>
+                    </div>
+                `;
+            } catch (err) {
+                try { this.container.innerHTML = ''; } catch { /* ignore */ }
+            }
+        } else {
+            try { this.container.innerHTML = ''; } catch { /* ignore */ }
+        }
+
+        this._destroyed = true;
+        this._destroying = false;
     }
 
     /**
@@ -1137,7 +1230,7 @@ export class TldrawManager {
         if (!this.editor) return null;
 
         const shapes = this.editor.getCurrentPageShapes();
-        // //console.log("查找形状", blockId, shapes);
+        // console.debug("查找形状", blockId, shapes);
         const cardShape = shapes.find(shape =>
             (shape.type === 'card' || shape.type === 'single-block' || shape.type === 'slide') &&
             (shape as ICardShape).props?.blockId === blockId
@@ -1171,15 +1264,15 @@ export class TldrawManager {
                     if (settingdata['SyncDelete']) {
                         // SyncDelete=true 的情况：删除块
                         await api.deleteBlock(blockId);
-                        //console.log(`Deleted block ${blockId} because no other cards reference it.`);
+                        console.debug(`Deleted block ${blockId} because no other cards reference it.`);
                     } else {
                         // 否则只重置属性，保留块
                         await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
-                        //console.log(`Block attribute updated for ${blockId} as no other cards reference it.`);
+                        console.debug(`Block attribute updated for ${blockId} as no other cards reference it.`);
                     }
                 }
             } else {
-                //console.log(`Card deletion: ${remainingCardsCount} remaining card(s) reference block ${blockId}; skipping block update.`);
+                console.debug(`Card deletion: ${remainingCardsCount} remaining card(s) reference block ${blockId}; skipping block update.`);
             }
         } catch (err) {
             console.error('handleCardShapeDeletion error', err);
@@ -1203,10 +1296,10 @@ export class TldrawManager {
                     // single-block 删除行为：默认与 card 保持一致。
                     if (settingdata['SyncDelete']) {
                         await api.deleteBlock(blockId);
-                        //console.log(`Deleted block ${blockId} because no other single-blocks reference it.`);
+                        console.debug(`Deleted block ${blockId} because no other single-blocks reference it.`);
                     } else {
                         await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
-                        // //console.log("%%%",block.markdown);
+                        // console.debug("%%%",block.markdown);
                         // 只删除指向当前画板(this.id) 与该块(blockId) 的[*](...)链接
                         // 支持 https:// 和 siyuan:// 两种协议
                         const replacedMarkdown = block.kramdown.replace(/\[\*\]\(((https|siyuan):\/\/plugins\/siyuan-steve-tools\/\?[^)]+)\)/g, (match, url) => {
@@ -1231,7 +1324,7 @@ export class TldrawManager {
                     }
                 }
             } else {
-                //console.log(`Single-block deletion: ${remainingSingleBlockCount} remaining single-block(s) reference block ${blockId}; skipping block update.`);
+                console.debug(`Single-block deletion: ${remainingSingleBlockCount} remaining single-block(s) reference block ${blockId}; skipping block update.`);
             }
         } catch (err) {
             console.error('handleSingleBlockDeletion error', err);
@@ -1304,7 +1397,7 @@ export class TldrawManager {
     //             }
     //             if (!used) {
     //                 try {
-    //                     //console.log(`Removing unreferenced asset ${aid} after deleting shape ${shape.id}`);
+    //                     console.debug(`Removing unreferenced asset ${aid} after deleting shape ${shape.id}`);
     //                     this.store.remove([aid] as any);
     //                 } catch (err) {
     //                     console.warn('Failed to remove asset after shape deletion', aid, err);
@@ -1357,7 +1450,7 @@ export class TldrawManager {
         if (shapeId === "") {
             shapeId = this.findShapeByBlockId(blockId);
         }
-        //console.log("导航到形状", shapeId, blockId);
+        console.debug("导航到形状", shapeId, blockId);
         if (!shapeId) return false;
 
         if (this.editor) {
@@ -1374,7 +1467,7 @@ export class TldrawManager {
 
 function isDarkTheme(): boolean {
     // 思源笔记暗色主题通常通过 data-theme 属性判断
-    // //console.log("判断思源主题", document.documentElement.getAttribute('data-theme-mode'));
+    // console.debug("判断思源主题", document.documentElement.getAttribute('data-theme-mode'));
     return document.documentElement.getAttribute('data-theme-mode') === 'dark';
 }
 
