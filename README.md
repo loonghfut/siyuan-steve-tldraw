@@ -6,7 +6,7 @@ STEVETOOLS—TLDRAW
 [![GitHub all releases](https://img.shields.io/github/downloads/loonghfut/siyuan-steve-tools/total)](https://github.com/loonghfut/siyuan-steve-tools/releases)
 
 #### Split from the STtools plugin
-
+If you only need STtools' whiteboard feature, it's recommended to uninstall STtools and use this plugin's whiteboard instead. If you still need other STtools features, you may continue using STtools and do not need to install this plugin.
 ## Do not use this plugin together with the STtools plugin — unknown bugs may occur.
 
 #### This plugin's data is compatible with the whiteboard module data in STtools, but do not use both plugins at the same time. You may switch from this plugin to the STtools plugin.
