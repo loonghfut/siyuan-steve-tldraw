@@ -2,7 +2,7 @@
   "name": "siyuan-steve-tldraw",
   "author": "steve",
   "url": "https://github.com/loonghfut/siyuan-steve-tldraw",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "minAppVersion": "3.5.1",
   "disabledInPublish": true,
   "backends": [
