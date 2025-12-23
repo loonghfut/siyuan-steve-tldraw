@@ -118,7 +118,7 @@ export async function getBackupPreview(path: string): Promise<BackupPreview> {
         }
 
         // Normalize candidate document object
-        const doc = data?.document ?? data;
+        const doc = (data as any)?.document ?? data;
 
         // TLDraw snapshots may use different layouts.
         // 1) Newer snapshots often put shapes/pages under `doc.store` as keys like 'shape:ID' / 'page:ID'.
