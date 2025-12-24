@@ -4,7 +4,7 @@ import { CardShapeTool } from './CardShape/CardShapeTool'
 import { CardShapeUtil } from './CardShape/CardShapeUtil'
 import { SingleBlockShapeTool } from './SingleBlockShape/SingleBlockShapeTool'
 import { SingleBlockShapeUtil, SingleBlockBindingUtil } from './SingleBlockShape/SingleBlockShapeUtil'
-import { BezierConnectorShapeUtil, BezierConnectorBindingUtil, keepConnectorsAtBottom, PointingPort } from './BezierConnectorShape'
+import { BezierConnectorShapeUtil, BezierConnectorBindingUtil, PointingPort } from './BezierConnectorShape'
 import { components, uiOverrides } from './ui-overrides'
 import {
     Tldraw,
@@ -330,9 +330,9 @@ export class TldrawManager {
 
 
     private options: Partial<TldrawOptions> = {
-        createTextOnCanvasDoubleClick: false,
+        createTextOnCanvasDoubleClick: settingdata['enableDoubleClickCreateSingleBlock'] ? false : true,
         maxFontsToLoadBeforeRender: 10,
-
+        cameraSlideFriction: 1,
     }
     /**
      * 渲染tldraw组件
@@ -366,6 +366,7 @@ export class TldrawManager {
                     embeds={allEmbeds}
                     onMount={(editor) => {
                         this.editor = editor;
+                        editor.user.updateUserPreferences({ isSnapMode:  settingdata['isSnapMode'] || false })
                         this.applyThemeToEditor();
                         this.setupThemeObserver();
                         // 设置自动保存功能
@@ -459,6 +460,31 @@ export class TldrawManager {
                         // 设置交互状态监听，用于优化拖动时的性能
                         // 在拖动、缩放画布时暂停内容加载和渲染
                         this.setupInteractionStateListener(editor);
+
+                        // 点击画布背景时清除页面文本选区，避免残留选区影响后续操作
+                        try {
+                            const editorContainer = editor.getContainer();
+                            const canvasClickHandler = (ev: MouseEvent) => {
+                                try {
+                                    const target = ev.target as HTMLElement | null;
+                                    if (!target) return;
+                                    // 如果点击在可编辑区域或 protyle 内容内，则忽略
+                                    if (target.closest('.protyle-wysiwyg') || target.closest('[contenteditable="true"]')) return;
+                                    if (window.getSelection) {
+                                        const sel = window.getSelection();
+                                        if (sel && !sel.isCollapsed) sel.removeAllRanges();
+                                    }
+                                    if (document.activeElement instanceof HTMLElement) {
+                                        try { (document.activeElement as HTMLElement).blur(); } catch { }
+                                    }
+                                } catch { }
+                            };
+                            // store handler reference for cleanup
+                            (this as any)._canvasClickHandler = canvasClickHandler;
+                            editorContainer.addEventListener('click', canvasClickHandler);
+                        } catch (err) {
+                            console.warn('注册画布点击清除选区监听器失败', err);
+                        }
                         
                         // 添加全局拖放事件监听
                         const container = editor.getContainer();
@@ -510,7 +536,7 @@ export class TldrawManager {
                              * - 否则，将 link 作为独立的行插入到内容末尾（在 IAL 之前）
                              */
                             // Use class-level helper to create updated content with link to avoid adding link inside IAL/attribute block
-                            const appendLinkToKramdown = this.appendLinkToKramdown.bind(this);
+                            // const appendLinkToKramdown = this.appendLinkToKramdown.bind(this);
                             console.debug("拖拽块的内容", content);
                             if (blockIdo_rigin.includes('nodeheading')) {
                                 aproblock = blockId;
@@ -687,44 +713,44 @@ export class TldrawManager {
      * - 如果是 heading 类型（isHeading === true），将 link 插入到最后一行（heading 行）后面： `###### 标题 [🔗](...)`
      * - 否则，将 link 作为独立的行插入到内容末尾（在 IAL 之前）
      */
-    private appendLinkToKramdown(origContent: string, linkMarkdown: string, linkUrl: string, isHeading = false) {
-        if (!origContent) return linkMarkdown;
-        // 检查是否已有该链接
-        if (origContent.includes(linkUrl)) return origContent;
+    // private appendLinkToKramdown(origContent: string, linkMarkdown: string, linkUrl: string, isHeading = false) {
+    //     if (!origContent) return linkMarkdown;
+    //     // 检查是否已有该链接
+    //     if (origContent.includes(linkUrl)) return origContent;
 
-        // 尝试匹配结尾处的 IAL / attribute block：以换行 + '{:' 开头并以 '}' 结尾
-        const attrMatch = origContent.match(/(\n\{:\s*[\s\S]*?\}\s*)$/);
-        if (attrMatch) {
-            const attrs = attrMatch[1];
-            const before = origContent.slice(0, origContent.length - attrs.length);
-            if (isHeading) {
-                const lines = before.split('\n');
-                const lastLine = lines.pop() || '';
-                const newLastLine = `${lastLine}${lastLine.endsWith(' ') ? '' : ' '}${linkMarkdown}`;
-                lines.push(newLastLine);
-                return lines.join('\n') + attrs;
-            } else {
-                const trimmedBefore = before.replace(/[\s\n]+$/, '');
-                // 直接在内容后面加链接，不要加换行
-                const sep = trimmedBefore.endsWith(' ') ? '' : ' ';
-                return `${trimmedBefore}${sep}${linkMarkdown}${attrs}`;
-            }
-        } else {
-            // 没有 IAL
-            if (isHeading) {
-                const lines = origContent.split('\n');
-                const lastLine = lines.pop() || '';
-                const newLastLine = `${lastLine}${lastLine.endsWith(' ') ? '' : ' '}${linkMarkdown}`;
-                lines.push(newLastLine);
-                return lines.join('\n');
-            } else {
-                const trimmed = origContent.replace(/[\s\n]+$/, '');
-                // 直接在内容后面加链接，不要加换行
-                const sep = trimmed.endsWith(' ') ? '' : ' ';
-                return `${trimmed}${sep}${linkMarkdown}`;
-            }
-        }
-    }
+    //     // 尝试匹配结尾处的 IAL / attribute block：以换行 + '{:' 开头并以 '}' 结尾
+    //     const attrMatch = origContent.match(/(\n\{:\s*[\s\S]*?\}\s*)$/);
+    //     if (attrMatch) {
+    //         const attrs = attrMatch[1];
+    //         const before = origContent.slice(0, origContent.length - attrs.length);
+    //         if (isHeading) {
+    //             const lines = before.split('\n');
+    //             const lastLine = lines.pop() || '';
+    //             const newLastLine = `${lastLine}${lastLine.endsWith(' ') ? '' : ' '}${linkMarkdown}`;
+    //             lines.push(newLastLine);
+    //             return lines.join('\n') + attrs;
+    //         } else {
+    //             const trimmedBefore = before.replace(/[\s\n]+$/, '');
+    //             // 直接在内容后面加链接，不要加换行
+    //             const sep = trimmedBefore.endsWith(' ') ? '' : ' ';
+    //             return `${trimmedBefore}${sep}${linkMarkdown}${attrs}`;
+    //         }
+    //     } else {
+    //         // 没有 IAL
+    //         if (isHeading) {
+    //             const lines = origContent.split('\n');
+    //             const lastLine = lines.pop() || '';
+    //             const newLastLine = `${lastLine}${lastLine.endsWith(' ') ? '' : ' '}${linkMarkdown}`;
+    //             lines.push(newLastLine);
+    //             return lines.join('\n');
+    //         } else {
+    //             const trimmed = origContent.replace(/[\s\n]+$/, '');
+    //             // 直接在内容后面加链接，不要加换行
+    //             const sep = trimmed.endsWith(' ') ? '' : ' ';
+    //             return `${trimmed}${sep}${linkMarkdown}`;
+    //         }
+    //     }
+    // }
     
     /**
      * 设置交互状态监听器
@@ -1183,6 +1209,20 @@ export class TldrawManager {
             try { (window as any).__st_dragNodeId = null; } catch (e) { }
         } catch (err) {
             console.warn('移除 drag 监听器出错', err);
+        }
+
+        // 移除画布点击清除选区监听器
+        try {
+            const handler = (this as any)._canvasClickHandler as ((ev: MouseEvent) => void) | undefined;
+            if (handler && this.editor) {
+                try {
+                    const container = this.editor.getContainer();
+                    container.removeEventListener('click', handler);
+                } catch (e) { /* ignore */ }
+            }
+            (this as any)._canvasClickHandler = null;
+        } catch (err) {
+            console.warn('移除画布点击清除选区监听器失败', err);
         }
 
         if (this.themeObserver) {
