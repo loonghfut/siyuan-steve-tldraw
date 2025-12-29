@@ -96,7 +96,7 @@ export function createIframeDock(options: IframeDockOptions) {
             setupResizeObserver(targetElement);
         },
         destroy() {
-            //console.log("destroy dock:", type);
+            console.debug("destroy dock:", type);
             // 断开 ResizeObserver
             if (resizeObserver) {
                 resizeObserver.disconnect();
@@ -432,7 +432,7 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
             const obj = { kind, url, body: fullBody };
             window.__WPS_RoamingQueue.push(obj);
             if (MODE === 'console') {
-                //console.log('[WPS_Roaming]' + JSON.stringify(obj));
+                console.debug('[WPS_Roaming]' + JSON.stringify(obj));
             }
         } catch (e) { /* swallow */ }
     };
@@ -501,8 +501,8 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                                         // 回调（可选）
                                         // try { if (onRoamingIntercept) onRoamingIntercept(obj); } catch (cbErr) { /* ignore */ }
                                         // 始终宿主打印
-                                        // try { //console.log('[WPS_Roaming_Host]', obj.kind, obj.url, obj.body); } catch (logErr) { /* ignore */ }
-                                        // //console.log('[WPS]', obj.body);
+                                        // try { console.debug('[WPS_Roaming_Host]', obj.kind, obj.url, obj.body); } catch (logErr) { /* ignore */ }
+                                        // console.debug('[WPS]', obj.body);
                                         // 累加到 window.wpsdoc 并基于 link_id 去重
                                         try {
                                             const newItems = pickRoamingFields(obj.body) || [];
@@ -517,9 +517,9 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                                                     }
                                                 }
                                             }
-                                            //console.log('[WPS_Roaming_Host]', newItems);
-                                        } catch (e) { /* ignore accumulate errors */ }
-
+                                            console.debug('[WPS_Roaming_Host]', newItems);
+                                        } catch(e) { /* ignore accumulate errors */ }
+                                        
                                     }
                                 }
                             } catch (err) { /* ignore */ }
@@ -533,9 +533,7 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                                 if (Array.isArray(arr) && arr.length) {
                                     for (const obj of arr) {
                                         try { if (onRoamingIntercept) onRoamingIntercept(obj); } catch (e) { }
-                                        try {
-                                            // console.log('[WPS_Roaming_Host]', obj.kind, obj.url, obj.body);
-                                        } catch (e) { }
+                                        try { console.debug('[WPS_Roaming_Host]', obj.kind, obj.url, obj.body); } catch (e) { }
                                     }
                                 }
                             } catch (e) { /* ignore */ }
@@ -751,7 +749,7 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
             bindCopyButton(dock.element, containerClass);
         },
         destroy() {
-            //console.log("destroy dock:", type);
+            console.debug("destroy dock:", type);
             // 清除 hover / btn 监听
             try {
                 const root = this.element.querySelector(`#${containerClass}`) as HTMLElement | null;
@@ -789,7 +787,7 @@ export function getCursorBlockId() {
     const blockElement = container.closest('.protyle-wysiwyg [data-node-id]');
 
     if (blockElement) {
-        // //console.log(blockElement.getAttribute('data-node-id'));
+        // console.debug(blockElement.getAttribute('data-node-id'));
         return blockElement.getAttribute('data-node-id');
     } else {
         return null;
@@ -800,46 +798,46 @@ export function getCursorBlockId() {
 
 
 interface RoamingItem {
-    link_id: string;
-    link_url: string;
-    name: string;
-    file_type: string;
-    file_src: string;
+  link_id: string;
+  link_url: string;
+  name: string;
+  file_type: string;
+  file_src: string;
 }
 
 function normalizeToArray(input: any): any[] {
-    if (Array.isArray(input)) return input;
+  if (Array.isArray(input)) return input;
 
-    // 字符串：尝试 JSON 解析
-    if (typeof input === 'string') {
-        try {
-            const parsed = JSON.parse(input);
-            return normalizeToArray(parsed); // 递归再判
-        } catch {
-            return [];
-        }
+  // 字符串：尝试 JSON 解析
+  if (typeof input === 'string') {
+    try {
+      const parsed = JSON.parse(input);
+      return normalizeToArray(parsed); // 递归再判
+    } catch {
+      return [];
     }
+  }
 
-    if (input && typeof input === 'object') {
-        // 常见包裹字段
-        const possibleKeys = ['data', 'list', 'items', 'records', 'result'];
-        for (const k of possibleKeys) {
-            if (Array.isArray((input as any)[k])) return (input as any)[k];
-        }
-        // 单对象当作一个元素
-        return [input];
+  if (input && typeof input === 'object') {
+    // 常见包裹字段
+    const possibleKeys = ['data', 'list', 'items', 'records', 'result'];
+    for (const k of possibleKeys) {
+      if (Array.isArray((input as any)[k])) return (input as any)[k];
     }
+    // 单对象当作一个元素
+    return [input];
+  }
 
-    return [];
+  return [];
 }
 
 export function pickRoamingFields(raw: any): RoamingItem[] {
-    const arr = normalizeToArray(raw);
-    return arr.map(o => ({
-        link_id: o?.link_id ?? '',
-        link_url: o?.link_url ?? '',
-        name: o?.name ?? '',
-        file_type: o?.file_type ?? '',
-        file_src: o?.file_src ?? '',
-    }));
+  const arr = normalizeToArray(raw);
+  return arr.map(o => ({
+    link_id: o?.link_id ?? '',
+    link_url: o?.link_url ?? '',
+    name: o?.name ?? '',
+    file_type: o?.file_type ?? '',
+    file_src: o?.file_src ?? '',
+  }));
 }

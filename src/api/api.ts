@@ -7,7 +7,6 @@
  */
 
 import { fetchPost, fetchSyncPost, IOperation, IWebSocketData, Protyle, showMessage } from "siyuan";
-// import { ISelectOption } from "@/calendar/interface";
 import { settingdata } from "..";
 import { AVManager } from "./db_pro";
 // 创建 AVManager 实例 - 可以根据需要进行配置
@@ -107,6 +106,47 @@ export async function setNotebookConf(notebook: NotebookId, conf: NotebookConf):
 
 
 // **************************************** File Tree ****************************************
+
+export interface ListDocsFile {
+    path: string;
+    name: string;
+    icon: string;
+    name1: string;
+    alias: string;
+    memo: string;
+    bookmark: string;
+    id: string;
+    count: number;
+    size: number;
+    hSize: string;
+    mtime: number;
+    ctime: number;
+    hMtime: string;
+    hCtime: string;
+    sort: number;
+    subFileCount: number;
+    hidden: boolean;
+    newFlashcardCount: number;
+    dueFlashcardCount: number;
+    flashcardCount: number;
+}
+
+export interface IResListDocsByPath {
+    box: string;
+    files: ListDocsFile[];
+    path: string;
+}
+
+export async function listDocsByPath(app: string, notebook: string, path: string): Promise<IResListDocsByPath> {
+    const data = {
+        app: app,
+        notebook: notebook,
+        path: path
+    };
+    const url = '/api/filetree/listDocsByPath';
+    return request(url, data);
+}
+
 export async function createDocWithMd(notebook: NotebookId, path: string, markdown: string): Promise<DocumentId> {
     let data = {
         notebook: notebook,
@@ -822,7 +862,7 @@ async function processAddBlockQueueForAvID(avID: string) {
     }
 
     try {
-        //console.log(`🚀 [批量添加块] 开始处理 ${blocks.length} 个块，avID: ${avID}`);
+        console.debug(`🚀 [批量添加块] 开始处理 ${blocks.length} 个块，avID: ${avID}`);
 
         // 构建批量添加的数据
         const sources = blocks.map(block => ({
@@ -839,7 +879,7 @@ async function processAddBlockQueueForAvID(avID: string) {
         // 成功后解析所有Promise
         blocks.forEach(block => block.resolve(result));
 
-        //console.log(`✅ [批量添加块] 成功添加 ${blocks.length} 个块到 avID: ${avID}`);
+        console.debug(`✅ [批量添加块] 成功添加 ${blocks.length} 个块到 avID: ${avID}`);
 
     } catch (error) {
         console.error(`❌ [批量添加块] 添加块失败，avID ${avID}:`, error);
@@ -942,7 +982,7 @@ export async function updateAttrViewCell_pro(
             reject
         });
 
-        // //console.log(`📝 [队列] 添加单元格更新请求，队列当前长度: ${cellUpdateQueue.length}, avID: ${avID}`);
+        // console.debug(`📝 [队列] 添加单元格更新请求，队列当前长度: ${cellUpdateQueue.length}, avID: ${avID}`);
 
         // 记录队列开始时间
         if (!cellUpdateQueueStartTime) {
@@ -963,7 +1003,7 @@ export async function updateAttrViewCell_pro(
         // 如果队列已经等待太久或队列很大，立即处理
         if (queueAge >= MAX_WAIT_TIME || currentQueueSize >= 50) {
             waitTime = 150; // 几乎立即处理
-            //console.log(`⚡ [队列] 触发立即处理 - 队列大小: ${currentQueueSize}, 等待时间: ${queueAge}ms`);
+            console.debug(`⚡ [队列] 触发立即处理 - 队列大小: ${currentQueueSize}, 等待时间: ${queueAge}ms`);
         } else if (currentQueueSize >= 4) {
             waitTime = 500; // 减少等待时间
         }
@@ -979,13 +1019,13 @@ export async function updateAttrViewCell_pro(
 // 处理队列函数 - 使用批量API优化
 async function processQueue() {
     if (isProcessingQueue || cellUpdateQueue.length === 0) {
-        // //console.log(`⏸️ [队列处理] 跳过处理 - 正在处理: ${isProcessingQueue}, 队列长度: ${cellUpdateQueue.length}`);
+        // console.debug(`⏸️ [队列处理] 跳过处理 - 正在处理: ${isProcessingQueue}, 队列长度: ${cellUpdateQueue.length}`);
         return;
     }
 
     isProcessingQueue = true;
     const totalItems = cellUpdateQueue.length;
-    // //console.log(`🚀 [队列处理] 开始处理单元格更新队列，共 ${totalItems} 个项目`);
+    // console.debug(`🚀 [队列处理] 开始处理单元格更新队列，共 ${totalItems} 个项目`);
 
     // 按 avID 分组处理
     const groupedUpdates = new Map<string, Array<typeof cellUpdateQueue[0]>>();
@@ -1003,12 +1043,12 @@ async function processQueue() {
         groupedUpdates.get(update.avID)!.push(update);
     }
 
-    // //console.log(`📊 [队列处理] 分组结果: ${groupedUpdates.size} 个avID，总共 ${allUpdates.length} 个更新`);
+    // console.debug(`📊 [队列处理] 分组结果: ${groupedUpdates.size} 个avID，总共 ${allUpdates.length} 个更新`);
 
     // 按 avID 分组批量处理
     for (const [avID, updates] of groupedUpdates.entries()) {
         try {
-            // //console.log(`🔄 [批量更新单元格] 开始处理 ${updates.length} 个单元格更新，avID: ${avID}`);
+            // console.debug(`🔄 [批量更新单元格] 开始处理 ${updates.length} 个单元格更新，avID: ${avID}`);
 
             // 预处理所有值并获取键信息
             const processedUpdates = await Promise.all(
@@ -1043,13 +1083,13 @@ async function processQueue() {
 
             if (batchUpdates.length > 0) {
                 // 使用批量API更新单元格
-                // //console.log(`🔄 [批量更新单元格] 发送批量更新请求，avID: ${avID}`, batchUpdates);
+                // console.debug(`🔄 [批量更新单元格] 发送批量更新请求，avID: ${avID}`, batchUpdates);
                 const result = await avManager.batchUpdateCells(avID, batchUpdates);
 
                 // 成功后解析所有Promise
                 updates.forEach(update => update.resolve(result));
 
-                // //console.log(`✅ [批量更新单元格] 成功更新 ${batchUpdates.length} 个单元格，avID: ${avID}`);
+                // console.debug(`✅ [批量更新单元格] 成功更新 ${batchUpdates.length} 个单元格，avID: ${avID}`);
                 // 批量更新完成后的后续处理
                 await handlePostBatchUpdateActions(avID);
             } else {
@@ -1067,13 +1107,13 @@ async function processQueue() {
         // 每个avID处理完后添加延迟
         if (groupedUpdates.size > 1) {
             const batchDelay = getBatchDelay();
-            // //console.log(`⏱️ [批量处理] avID ${avID} 处理完成，等待 ${batchDelay}ms 后处理下一个avID...`);
+            // console.debug(`⏱️ [批量处理] avID ${avID} 处理完成，等待 ${batchDelay}ms 后处理下一个avID...`);
             await new Promise(resolve => setTimeout(resolve, batchDelay));
         }
     }
 
     isProcessingQueue = false;
-    //console.log(`✅ [队列处理] 队列处理完成，共处理了 ${totalItems} 个单元格更新`);
+    console.debug(`✅ [队列处理] 队列处理完成，共处理了 ${totalItems} 个单元格更新`);
 }
 
 // 处理批量更新完成后的后续操作
@@ -1094,8 +1134,7 @@ async function handlePostBatchUpdateActions(avID: string) {
 // 刷新属性视图
 async function refreshAttributeView(avID: string) {
     try {
-        // refreshKanban();
-        // //console.log(`🔄 [视图刷新] 成功刷新视图，avID: ${avID}`);
+        // console.debug(`🔄 [视图刷新] 成功刷新视图，avID: ${avID}`);
     } catch (error) {
         console.warn(`⚠️ [视图刷新] 刷新视图失败，avID: ${avID}`, error);
     }
@@ -1290,7 +1329,7 @@ async function getDateTimestamps(dateStr: string): Promise<{ start: number, end:
     }
 }
 
-// import { refreshKanban } from "@/calendar/kanban";
+
 
 
 
@@ -1437,6 +1476,31 @@ export async function getDoc(id: string): Promise<IResGetDoc> {
         id: id
     };
     const url = '/api/filetree/getDoc';
+    return request(url, data);
+}
+
+export interface IResGetDocInfo {
+    id: string;
+    rootID: string;
+    name: string;
+    refCount: number;
+    subFileCount: number;
+    refIDs: string[];
+    ial: Record<string, string>;
+    icon: string;
+    attrViews: Array<{ id: string; name: string }>;
+}
+
+/**
+ * 获取文档信息（标题、题头图等）
+ * @param id 文档块 ID
+ * @returns 文档信息对象
+ */
+export async function getDocInfo(id: string): Promise<IResGetDocInfo> {
+    const data = {
+        id: id
+    };
+    const url = '/api/block/getDocInfo';
     return request(url, data);
 }
 

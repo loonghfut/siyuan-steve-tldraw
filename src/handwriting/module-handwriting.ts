@@ -3,10 +3,13 @@ import { openTab, Plugin, showMessage } from "siyuan";
 // import './handwriting.css';
 import { TldrawManager } from './tldraw/tldraw-manager';
 // 替换为新的卡片视图组件
-import TldrawWhiteboardCards from './tldraw/tldraw-whiteboard-cards.svelte';
-import { addWhiteboardButton } from "./function/assist";
+import TldrawWhiteboardCards from './tldraw/ui/tldraw-whiteboard-cards.svelte';
+import TldrawWhiteboardManager from './tldraw/ui/tldraw-whiteboard-manager.svelte';
+import { addWhiteboardButton, setupFileTreeObserver } from "./function/assist";
 import * as api from "@/api/api";
 import { TLShapeId } from "@tldraw/tldraw";
+import { registerTab, unregisterTab } from './tldraw/tldraw-instance-manager';
+import { settingdata } from "@/index";
 export class M_handwriting {
     private plugin: Plugin;
     // 存储画布实例的映射表
@@ -25,9 +28,16 @@ export class M_handwriting {
     private pendingTldrawNodes?: Set<HTMLElement>;
     private mutationFlushHandle?: number;
     private mutationFlushHandleIsTimeout?: boolean;
+    // 文档树观察器实例
+    private fileTreeObserver?: MutationObserver;
 
     constructor(plugin: Plugin) {
         this.plugin = plugin;
+    }
+
+    // 公开访问 plugin 的 getter
+    get pluginInstance() {
+        return this.plugin;
     }
 
     async init(settingdata) {
@@ -112,6 +122,7 @@ export class M_handwriting {
                         },
                         position: "right",
                     });
+                    
                     const tldrawManager = (tab.panelElement as any).tldrawManager as TldrawManager;
                     // 延时后再导航到指定块/形状
                     setTimeout(() => {
@@ -232,17 +243,59 @@ export class M_handwriting {
                 panelElement.appendChild(tldrawContainer);
                 const tl = new TldrawManager(this.data.rootid, tldrawContainer, [this.data.rootid], this.tab.title);
                 (panelElement as any).tldrawManager = tl;
-
+                
+                // 注册 Tab 实例
+                registerTab(this.data.rootid, this.tab);
             },
             async destroy() {
                 console.debug("销毁画板选项卡", this);
+                const rootid = this.data.rootid;
                 const tldrawManager = (this.element as any).tldrawManager;
                 if (tldrawManager) {
                     tldrawManager.destroy();
-                    // console.debug("销毁画板实例", tldrawManager);
+                }
+                // 注销 Tab 实例
+                if (rootid) {
+                    unregisterTab(rootid);
                 }
             }
         })
+
+        // 注册白板管理 Tab
+        const managerPlugin = this.plugin;
+        this.plugin.addTab({
+            type: "steveTool-whiteboard-manager",
+            async init() {
+                console.debug("初始化白板管理选项卡");
+                try {
+                    this.element.innerHTML = '';
+                    const root = document.createElement('div');
+                    root.className = 'steve-handwriting-manager-root';
+                    root.style.width = '100%';
+                    root.style.height = '100%';
+                    this.element.appendChild(root);
+                    // @ts-ignore
+                    (this.element as any).__svelteComponent = new TldrawWhiteboardManager({ 
+                        target: root, 
+                        props: { plugin: managerPlugin } 
+                    });
+                } catch (err) {
+                    console.error('挂载白板管理组件失败:', err);
+                }
+            },
+            async destroy() {
+                console.debug("销毁白板管理选项卡");
+                try {
+                    const component = (this.element as any).__svelteComponent;
+                    if (component && typeof component.$destroy === 'function') {
+                        component.$destroy();
+                    }
+                } catch (e) {
+                    console.warn('销毁白板管理组件时出错:', e);
+                }
+            }
+        })
+
         // 添加顶栏按钮
         // this.plugin.addTopBar({
         //     icon: "iconSTWhiteboard",
@@ -331,6 +384,11 @@ export class M_handwriting {
                 this.startTldrawLinkWatcher(protyleEl);
             }
         });
+
+        // 设置文档树白板按钮观察器（根据设置决定是否启用）
+        if (settingdata['tldraw-show-in-file-tree'] !== false) {
+            this.fileTreeObserver = setupFileTreeObserver();
+        }
     }
 
     /**
@@ -452,6 +510,11 @@ export class M_handwriting {
         }
         // 停止观察器
         this.stopTldrawLinkWatcher();
+        // 停止文档树观察器
+        if (this.fileTreeObserver) {
+            this.fileTreeObserver.disconnect();
+            this.fileTreeObserver = undefined;
+        }
         // 销毁 dock 上的 svelte 组件（如果存在）
         try {
             if (this.dockComponent && typeof this.dockComponent.$destroy === 'function') {

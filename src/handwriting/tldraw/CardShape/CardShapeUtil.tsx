@@ -20,6 +20,7 @@ import { shapeLoadManager } from '../shape-load-manager'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
 import { renderAllContent } from '../utils/render/content-renderer'
 import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
+import { exportCardShapeToSvg } from './CardShapeExport'
 
 let isCreatingBlock = false;
 // 仅用于并发创建控制，不再缓存最近创建的块ID
@@ -46,71 +47,6 @@ function getCachedPreview(blockId: string, fontSize: number): string | null {
 // 使缓存失效
 function invalidatePreviewCache(blockId: string) {
 	staticPreviewCache.delete(blockId);
-}
-
-// 使用 getHeadingChildrenDOM API 获取静态 DOM 内容
-async function fetchStaticDomContent(blockId: string): Promise<string | null> {
-	try {
-		const res = await api.getHeadingChildrenDOM(blockId);
-		// getHeadingChildrenDOM 直接返回 DOM 字符串
-		if (!res) {
-			return null;
-		}
-		if (typeof document === 'undefined') {
-			return res;
-		}
-		const wrapper = document.createElement('div');
-		wrapper.innerHTML = res;
-		const embedNodes = Array.from(
-			wrapper.querySelectorAll('[data-type="NodeBlockQueryEmbed"]')
-		);
-		if (embedNodes.length === 0) {
-			return wrapper.innerHTML;
-		}
-
-		const idsToResolve = embedNodes
-			.map((node) => node.getAttribute('data-node-id')?.trim() || '')
-			.filter(Boolean);
-		const uniqueIds = Array.from(new Set(idsToResolve));
-		if (uniqueIds.length === 0) {
-			return wrapper.innerHTML;
-		}
-
-		let embedDomMap: Record<string, string> | null = null;
-		try {
-			embedDomMap = await api.getBlockDOMsWithEmbed(uniqueIds);
-		} catch (err) {
-			console.error('获取嵌入 DOM 内容失败:', err);
-			return wrapper.innerHTML;
-		}
-		if (!embedDomMap) {
-			return wrapper.innerHTML;
-		}
-
-		const buildFragmentFromHtml = (html: string) => {
-			const temp = document.createElement('div');
-			temp.innerHTML = html;
-			const fragment = document.createDocumentFragment();
-			while (temp.firstChild) {
-				fragment.appendChild(temp.firstChild);
-			}
-			return fragment;
-		};
-
-		embedNodes.forEach((node) => {
-			const targetId = node.getAttribute('data-node-id')?.trim();
-			if (!targetId) return;
-			const replacementHtml = embedDomMap[targetId];
-			if (!replacementHtml) return;
-			const fragment = buildFragmentFromHtml(replacementHtml);
-			node.replaceWith(fragment);
-		});
-
-		return wrapper.innerHTML;
-	} catch (err) {
-		console.error('获取静态 DOM 内容失败:', err);
-		return null;
-	}
 }
 
 // 批量块存在性检查：收集多个卡片的检查请求，合并处理
@@ -145,14 +81,6 @@ function scheduleBlockCheck(blockId: string, shapeId: string): Promise<boolean> 
 		}
 	});
 }
-
-// 关键样式属性列表（优化样式内联性能）
-const CRITICAL_STYLE_PROPS = [
-	'color', 'background-color', 'background', 'font-size', 'font-family', 'font-weight',
-	'line-height', 'text-align', 'padding', 'margin', 'border', 'display', 'flex-direction',
-	'align-items', 'justify-content', 'width', 'height', 'max-width', 'max-height',
-	'overflow', 'white-space', 'word-break', 'opacity', 'visibility'
-];
 
 
 export class CardShapeUtil extends ShapeUtil<ICardShape> {
@@ -225,8 +153,17 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false;
 		const tldrawHeaderImage = settingdata['tldraw-header-image'] !== false;
 		const [collapsedText, setCollapsedText] = useState<string>('加载中...');
+		const [collapsedDocInfo, setCollapsedDocInfo] = useState<{
+			title: string;
+			titleImg?: string;
+			titleImgSrc?: string;
+			titleImgBackground?: string;
+			titleImgColor?: string;
+			titleImgHasUrl?: boolean;
+		} | null>(null);
 		const isCollapsed = shape.props.isCollapsed || false;
 		const isMainCard = Boolean(shape.props.isMain);
+		const headerGradientFallback = `linear-gradient(135deg, ${theme[shape.props.color].solid} 0%, ${theme[shape.props.color].semi} 100%)`;
 
 		// 计算有效渲染模式（不使用 useMemo，确保每次渲染都读取最新的全局设置）
 		const globalRenderMode: Exclude<CardRenderMode, 'inherit'> =
@@ -243,6 +180,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// 追踪上一次的编辑状态，用于检测编辑->非编辑的切换
 		const prevIsEditingRef = useRef(isEditingState);
 		const refreshNonceRef = useRef(shape.props.refreshNonce);
+		const prevCollapsedRef = useRef(isCollapsed);
 
 
 		// 仅在编辑时创建 Protyle 实例
@@ -312,6 +250,81 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			}
 		}, [isEditingState, blockId]);
 
+		// 折叠/展开时记录高度并在展开时恢复
+		useEffect(() => {
+			const prev = prevCollapsedRef.current;
+			const collapsedHeight = Math.max(fontSize * 6, isMainCard ? 260 : 100);
+			const storedHeight = shape.props.preCollapseHeight;
+
+			// 折叠状态下进入编辑：临时恢复到折叠前高度，便于编辑
+			if (isCollapsed && isEditingState) {
+				const restoreHeight = (storedHeight && storedHeight > 0) ? storedHeight : shape.props.h || collapsedHeight;
+				const ensuredStoredHeight = storedHeight || shape.props.h || collapsedHeight;
+				if (shape.props.h !== restoreHeight) {
+					this.editor.updateShape({
+						id: shape.id,
+						type: shape.type,
+						props: {
+							...shape.props,
+							isCollapsed: true,
+							preCollapseHeight: ensuredStoredHeight,
+							h: restoreHeight,
+						},
+					});
+				}
+				prevCollapsedRef.current = isCollapsed;
+				return;
+			}
+
+			// 折叠且非编辑：如果未记录高度则记录并收缩；若已记录则确保收缩到折叠高度
+			if (isCollapsed) {
+				if (!storedHeight) {
+					this.editor.updateShape({
+						id: shape.id,
+						type: shape.type,
+						props: {
+							...shape.props,
+							isCollapsed: true,
+							preCollapseHeight: shape.props.h,
+							h: collapsedHeight,
+						},
+					});
+				} else if (shape.props.h !== collapsedHeight) {
+					this.editor.updateShape({
+						id: shape.id,
+						type: shape.type,
+						props: {
+							...shape.props,
+							isCollapsed: true,
+							preCollapseHeight: storedHeight,
+							h: collapsedHeight,
+						},
+					});
+				}
+				prevCollapsedRef.current = isCollapsed;
+				return;
+			}
+
+			// 从折叠 -> 展开时恢复高度
+			if (prev && !isCollapsed && storedHeight && storedHeight > 0) {
+				this.editor.updateShape({
+					id: shape.id,
+					type: shape.type,
+					props: {
+						...shape.props,
+						h: storedHeight,
+						isCollapsed: false,
+						preCollapseHeight: undefined,
+					},
+				});
+				prevCollapsedRef.current = isCollapsed;
+				return;
+			}
+
+			// 同步记录当前折叠状态
+			prevCollapsedRef.current = isCollapsed;
+		}, [isCollapsed, isEditingState, shape.props.h, shape.props.preCollapseHeight, shape.id, shape.props.fontSize, shape.type, isMainCard]);
+
 		// 编辑模式切换时聚焦到形状，并在退出编辑后恢复之前的视角
 		useEffect(() => {
 			// 延迟执行，确保编辑状态完全建立
@@ -357,27 +370,113 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			return () => clearTimeout(timer)
 		}, [isEditing, shape.id])
 
-		// 折叠状态下获取块的 markdown 内容并截取前10个字
+		// 解析题头图：提取背景图 URL/渐变，并返回 img src 以及背景信息
+		const parseTitleImg = (titleImg?: string): {
+			src: string;
+			backgroundImage?: string;
+			backgroundColor?: string;
+			hasUrl?: boolean;
+		} => {
+			const fallback = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+			if (!titleImg) return { src: fallback };
+			let imgSrc = fallback;
+			let hasUrl = false;
+			let backgroundImage: string | undefined;
+			let backgroundColor: string | undefined;
+
+			// 先检查是否包含 url()（可能是 background 属性中的 url）
+			const urlMatch = titleImg.match(/url\(["']?([^"')]+)["']?\)/i);
+			if (urlMatch) {
+				hasUrl = true;
+				const imgPath = urlMatch[1];
+				imgSrc = `${imgPath}`;
+				backgroundImage = `url(${imgSrc})`;
+			} else {
+				// 尝试从 background-image 属性提取
+				const bgImageMatch = titleImg.match(/background-image\s*:\s*([^;]+);?/i);
+				if (bgImageMatch) {
+					backgroundImage = bgImageMatch[1].trim(); // 支持线性渐变等
+				} else {
+					// 尝试从 background 属性中提取（包含渐变的完整背景定义）
+					// 如: "background: linear-gradient(...)" 或复合 background 定义
+					const bgMatch = titleImg.match(/background\s*:\s*([^;]+)/i);
+					if (bgMatch) {
+						const bgValue = bgMatch[1].trim();
+						// 检查是否包含渐变或图片
+						if (bgValue.includes('gradient') || bgValue.includes('url(')) {
+							backgroundImage = bgValue;
+						}
+					}
+				}
+			}
+
+			const bgColorMatch = titleImg.match(/background-color\s*:\s*([^;]+);?/i);
+			if (bgColorMatch) {
+				backgroundColor = bgColorMatch[1].trim();
+			}
+
+			return { src: imgSrc, backgroundImage, backgroundColor, hasUrl };
+		};
+
+		// 折叠状态下的展示内容：
+		// - isMain: 显示题头图和标题
+		// - 其他: 显示块内容摘要
 		useEffect(() => {
-			if (isCollapsed && shape.props.blockId) {
-				api.getBlockByID(shape.props.blockId).then((res) => {
+			if (!isCollapsed || !shape.props.blockId) return;
+
+			let cancelled = false;
+
+			const loadForMain = async () => {
+				try {
+					const info = await api.getDocInfo(shape.props.blockId);
+					if (cancelled) return;
+					const ial = info?.ial || {};
+					const titleImg = ial['title-img'];
+					const title = ial.title || info?.name || '未命名文档';
+					const parsed = parseTitleImg(titleImg);
+					setCollapsedDocInfo({
+						title,
+						titleImg,
+						titleImgSrc: parsed.src,
+						titleImgBackground: parsed.backgroundImage,
+						titleImgColor: parsed.backgroundColor,
+						titleImgHasUrl: parsed.hasUrl,
+					});
+				} catch (e) {
+					if (cancelled) return;
+					setCollapsedDocInfo({ title: '未命名文档' });
+				}
+			};
+
+			const loadForNormal = async () => {
+				try {
+					const res = await api.getBlockByID(shape.props.blockId);
+					if (cancelled) return;
 					if (res && res.content) {
-						// 移除 markdown 标记和链接，只保留纯文本
 						const plainText = res.content
-							.replace(/\[🔗\]\([^)]+\)/g, '') // 移除链接
-							.replace(/^#+\s+/gm, '') // 移除标题标记
-							.replace(/\{:[^}]+\}/g, '') // 移除属性
+							.replace(/\[🔗\]\([^)]+\)/g, '')
+							.replace(/^#+\s+/gm, '')
+							.replace(/\{:[^}]+\}/g, '')
 							.trim();
-						const preview = plainText.slice(0, 10) + (plainText.length > 10 ? '...' : '');
+						const preview = plainText
 						setCollapsedText(preview || '空块');
 					} else {
 						setCollapsedText('空块');
 					}
-				}).catch(() => {
+				} catch {
+					if (cancelled) return;
 					setCollapsedText('加载失败');
-				});
+				}
+			};
+
+			if (isMainCard) {
+				loadForMain();
+			} else {
+				loadForNormal();
 			}
-		}, [isCollapsed, shape.props.blockId]);
+
+			return () => { cancelled = true; };
+		}, [isCollapsed, shape.props.blockId, isMainCard]);
 
 
 
@@ -446,13 +545,13 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// Protyle 生命周期管理主 Effect
 		// 注意：对于 live-protyle 模式，编辑状态切换不应触发重建
 		useEffect(() => {
-				// 检测是否为手动刷新（通过 refreshNonce 变更触发）
-				const manualRefreshTriggered = refreshNonceRef.current !== shape.props.refreshNonce;
-				const shouldForceReloadLiveProtyle =
-					effectiveRenderMode === 'live-protyle' &&
-					manualRefreshTriggered;
-				// 更新引用以记录最新的 nonce
-				refreshNonceRef.current = shape.props.refreshNonce;
+			// 检测是否为手动刷新（通过 refreshNonce 变更触发）
+			const manualRefreshTriggered = refreshNonceRef.current !== shape.props.refreshNonce;
+			const shouldForceReloadLiveProtyle =
+				effectiveRenderMode === 'live-protyle' &&
+				manualRefreshTriggered;
+			// 更新引用以记录最新的 nonce
+			refreshNonceRef.current = shape.props.refreshNonce;
 			// 折叠状态下不渲染 Protyle
 			if (isCollapsed && !isEditingState) {
 				destroyRuntimeResources();
@@ -473,28 +572,28 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			// effectiveRenderMode 已通过 useMemo 计算
 
 			// 等待 Protyle 完成首次内容渲染（尽量接近编辑态样式）
-			const waitForProtyleRendered = async (pt: Protyle, timeout = 800) => {
-				const ce = pt.protyle?.contentElement as HTMLElement | undefined;
-				if (!ce) return;
-				if (ce.childElementCount > 0) {
-					await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-					return;
-				}
-				await new Promise<void>((resolve) => {
-					let done = false;
-					const finish = () => {
-						if (done) return; done = true; resolve();
-					};
-					const obs = new MutationObserver(() => {
-						if (ce.childElementCount > 0) {
-							obs.disconnect();
-							requestAnimationFrame(() => requestAnimationFrame(finish));
-						}
-					});
-					obs.observe(ce, { childList: true, subtree: true });
-					setTimeout(() => { try { obs.disconnect(); } catch { } finish(); }, timeout);
-				});
-			};
+			// const waitForProtyleRendered = async (pt: Protyle, timeout = 800) => {
+			// 	const ce = pt.protyle?.contentElement as HTMLElement | undefined;
+			// 	if (!ce) return;
+			// 	if (ce.childElementCount > 0) {
+			// 		await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+			// 		return;
+			// 	}
+			// 	await new Promise<void>((resolve) => {
+			// 		let done = false;
+			// 		const finish = () => {
+			// 			if (done) return; done = true; resolve();
+			// 		};
+			// 		const obs = new MutationObserver(() => {
+			// 			if (ce.childElementCount > 0) {
+			// 				obs.disconnect();
+			// 				requestAnimationFrame(() => requestAnimationFrame(finish));
+			// 			}
+			// 		});
+			// 		obs.observe(ce, { childList: true, subtree: true });
+			// 		setTimeout(() => { try { obs.disconnect(); } catch { } finish(); }, timeout);
+			// 	});
+			// };
 
 			const mountProtyle = async (priority: number): Promise<string | null> => {
 				if (cancelled) return null;
@@ -602,7 +701,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							rootId: currentBlockId,
 							render: {
 								background: (shape.props.isMain && tldrawHeaderImage),
-								breadcrumb: shape.props.isMain,
+								breadcrumb: false,
 								gutter: true,
 								title: shape.props.isMain,
 								breadcrumbDocName: shape.props.isMain,
@@ -662,87 +761,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				return currentBlockId;
 			};
 
-			// 从 Protyle 实例克隆静态预览 - 用于文档块(isMain)的静态渲染
-			const useStaticPreviewFromProtyle = async (forceRefresh = false) => {
-				if (!isMainCard) return;
-				if (!protyleRef.current || cancelled) return;
-				const ce = protyleRef.current.protyle?.contentElement as HTMLElement | undefined;
-				if (!ce) return;
-
-				// 检查缓存（如果非强制刷新）
-				const currentBlockId = containerRef.current?.getAttribute('blockid') || blockId;
-				if (!forceRefresh && currentBlockId) {
-					const cachedHtml = getCachedPreview(currentBlockId, fontSize);
-					if (cachedHtml) {
-						// 使用缓存的预览
-						if (staticPreviewRef.current?.parentElement === containerRef.current) {
-							containerRef.current.removeChild(staticPreviewRef.current);
-						}
-						const wrapper = document.createElement('div');
-						wrapper.innerHTML = cachedHtml;
-						const clone = wrapper.firstElementChild as HTMLElement;
-						if (clone && containerRef.current) {
-										if (protyleHostRef.current?.parentElement === containerRef.current) {
-								try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
-							}
-							staticPreviewRef.current = clone;
-							containerRef.current.appendChild(clone);
-							// 先把 protyle-html 转为普通 DOM，再运行后续渲染
-							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
-							await renderAllContent(clone);
-							// 清理 Protyle
-							if (protyleHostRef.current?.parentElement) {
-								protyleHostRef.current.parentElement.removeChild(protyleHostRef.current);
-							}
-							try { safeDestroyProtyle(protyleRef.current); } catch { }
-							protyleRef.current = null;
-							protyleHostRef.current = null;
-							if (cancelled) return;
-							return;
-						}
-					}
-				}
-
-				// 保险起见，再等待一次渲染完成
-				await waitForProtyleRendered(protyleRef.current);
-				if (cancelled) return;
-				// 克隆只读 DOM
-				if (staticPreviewRef.current?.parentElement === containerRef.current) {
-					containerRef.current.removeChild(staticPreviewRef.current);
-				}
-				const clone = ce.cloneNode(true) as HTMLElement;
-				clone.style.width = '100%';
-				clone.style.height = '100%';
-				clone.style.overflow = 'auto';
-				clone.style.fontSize = `${fontSize}px`;
-
-				// 缓存原始 DOM HTML（渲染前）
-				if (currentBlockId) {
-					cacheStaticPreview(currentBlockId, clone.outerHTML, fontSize);
-				}
-
-				// 渲染所有内容类型（公式、图表等）需要依赖已挂载的 DOM，先挂载再渲染
-				if (containerRef.current) {
-					if (protyleHostRef.current?.parentElement === containerRef.current) {
-						try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
-					}
-					staticPreviewRef.current = clone;
-					containerRef.current.appendChild(clone);
-					await renderAllContent(clone);
-				}
-
-				// 清理 Protyle host
-				if (protyleHostRef.current?.parentElement) {
-					protyleHostRef.current.parentElement.removeChild(protyleHostRef.current);
-				}
-				// 销毁 Protyle 实例
-				try { safeDestroyProtyle(protyleRef.current); } catch { }
-				protyleRef.current = null;
-				protyleHostRef.current = null;
-				if (cancelled) return;
-			};
-
-			// 使用 getDoc API 直接获取静态 DOM 内容（无需创建 Protyle）
+			// 从 API 获取静态预览 - 用于文档块(isMain)的静态渲染
 			const useStaticPreviewFromGetDoc = async (targetBlockId: string, forceRefresh = false) => {
 				if (cancelled || !containerRef.current) return;
 
@@ -758,6 +777,15 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						wrapper.innerHTML = cachedHtml;
 						const clone = wrapper.firstElementChild as HTMLElement;
 						if (clone && containerRef.current) {
+							// 清理 Protyle host
+							if (protyleHostRef.current?.parentElement === containerRef.current) {
+								try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
+							}
+							// 销毁 Protyle 实例
+							try { safeDestroyProtyle(protyleRef.current); } catch { }
+							protyleRef.current = null;
+							protyleHostRef.current = null;
+
 							staticPreviewRef.current = clone;
 							containerRef.current.appendChild(clone);
 							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
@@ -769,22 +797,138 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				}
 
 				// 使用 getDoc API 获取 DOM 内容
-				const domContent = await fetchStaticDomContent(targetBlockId);
+				let domContent: string | null = null;
+				try {
+					const res = await api.getDoc(targetBlockId);
+					if (res && res.content) {
+						domContent = res.content;
+					}
+				} catch (err) {
+					console.error('获取文档 DOM 内容失败:', err);
+				}
+
 				if (cancelled || !domContent) return;
+
+				// 对于 isMain 形状，获取文档信息（标题和题头图）
+				let docInfo: api.IResGetDocInfo | null = null;
+				if (isMainCard) {
+					try {
+						docInfo = await api.getDocInfo(targetBlockId);
+					} catch (err) {
+						console.error('获取文档信息失败:', err);
+					}
+				}
 
 				// 移除旧的静态预览
 				if (staticPreviewRef.current?.parentElement === containerRef.current) {
 					containerRef.current.removeChild(staticPreviewRef.current);
 				}
+				// 清理 Protyle host
+				if (protyleHostRef.current?.parentElement === containerRef.current) {
+					try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
+				}
+				// 销毁 Protyle 实例
+				try { safeDestroyProtyle(protyleRef.current); } catch { }
+				protyleRef.current = null;
+				protyleHostRef.current = null;
 
 				// 创建预览容器
 				const previewWrapper = document.createElement('div');
 				previewWrapper.className = 'protyle-wysiwyg protyle-wysiwyg--attr';
 				previewWrapper.style.width = '100%';
 				previewWrapper.style.height = '100%';
-				previewWrapper.style.overflow = 'scroll';
+				previewWrapper.style.overflow = 'auto';
 				previewWrapper.style.fontSize = `${fontSize}px`;
 				previewWrapper.innerHTML = domContent;
+
+				// 如果是 isMain 形状，添加题头图和标题
+				if (isMainCard && docInfo) {
+					const ial = docInfo.ial || {};
+					const titleImg = ial['title-img'];
+					const title = ial.title || docInfo.name || '未命名文档';
+
+					// 创建顶部区域容器
+					const topContainer = document.createElement('div');
+					topContainer.className = 'protyle-top';
+
+					// 添加题头图
+					if (titleImg && tldrawHeaderImage) {
+						const bgContainer = document.createElement('div');
+						bgContainer.className = 'protyle-background protyle-background--enable';
+						bgContainer.setAttribute('data-node-id', targetBlockId);
+
+						const bgImg = document.createElement('div');
+						bgImg.className = 'protyle-background__img';
+
+						// 处理 title-img 的背景图片兼容
+						let bgStyle = titleImg;
+						let imgSrc = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+						const urlMatch = titleImg.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/);
+						if (urlMatch) {
+							const imgPath = urlMatch[1];
+							// 构建静态资源 URL
+							const assetUrl = `${imgPath}`;
+							imgSrc = assetUrl;
+							// 移除 background-image 部分，只保留其他样式（如 background-color）
+							bgStyle = titleImg.replace(/background-image:\s*url\(["']?[^"')]+["']?\);?/g, '').trim();
+							// 移除末尾分号
+							if (bgStyle.endsWith(';')) bgStyle = bgStyle.slice(0, -1);
+						}
+
+						bgImg.innerHTML = `<img src="${imgSrc}" style="${bgStyle}">`;
+
+						const bgIa = document.createElement('div');
+						bgIa.className = 'protyle-background__ia';
+						bgIa.style.marginLeft = '24px';
+						bgIa.style.marginRight = '16px';
+
+						bgContainer.appendChild(bgImg);
+						bgContainer.appendChild(bgIa);
+						topContainer.appendChild(bgContainer);
+					}
+
+					// 添加标题
+					const titleContainer = document.createElement('div');
+					titleContainer.className = 'protyle-title protyle-wysiwyg--attr';
+					titleContainer.setAttribute('data-node-id', targetBlockId);
+					titleContainer.setAttribute('data-render', 'true');
+					titleContainer.style.margin = '16px 16px 0px 24px';
+
+					const iconSpan = document.createElement('span');
+					iconSpan.className = 'protyle-title__icon';
+					iconSpan.innerHTML = '<svg><use xlink:href="#iconFile"></use></svg>';
+
+					const titleInput = document.createElement('div');
+					titleInput.contentEditable = 'false';
+					titleInput.spellcheck = false;
+					titleInput.className = 'protyle-title__input';
+					titleInput.style.outline = 'none';
+					titleInput.textContent = title;
+
+					const attrDiv = document.createElement('div');
+					attrDiv.className = 'protyle-attr';
+
+					// 添加书签（如果有）
+					const bookmark = ial.bookmark;
+					if (bookmark) {
+						const bookmarkDiv = document.createElement('div');
+						bookmarkDiv.className = 'protyle-attr--bookmark';
+						bookmarkDiv.textContent = bookmark;
+						attrDiv.appendChild(bookmarkDiv);
+					}
+
+					titleContainer.appendChild(iconSpan);
+					titleContainer.appendChild(titleInput);
+					titleContainer.appendChild(attrDiv);
+					topContainer.appendChild(titleContainer);
+
+					// 将 topContainer 插入到内容最前面
+					if (previewWrapper.firstChild) {
+						previewWrapper.insertBefore(topContainer, previewWrapper.firstChild);
+					} else {
+						previewWrapper.appendChild(topContainer);
+					}
+				}
 
 				// 缓存原始 DOM HTML（渲染前）
 				cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize);
@@ -832,17 +976,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						const id = containerRef.current?.getAttribute('blockid') || blockId;
 						if (!id) return;
 						if (isMainCard) {
-							// 文档块：创建 Protyle 实例并克隆 DOM
-							if (!protyleRef.current) {
-								await mountProtyle(2);
-								if (cancelled) return;
-								    if (protyleRef.current) await waitForProtyleRendered(protyleRef.current);
-									    }
-									    // 如果是手动刷新，则强制 bypass 缓存并通过 API 重新获取 DOM
-									    await useStaticPreviewFromProtyle(wasEditing || manualRefreshTriggered);
+							await useStaticPreviewFromGetDoc(id, wasEditing || manualRefreshTriggered);
 							if (cancelled) return;
 						} else {
-							// 普通块：使用 fetchStaticDomContent API 直接获取静态 DOM
+							// 普通块：使用 getDoc API 直接获取静态 DOM
 							if (protyleRef.current) {
 								if (protyleHostRef.current?.parentElement) {
 									protyleHostRef.current.parentElement.removeChild(protyleHostRef.current);
@@ -944,20 +1081,102 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				>
 					{/* 折叠状态 */}
 					{isCollapsed && !isEditingState && (
-						<div style={{
-							width: '100%',
-							height: '100%',
-							display: 'flex',
-							alignItems: 'center',
-							justifyContent: 'center',
-							fontSize: `${Math.min(shape.props.w / 6, shape.props.h / 2)}px`,
-							padding: '8px',
-							wordBreak: 'break-all',
-							color: theme[shape.props.color].solid,
-							textAlign: 'center',
-						}}>
-							{collapsedText}
+						isMainCard ? (
+							<div style={{
+								width: '100%',
+								height: '100%',
+								display: 'flex',
+								flexDirection: 'column',
+								alignItems: 'flex-start',
+								justifyContent: 'flex-start',
+								gap: '12px',
+								padding: '12px',
+								boxSizing: 'border-box',
+								color: theme[shape.props.color].solid,
+								overflow: 'hidden',
+							}}
+						>
+							{tldrawHeaderImage && (
+								<div
+									style={{
+										width: '100%',
+										height: '80%',
+										minHeight: '120px',
+										borderRadius: '12px',
+										overflow: 'hidden',
+										background: collapsedDocInfo?.titleImgBackground || collapsedDocInfo?.titleImgColor || headerGradientFallback,
+										display: 'flex',
+										alignItems: 'center',
+										justifyContent: 'center',
+									}}
+								>
+									{collapsedDocInfo?.titleImgHasUrl ? (
+										<img
+											src={collapsedDocInfo.titleImgSrc}
+											style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+											alt={collapsedDocInfo.title || '文档'}
+										/>
+									) : null}
+								</div>
+							)}
+							<div style={{
+								width: '100%',
+								display: 'flex',
+								alignItems: 'center',
+								gap: '8px',
+								fontSize: `${Math.min(shape.props.w / 8, 28)}px`,
+								fontWeight: 600,
+								wordBreak: 'break-all',
+							}}>
+								<span style={{ display: 'flex', alignItems: 'center' }}>
+									<svg width="20" height="20" style={{ marginRight: '6px' }}>
+										<use xlinkHref="#iconFile"></use>
+									</svg>
+									{collapsedDocInfo?.title || '加载中...'}
+								</span>
+							</div>
 						</div>
+						) : (
+							<div style={{
+								width: '100%',
+								height: '100%',
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'flex-start',
+								padding: '10px 14px',
+								boxSizing: 'border-box',
+								gap: '10px',
+							}}>
+								{/* 折叠图标 */}
+								<svg
+									width="18"
+									height="18"
+									viewBox="0 0 24 24"
+									fill="none"
+									stroke={theme[shape.props.color].solid}
+									strokeWidth="2"
+									strokeLinecap="round"
+									strokeLinejoin="round"
+									style={{ flexShrink: 0, opacity: 0.6 }}
+								>
+									<polyline points="4 14 10 14 10 20"></polyline>
+									<polyline points="20 10 14 10 14 4"></polyline>
+									<line x1="14" y1="10" x2="21" y2="3"></line>
+									<line x1="3" y1="21" x2="10" y2="14"></line>
+								</svg>
+								{/* 内容摘要文字 */}
+								<span style={{
+									fontSize: '21px',
+									fontWeight: 500,
+									color: theme[shape.props.color].solid,
+									wordBreak: 'break-all',
+									lineHeight: 1.4,
+									opacity: 0.85,
+								}}>
+									{collapsedText}
+								</span>
+							</div>
+						)
 					)}
 					{shape.props.isNewlyCreated && !shape.props.blockId && !isEditingState && (
 						<div style={{
@@ -1012,430 +1231,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 	}
 
 	override toSvg(shape: ICardShape, ctx: SvgExportContext): ReactElement | null {
-		const theme = getDefaultColorTheme({ isDarkMode: ctx.isDarkMode })
-		const { w, h, color, fontSize = 16, blockId, isCollapsed } = shape.props
-		const borderWidth = 3 // 与实际渲染的边框宽度一致
-		const radius = 10 // 与实际渲染的圆角一致
-		const strokeColor = theme[color].solid
-		const fillColor = theme[color].semi
-		// 内容区域的尺寸（去掉边框后的可用空间）
-		const contentWidth = Math.max(w - borderWidth * 2, 1)
-		const contentHeight = Math.max(h - borderWidth * 2, 1)
-
-		// 折叠状态：直接返回简化的 SVG
-		if (isCollapsed) {
-			// 获取折叠时显示的文本
-			let collapsedText = 'Card'
-			if (blockId) {
-				try {
-					const xhr = new XMLHttpRequest()
-					xhr.open('POST', '/api/block/getBlockInfo', false)
-					xhr.setRequestHeader('Content-Type', 'application/json')
-					xhr.send(JSON.stringify({ id: blockId }))
-					if (xhr.status >= 200 && xhr.status < 300) {
-						const res = JSON.parse(xhr.responseText)
-						if (res?.data?.rootTitle) {
-							collapsedText = res.data.rootTitle.slice(0, 10) + (res.data.rootTitle.length > 10 ? '...' : '')
-						}
-					}
-				} catch { }
-			}
-			const collapsedFontSize = Math.min(w / 6, h / 2, 24)
-			return (
-				<g>
-					<rect
-						width={w}
-						height={h}
-						fill={fillColor}
-						stroke={strokeColor}
-						strokeWidth={borderWidth}
-						rx={radius}
-						ry={radius}
-					/>
-					<text
-						x={w / 2}
-						y={h / 2}
-						fill={strokeColor}
-						fontSize={collapsedFontSize}
-						dominantBaseline="middle"
-						textAnchor="middle"
-					>
-						{collapsedText}
-					</text>
-				</g>
-			)
-		}
-
-		let serialized = ''
-
-		const serializeContent = () => {
-			if (typeof document === 'undefined') return ''
-			const host = document.getElementById(shape.id)
-			if (!host) return ''
-			const content = host.querySelector('[blockid]') as HTMLElement | null
-			if (!content) return ''
-
-			// 二进制转 Base64
-			const binaryToBase64 = (binary: string) => {
-				let base64 = ''
-				const chunkSize = 0x6000 // divisible by 3 to keep padding predictable
-				for (let i = 0; i < binary.length; i += chunkSize) {
-					const slice = binary.slice(i, i + chunkSize)
-					let normalized = ''
-					for (let j = 0; j < slice.length; j++) {
-						normalized += String.fromCharCode(slice.charCodeAt(j) & 0xff)
-					}
-					base64 += btoa(normalized)
-				}
-				return base64
-			}
-
-			// MIME 类型映射
-			const mimeMap: Record<string, string> = {
-				png: 'image/png',
-				jpg: 'image/jpeg',
-				jpeg: 'image/jpeg',
-				gif: 'image/gif',
-				webp: 'image/webp',
-				svg: 'image/svg+xml',
-				bmp: 'image/bmp',
-				ico: 'image/x-icon',
-				avif: 'image/avif',
-				mp4: 'video/mp4',
-				webm: 'video/webm',
-				ogg: 'video/ogg',
-			}
-
-			// 将资源路径转换为 data URL
-			const assetToDataUrl = (rawSrc: string | null) => {
-				if (!rawSrc) return ''
-				const trimmed = rawSrc.trim()
-				if (!trimmed || /^data:/i.test(trimmed) || /^https?:/i.test(trimmed) || trimmed.startsWith('//')) return trimmed
-				let logicalPath = trimmed.replace(/^\.\//, '')
-				if (logicalPath.startsWith('/')) logicalPath = logicalPath.slice(1)
-				let kernelPath = ''
-				if (logicalPath.startsWith('assets/')) kernelPath = `/data/${logicalPath}`
-				else if (logicalPath.startsWith('data/')) kernelPath = `/${logicalPath}`
-				else if (logicalPath.startsWith('/data/')) kernelPath = logicalPath
-				else return trimmed
-				try {
-					const xhr = new XMLHttpRequest()
-					xhr.open('POST', '/api/file/getFile', false)
-					xhr.overrideMimeType('text/plain; charset=x-user-defined')
-					xhr.setRequestHeader('Content-Type', 'application/json')
-					xhr.send(JSON.stringify({ path: kernelPath }))
-					if (xhr.status >= 200 && xhr.status < 300 && typeof xhr.responseText === 'string') {
-						const base64 = binaryToBase64(xhr.responseText)
-						const ext = (logicalPath.split('.').pop() || 'png').toLowerCase()
-						const mime = mimeMap[ext] || 'application/octet-stream'
-						return `data:${mime};base64,${base64}`
-					}
-				} catch (err) {
-					console.warn('Embedding asset failed', err)
-				}
-				return trimmed
-			}
-
-			// 克隆内容
-			const clone = content.cloneNode(true) as HTMLElement
-
-			// 扩展的关键样式属性列表（包含更多可能影响外观的属性）
-			const EXTENDED_STYLE_PROPS = [
-				...CRITICAL_STYLE_PROPS,
-				'text-decoration', 'text-transform', 'letter-spacing', 'word-spacing',
-				'box-shadow', 'text-shadow', 'transform', 'border-radius', 'border-color',
-				'border-width', 'border-style', 'outline', 'position', 'top', 'left', 'right', 'bottom',
-				'gap', 'grid-template-columns', 'grid-template-rows', 'flex-wrap', 'flex-grow', 'flex-shrink',
-				'min-width', 'min-height', 'list-style', 'list-style-type', 'vertical-align',
-				'text-indent', 'cursor', 'user-select', 'backdrop-filter', 'filter'
-			]
-
-			// 内联计算样式（使用扩展属性列表）
-			const inlineComputedStyles = (source: Element, target: Element, depth = 0) => {
-				// 增加递归深度限制
-				if (depth > 15) return
-				try {
-					const computed = window.getComputedStyle(source)
-					const styleText = EXTENDED_STYLE_PROPS
-						.map((prop) => {
-							const value = computed.getPropertyValue(prop)
-							// 跳过默认值和空值
-							if (!value || value === 'none' || value === 'normal' || value === 'auto') return ''
-							return `${prop}:${value};`
-						})
-						.filter(Boolean)
-						.join('')
-					const existing = target.getAttribute('style') || ''
-					target.setAttribute('style', `${styleText}${existing}`)
-				} catch { }
-
-				const sourceChildren = Array.from(source.children)
-				const targetChildren = Array.from(target.children)
-				const maxChildren = Math.min(sourceChildren.length, targetChildren.length, 150) // 增加子元素限制
-				for (let i = 0; i < maxChildren; i++) {
-					const srcChild = sourceChildren[i]
-					const tgtChild = targetChildren[i]
-					if (srcChild && tgtChild) {
-						inlineComputedStyles(srcChild, tgtChild, depth + 1)
-					}
-				}
-			}
-
-			inlineComputedStyles(content, clone)
-
-			// 清理不需要的属性
-			const attrsToRemove = [
-				'contenteditable', 'data-node-id', 'data-node-index', 'updated',
-				'data-realwidth', 'data-readonly', 'spellcheck', 'draggable'
-			]
-			attrsToRemove.forEach(attr => {
-				clone.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr))
-			})
-
-			// 隐藏滚动条
-			clone.querySelectorAll('*').forEach((node) => {
-				if (node instanceof HTMLElement) {
-					node.style.setProperty('scrollbar-width', 'none', 'important')
-					node.style.setProperty('-ms-overflow-style', 'none', 'important')
-					node.style.setProperty('overscroll-behavior', 'contain')
-				}
-			})
-
-			// 处理图片
-			clone.querySelectorAll('img').forEach((img) => {
-				const embedded = assetToDataUrl(img.getAttribute('src'))
-				if (embedded) {
-					img.setAttribute('src', embedded)
-					img.removeAttribute('crossorigin')
-					img.removeAttribute('loading')
-				}
-				// 处理 srcset
-				const srcset = img.getAttribute('srcset')
-				if (srcset) {
-					const resolvedSet = srcset
-						.split(',')
-						.map((entry) => {
-							const parts = entry.trim().split(/\s+/)
-							const url = parts[0]
-							const descriptor = parts.slice(1).join(' ')
-							const resolved = assetToDataUrl(url)
-							return resolved ? (descriptor ? `${resolved} ${descriptor}` : resolved) : ''
-						})
-						.filter(Boolean)
-						.join(', ')
-					if (resolvedSet) img.setAttribute('srcset', resolvedSet)
-					else img.removeAttribute('srcset')
-				}
-				// 设置图片样式确保正确显示
-				img.style.maxWidth = '100%'
-				img.style.height = 'auto'
-			})
-
-			// 处理视频：替换为第一帧截图或占位符
-			clone.querySelectorAll('video').forEach((video) => {
-				const poster = video.getAttribute('poster')
-				if (poster) {
-					// 如果有海报图，用图片替换视频
-					const img = document.createElement('img')
-					const embeddedPoster = assetToDataUrl(poster)
-					img.setAttribute('src', embeddedPoster || poster)
-					img.style.width = video.style.width || '100%'
-					img.style.height = video.style.height || 'auto'
-					img.style.objectFit = 'cover'
-					video.replaceWith(img)
-				} else {
-					// 无海报时显示视频占位符
-					const placeholder = document.createElement('div')
-					placeholder.style.cssText = `
-						width: ${video.style.width || '100%'};
-						height: ${video.style.height || '150px'};
-						background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-						display: flex;
-						align-items: center;
-						justify-content: center;
-						color: white;
-						font-size: 14px;
-						border-radius: 4px;
-					`
-					placeholder.textContent = '🎬 Video'
-					video.replaceWith(placeholder)
-				}
-			})
-
-			// 处理 source 元素
-			clone.querySelectorAll('source').forEach((sourceEl) => {
-				const src = sourceEl.getAttribute('src')
-				const resolved = assetToDataUrl(src)
-				if (resolved) {
-					sourceEl.setAttribute('src', resolved)
-					sourceEl.removeAttribute('crossorigin')
-				}
-				const srcset = sourceEl.getAttribute('srcset')
-				if (srcset) {
-					const resolvedSet = srcset
-						.split(',')
-						.map((entry) => {
-							const parts = entry.trim().split(/\s+/)
-							const url = parts[0]
-							const descriptor = parts.slice(1).join(' ')
-							const result = assetToDataUrl(url)
-							return result ? (descriptor ? `${result} ${descriptor}` : result) : ''
-						})
-						.filter(Boolean)
-						.join(', ')
-					if (resolvedSet) sourceEl.setAttribute('srcset', resolvedSet)
-					else sourceEl.removeAttribute('srcset')
-				}
-			})
-
-			// 处理 iframe（替换为占位符）
-			clone.querySelectorAll('iframe').forEach((iframe) => {
-				const placeholder = document.createElement('div')
-				placeholder.style.cssText = `
-					width: ${iframe.style.width || '100%'};
-					height: ${iframe.style.height || '150px'};
-					background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-					display: flex;
-					align-items: center;
-					justify-content: center;
-					color: white;
-					font-size: 14px;
-					border-radius: 4px;
-				`
-				placeholder.textContent = '🌐 Embedded Content'
-				iframe.replaceWith(placeholder)
-			})
-
-			// 处理 canvas（尝试导出为图片）
-			const originalCanvases = content.querySelectorAll('canvas')
-			const clonedCanvases = clone.querySelectorAll('canvas')
-			originalCanvases.forEach((canvas, index) => {
-				const clonedCanvas = clonedCanvases[index]
-				if (clonedCanvas && canvas instanceof HTMLCanvasElement) {
-					try {
-						const dataUrl = canvas.toDataURL('image/png')
-						const img = document.createElement('img')
-						img.src = dataUrl
-						img.style.width = canvas.style.width || `${canvas.width}px`
-						img.style.height = canvas.style.height || `${canvas.height}px`
-						clonedCanvas.replaceWith(img)
-					} catch {
-						// Canvas 可能受到跨域限制
-						const placeholder = document.createElement('div')
-						placeholder.style.cssText = `
-							width: ${canvas.style.width || canvas.width + 'px'};
-							height: ${canvas.style.height || canvas.height + 'px'};
-							background: #f0f0f0;
-							display: flex;
-							align-items: center;
-							justify-content: center;
-							color: #666;
-							font-size: 12px;
-						`
-						placeholder.textContent = 'Canvas'
-						clonedCanvas.replaceWith(placeholder)
-					}
-				}
-			})
-
-			// 处理 SVG 中的 use 元素（尝试内联）
-			clone.querySelectorAll('svg use').forEach((use) => {
-				const href = use.getAttribute('href') || use.getAttribute('xlink:href')
-				if (href && href.startsWith('#')) {
-					const targetId = href.slice(1)
-					const target = document.getElementById(targetId)
-					if (target) {
-						const clonedTarget = target.cloneNode(true) as Element
-						clonedTarget.removeAttribute('id')
-						use.replaceWith(clonedTarget)
-					}
-				}
-			})
-
-			// 设置克隆容器的样式（与实际渲染一致）
-			clone.style.width = `${contentWidth}px`
-			clone.style.height = `${contentHeight}px`
-			clone.style.pointerEvents = 'none'
-			clone.style.overflow = 'hidden'
-			clone.style.fontSize = `${fontSize}px`
-			clone.style.boxSizing = 'border-box'
-			clone.style.padding = '0px'
-
-			return clone.outerHTML
-		}
-
-		serialized = serializeContent()
-
-		// 全局样式：(隐藏滚动条)、重置一些默认样式
-		//*::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
-		//*::-webkit-scrollbar-thumb { display: none !important; }
-		const globalStyles = serialized
-			? `<style xmlns="http://www.w3.org/1999/xhtml">
-				* { scrollbar-width: none !important; -ms-overflow-style: none !important; }
-				a { color: inherit; text-decoration: none; }
-				img { max-width: 100%; height: auto; }
-			</style>`
-			: ''
-
-		return (
-			<g>
-				{/* 背景矩形：带边框和圆角 */}
-				<rect
-					width={w}
-					height={h}
-					fill={fillColor}
-					stroke={strokeColor}
-					strokeWidth={borderWidth}
-					rx={radius}
-					ry={radius}
-				/>
-				{/* 内容区域：使用 clipPath 裁剪圆角 */}
-				<defs>
-					<clipPath id={`clip-${shape.id}`}>
-						<rect
-							x={borderWidth}
-							y={borderWidth}
-							width={contentWidth}
-							height={contentHeight}
-							rx={Math.max(radius - borderWidth, 0)}
-							ry={Math.max(radius - borderWidth, 0)}
-						/>
-					</clipPath>
-				</defs>
-				{serialized ? (
-					<foreignObject
-						x={borderWidth}
-						y={borderWidth}
-						width={contentWidth}
-						height={contentHeight}
-						clipPath={`url(#clip-${shape.id})`}
-					>
-						<div
-							xmlns="http://www.w3.org/1999/xhtml"
-							style={{
-								width: '100%',
-								height: '100%',
-								overflow: 'hidden',
-								fontSize: `${fontSize}px`,
-								backgroundColor: 'transparent',
-							}}
-							dangerouslySetInnerHTML={{ __html: `${globalStyles}${serialized}` }}
-						/>
-					</foreignObject>
-				) : (
-					<text
-						x={w / 2}
-						y={h / 2}
-						fill={strokeColor}
-						fontSize={Math.min(fontSize * 0.9, 16)}
-						dominantBaseline="middle"
-						textAnchor="middle"
-					>
-						{blockId ? `Block ${blockId.slice(-6)}` : 'Card'}
-					</text>
-				)}
-			</g>
-		)
+		return exportCardShapeToSvg(shape, ctx)
 	}
 
 }

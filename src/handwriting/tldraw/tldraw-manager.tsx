@@ -28,7 +28,8 @@ import { captureSlideScreenshot, CaptureSlideScreenshotOptions, CaptureSlideScre
 import { getSlides } from './SlideShape/useSlides';
 import { ICardShape } from './CardShape/card-shape-types';
 import { showMessage, Dialog } from 'siyuan';
-import TldrawBackupManager from './tldraw-backup-manager.svelte';
+import { WhiteboardFileManager } from './whiteboard-file-manager';
+import TldrawBackupManager from './ui/tldraw-backup-manager.svelte';
 import { settingdata } from '@/index';
 import { JsShapeUtil } from './JsShape/JsShapeUtil';
 import { JsShapeTool } from './JsShape/JsShapeTool';
@@ -40,7 +41,7 @@ import { tldrawkey } from '@/../my/key';
 import { setupShapeLibraryDropHandler } from './shapelibrary/ShapeLibraryPanel';
 import { buildTldrawLink } from './utils/link-builder';
 import { setInteracting } from './utils/idle-scheduler';
-import { whiteboardFilesUpdated } from './whiteboards.store';
+import { registerInstance, unregisterInstance } from './tldraw-instance-manager';
 const assetUrls = getAssetUrls({
     baseUrl: 'plugins/siyuan-steve-tools/asset/',
 })
@@ -66,6 +67,7 @@ const filteredDefaultShapeUtils = defaultShapeUtils.filter(util => util.type !==
 const customShapeUtils = [...filteredDefaultShapeUtils, configuredArrowShapeUtil, CardShapeUtil, SingleBlockShapeUtil, SlideShapeUtil, JsShapeUtil, MindMapShapeUtil, BezierConnectorShapeUtil]
 const customBindingUtils = [...defaultBindingUtils, SingleBlockBindingUtil, BezierConnectorBindingUtil]
 const customTools = [CardShapeTool, SingleBlockShapeTool, SlideShapeTool, JsShapeTool, MindMapShapeTool]
+
 /**
  * TldrawManager类，用于管理tldraw实例和操作
  */
@@ -86,12 +88,13 @@ export class TldrawManager {
     private applyingRemoteChanges = false;
     private title: string;
     private themeObserver: MutationObserver | null = null;
-    private _whiteboardDeleteUnsub: (() => void) | null = null;
     private _autosaveUnsub: (() => void) | null = null;
     private _realtimeUnsub: (() => void) | null = null;
     private _broadcastChannel: BroadcastChannel | null = null;
     private _destroying = false;
     private _destroyed = false;
+    private _mouseDownPos: { x: number; y: number } | null = null;
+    private _isDragging = false;
 
     constructor(id: string, container: HTMLElement, blockIds?: string[], title?: string) {
         this.id = id;
@@ -104,40 +107,22 @@ export class TldrawManager {
             bindingUtils: customBindingUtils,
         });
 
-        // 监听白板数据文件删除事件：若当前实例对应数据被删除，自动销毁实例
-        this.setupWhiteboardDeletionListener();
+        // 将当前实例注册到实例管理器
+        registerInstance(this.id, this);
 
         // 初始化tldraw
         this.initialize();
     }
 
-    private setupWhiteboardDeletionListener() {
-        if (this._whiteboardDeleteUnsub) return;
-        try {
-            this._whiteboardDeleteUnsub = whiteboardFilesUpdated.subscribe(({ action, fileName, drawingId }) => {
-                if (action !== 'delete') return;
-                // 事件中可能携带 fileName 或 drawingId，任一匹配即可
-                const expectedFileName = `${this.storageKey}.json`;
-                const hit = (drawingId && drawingId === this.id) || (fileName && fileName === expectedFileName);
-                if (!hit) return;
 
-                // 数据已被删除：不要再保存（否则会把文件写回去）
-                try {
-                    showMessage(`画板数据已删除，已自动销毁实例：${this.title}`, 4000, 'info');
-                } catch { /* ignore */ }
-
-                void this.destroy({ skipSave: true, reason: 'data-deleted' });
-            });
-        } catch (err) {
-            console.warn('Failed to setup whiteboard deletion listener', err);
-        }
-    }
 
     /**
      * 初始化tldraw组件
      */
     private async initialize() {
         if (this._destroyed) return;
+        // 清空container中的旧内容（如果有）
+        this.container.innerHTML = '';
         const root = document.createElement('div');
         root.style.width = '100%';
         root.style.height = '100%';
@@ -290,13 +275,14 @@ export class TldrawManager {
     */
     private async loadData(): Promise<boolean> {
         try {
-            // 从思源笔记的存储中获取数据
-            const data = await api.getFile(`/data/storage/petal/sttools/${this.storageKey}.json`);
+            // 使用统一文件管理器加载数据
+            const dataContent = await WhiteboardFileManager.readWhiteboardFile(this.id);
 
-            if (data) {
-                console.debug("加载到数据", data);
+            if (dataContent) {
+                // console.debug("加载到数据", dataContent);
                 // 尝试解析和加载快照
                 try {
+                    const data = JSON.parse(dataContent);
                     loadSnapshot(this.store, data);
                     console.debug('已加载保存的画布数据');
                     return true; // 加载成功
@@ -320,9 +306,12 @@ export class TldrawManager {
             const jsonData = JSON.stringify(snapshot);
 
             // 保存到思源笔记的存储中
-            const blob = new Blob([jsonData], { type: 'application/json' });
-            await api.putFile(`/data/storage/petal/sttools/${this.storageKey}.json`, false, blob);
-            console.debug('画布数据已保存');
+            const result = await WhiteboardFileManager.saveWhiteboardFile(this.id, jsonData);
+            if (result.success) {
+                console.debug('画布数据已保存');
+            } else {
+                console.error('保存画布数据失败:', result.error);
+            }
         } catch (error) {
             console.error('保存画布数据失败', error);
         }
@@ -464,11 +453,36 @@ export class TldrawManager {
                         // 点击画布背景时清除页面文本选区，避免残留选区影响后续操作
                         try {
                             const editorContainer = editor.getContainer();
+                            
+                            const mouseDownHandler = (ev: MouseEvent) => {
+                                this._mouseDownPos = { x: ev.clientX, y: ev.clientY };
+                                this._isDragging = false;
+                            };
+                            
+                            const mouseMoveHandler = (ev: MouseEvent) => {
+                                if (this._isDragging || !this._mouseDownPos) return;
+                                
+                                const dx = ev.clientX - this._mouseDownPos.x;
+                                const dy = ev.clientY - this._mouseDownPos.y;
+                                if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+                                    this._isDragging = true;
+                                }
+                            };
+                            
+                            const mouseUpHandler = () => {
+                                this._mouseDownPos = null;
+                                setTimeout(() => {
+                                    this._isDragging = false;
+                                }, 50);
+                            };
+                            
                             const canvasClickHandler = (ev: MouseEvent) => {
                                 try {
                                     const target = ev.target as HTMLElement | null;
                                     if (!target) return;
-                                    // 如果点击在可编辑区域或 protyle 内容内，则忽略
+                                    
+                                    if (this._isDragging) return;
+                                    
                                     if (target.closest('.protyle-wysiwyg') || target.closest('[contenteditable="true"]')) return;
                                     if (window.getSelection) {
                                         const sel = window.getSelection();
@@ -479,8 +493,15 @@ export class TldrawManager {
                                     }
                                 } catch { }
                             };
-                            // store handler reference for cleanup
+                            
+                            (this as any)._canvasMouseDownHandler = mouseDownHandler;
+                            (this as any)._canvasMouseMoveHandler = mouseMoveHandler;
+                            (this as any)._canvasMouseUpHandler = mouseUpHandler;
                             (this as any)._canvasClickHandler = canvasClickHandler;
+                            
+                            editorContainer.addEventListener('mousedown', mouseDownHandler);
+                            editorContainer.addEventListener('mousemove', mouseMoveHandler);
+                            editorContainer.addEventListener('mouseup', mouseUpHandler);
                             editorContainer.addEventListener('click', canvasClickHandler);
                         } catch (err) {
                             console.warn('注册画布点击清除选区监听器失败', err);
@@ -506,7 +527,32 @@ export class TldrawManager {
                             console.debug('拖拽的数据类型', blockIdo_rigin);
                             // 使用正则表达式提取块ID
                             let blockId = '';
-                            if (blockIdo_rigin.startsWith('application/siyuan')) {
+                            let docname = '';
+                            // 处理文档大纲条目拖放
+                            if (e.dataTransfer!.types.includes('application/doc-outline-block')) {
+                                try {
+                                    const data = e.dataTransfer!.getData('application/doc-outline-block');
+                                    const parsed = JSON.parse(data);
+                                    blockId = parsed.blockId;
+                                    console.debug('文档大纲拖放的块ID', blockId);
+                                } catch (err) {
+                                    console.error('解析文档大纲拖放数据失败:', err);
+                                    return;
+                                }
+                            } else if (e.dataTransfer!.types.includes('application/child-doc')) {
+                                // 处理子文档拖放
+                                try {
+                                    const data = e.dataTransfer!.getData('application/child-doc');
+                                    const parsed = JSON.parse(data);
+                                    blockId = parsed.docId;
+                                    console.debug('子文档拖放的文档', parsed);
+                                    docname = parsed.docName || '';
+                                    console.debug('子文档拖放', blockId);
+                                } catch (err) {
+                                    console.error('解析子文档拖放数据失败:', err);
+                                    return;
+                                }
+                            } else if (blockIdo_rigin.startsWith('application/siyuan')) {
                                 const matches = blockIdo_rigin.match(/(\d{14}-\w{7})/g);
                                 if (matches && matches.length > 0) {
                                     blockId = matches[0]; // 获取第一个匹配的块ID
@@ -529,7 +575,7 @@ export class TldrawManager {
                             const idid = await api.generateSiyuanID();
                             const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
                             let aproblock: string;
-                            const content = (await api.getBlockKramdown(blockId)).kramdown;
+                            // const content = (await api.getBlockKramdown(blockId)).kramdown;
                             /**
                              * 将 linkMarkdown 插入到 kramdown 内容末尾（但在 IAL/attribute block 之前）
                              * - 如果是 heading 类型（isHeading === true），将 link 插入到最后一行（heading 行）后面： `###### 标题 [🔗](...)`
@@ -537,7 +583,7 @@ export class TldrawManager {
                              */
                             // Use class-level helper to create updated content with link to avoid adding link inside IAL/attribute block
                             // const appendLinkToKramdown = this.appendLinkToKramdown.bind(this);
-                            console.debug("拖拽块的内容", content);
+                            // console.debug("拖拽块的内容", content);
                             if (blockIdo_rigin.includes('nodeheading')) {
                                 aproblock = blockId;
                                 const link = buildTldrawLink(this.id, aproblock, this.title);
@@ -551,6 +597,15 @@ export class TldrawManager {
                             } else if (blockIdo_rigin.startsWith('application/siyuan-file')) {
                                 aproblock = blockId;
                                 await api.prependBlock("markdown", `((${blockId} '${(window as any).__st_dragName || ''}'))`, this.id)
+                            } else if (blockIdo_rigin.startsWith('application/doc-outline-block')) {
+                                aproblock = blockId;
+                                console.debug("拖拽的是文档大纲块");
+                                const link = buildTldrawLink(this.id, aproblock, this.title);
+                                await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw':"1"})
+                            } else if(blockIdo_rigin.startsWith('application/child-doc')) {
+                                aproblock = blockId;
+                                console.debug("拖拽的是子文档块");
+                                await api.prependBlock("markdown", `((${blockId} '${docname}'))`, this.id)
                             } else {
                                 aproblock = idid as string;
                                 const link = buildTldrawLink(this.id, aproblock, this.title);
@@ -559,7 +614,7 @@ export class TldrawManager {
                             }
                             // 创建新的Card形状
                             // console.debug("创建新的卡片形状",  aproblock[0].doOperations[0].id);
-                            if (blockIdo_rigin.startsWith('application/siyuan-file')) {
+                            if (blockIdo_rigin.startsWith('application/siyuan-file')||blockIdo_rigin.includes('application/child-doc')) {
                                 editor.createShape({
                                     type: 'card',
                                     x: x, // 默认宽度的一半，使形状中心在鼠标位置
@@ -571,6 +626,7 @@ export class TldrawManager {
                                         showMask: true,
                                         blockId: aproblock,
                                         isMain: true,
+                                        isCollapsed: true, // 拖拽进来默认为折叠状态
                                     },
                                 });
                             } else if (blockIdo_rigin.includes('paragraph')) {
@@ -596,6 +652,7 @@ export class TldrawManager {
                                         color: 'black',
                                         showMask: true,
                                         blockId: aproblock,
+                                        isCollapsed: false, // 拖拽进来默认为折叠状态
                                     },
                                 });
                             }
@@ -1064,26 +1121,22 @@ export class TldrawManager {
     }
     private async backupToTrash(reason: string = '自动备份'): Promise<string> {
         try {
-            // 确保回收站目录存在
-            try {
-                await api.putFile(`/data/storage/petal/sttools/trash/.gitkeep`, false, new Blob([''], { type: 'text/plain' }));
-            } catch (err) {
-                // 目录可能已存在，忽略错误
-            }
-
             // 获取当前数据
             const snapshot = getSnapshot(this.store);
             const jsonData = JSON.stringify(snapshot);
             console.debug('备份数据:', jsonData);
 
-            // 生成备份文件名
-            const trashFileName = `${this.storageKey}-${reason}-${Date.now()}.json`;
+            // 使用统一文件管理器备份
+            const result = await WhiteboardFileManager.backupWhiteboardData(this.id, jsonData, {
+                reason,
+                includeTimestamp: true,
+            });
 
-            // 将数据写入回收站
-            const blob = new Blob([jsonData], { type: 'application/json' });
-            await api.putFile(`/data/storage/petal/sttools/trash/${trashFileName}`, false, blob);
+            if (!result.success) {
+                throw new Error(result.error || '备份失败');
+            }
 
-            return trashFileName;
+            return result.fileName!;
         } catch (err) {
             console.error('备份数据到回收站失败:', err);
             throw err;
@@ -1107,26 +1160,15 @@ export class TldrawManager {
             // 如果需要，从存储中删除持久化数据
             if (removeStorage) {
                 try {
-                    // Create trash directory if it doesn't exist
-                    try {
-                        await api.putFile(`/data/storage/petal/sttools/trash/.gitkeep`, false, new Blob([''], { type: 'text/plain' }));
-                    } catch (err) {
-                        // Directory likely already exists
+                    const result = await WhiteboardFileManager.deleteWhiteboardFile(this.id, {
+                        reason: '清空画板',
+                    });
+                    
+                    if (result.success) {
+                        showMessage('已将画布数据移动到回收站: ' + result.fileName);
+                    } else {
+                        console.warn('删除存储文件失败:', result.error);
                     }
-
-                    // Get the data content before removal
-                    const dataContent = await api.getFile(`/data/storage/petal/sttools/${this.storageKey}.json`);
-
-                    // 确保写入的是字符串（api.getFile 可能返回对象）
-                    const contentToSave = typeof dataContent === 'string' ? dataContent : JSON.stringify(dataContent);
-
-                    // Move to trash with timestamp
-                    const trashFileName = `${this.storageKey}-${Date.now()}.json`;
-                    await api.putFile(`/data/storage/petal/sttools/trash/${trashFileName}`, false, new Blob([contentToSave], { type: 'application/json' }));
-
-                    // Remove original file
-                    await api.removeFile(`/data/storage/petal/sttools/${this.storageKey}.json`);
-                    showMessage('已将画布数据移动到回收站' + `/data/storage/petal/sttools/trash/${trashFileName}`);
                 } catch (err) {
                     // 如果文件不存在，忽略错误
                     console.warn('删除存储文件失败，可能文件不存在', err);
@@ -1186,12 +1228,6 @@ export class TldrawManager {
                 this._broadcastChannel = null;
             }
         } catch { /* ignore */ }
-        try {
-            if (this._whiteboardDeleteUnsub) {
-                this._whiteboardDeleteUnsub();
-                this._whiteboardDeleteUnsub = null;
-            }
-        } catch { /* ignore */ }
 
         // 清空容器
         this.container.innerHTML = '';
@@ -1213,14 +1249,32 @@ export class TldrawManager {
 
         // 移除画布点击清除选区监听器
         try {
-            const handler = (this as any)._canvasClickHandler as ((ev: MouseEvent) => void) | undefined;
-            if (handler && this.editor) {
+            const clickHandler = (this as any)._canvasClickHandler as ((ev: MouseEvent) => void) | undefined;
+            const mouseDownHandler = (this as any)._canvasMouseDownHandler as ((ev: MouseEvent) => void) | undefined;
+            const mouseMoveHandler = (this as any)._canvasMouseMoveHandler as ((ev: MouseEvent) => void) | undefined;
+            const mouseUpHandler = (this as any)._canvasMouseUpHandler as (() => void) | undefined;
+            
+            if (this.editor) {
                 try {
                     const container = this.editor.getContainer();
-                    container.removeEventListener('click', handler);
+                    if (clickHandler) {
+                        container.removeEventListener('click', clickHandler);
+                    }
+                    if (mouseDownHandler) {
+                        container.removeEventListener('mousedown', mouseDownHandler);
+                    }
+                    if (mouseMoveHandler) {
+                        container.removeEventListener('mousemove', mouseMoveHandler);
+                    }
+                    if (mouseUpHandler) {
+                        container.removeEventListener('mouseup', mouseUpHandler);
+                    }
                 } catch (e) { /* ignore */ }
             }
             (this as any)._canvasClickHandler = null;
+            (this as any)._canvasMouseDownHandler = null;
+            (this as any)._canvasMouseMoveHandler = null;
+            (this as any)._canvasMouseUpHandler = null;
         } catch (err) {
             console.warn('移除画布点击清除选区监听器失败', err);
         }
@@ -1256,6 +1310,9 @@ export class TldrawManager {
         } else {
             try { this.container.innerHTML = ''; } catch { /* ignore */ }
         }
+
+        // 从实例管理器中注销当前实例
+        unregisterInstance(this.id);
 
         this._destroyed = true;
         this._destroying = false;
