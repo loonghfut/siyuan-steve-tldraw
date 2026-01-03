@@ -43,13 +43,13 @@ import { buildTldrawLink } from './utils/link-builder';
 import { setInteracting } from './utils/idle-scheduler';
 import { registerInstance, unregisterInstance } from './tldraw-instance-manager';
 const assetUrls = getAssetUrls({
-    baseUrl: 'plugins/siyuan-steve-tools/asset/',
+    baseUrl: 'plugins/siyuan-steve-tldraw/asset/',
 })
 
 // 为返回的 assetUrls 添加自定义图标映射（运行时赋值以避免类型定义冲突）
 try {
-    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tools/asset/icons/custom/mindmap.svg';
-    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tools/asset/icons/custom/iconParagraph.svg';
+    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/mindmap.svg';
+    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/iconParagraph.svg';
 } catch (err) {
     console.warn('无法在 assetUrls 上添加 custom-icon 映射', err);
 }
@@ -480,10 +480,37 @@ export class TldrawManager {
                                 try {
                                     const target = ev.target as HTMLElement | null;
                                     if (!target) return;
-                                    
+
                                     if (this._isDragging) return;
-                                    
+
+                                    // 排除思源编辑器内容
                                     if (target.closest('.protyle-wysiwyg') || target.closest('[contenteditable="true"]')) return;
+
+                                    // 排除 tldraw 自身的形状元素，包括文本框
+                                    // tldraw 的形状有 .tl-shape 类，文本编辑时会有 .tl-text 或 .tl-html-container
+                                    if (target.closest('.tl-shape') ||
+                                        target.closest('.tl-grid') ||
+                                        target.closest('.tl-canvas') ||
+                                        target.closest('.tl-text') ||
+                                        target.closest('.tl-html-container') ||
+                                        target.closest('[data-shape-id]') ||
+                                        target.closest('.tl-scribble') ||
+                                        target.closest('.tl-embed') ||
+                                        target.closest('.tl-connector')) {
+                                        return;
+                                    }
+
+                                    // 排除 tldraw UI 元素
+                                    if (target.closest('.tlui') ||
+                                        target.closest('[data-testid="canvas"]') ||
+                                        target.closest('.tlui-input') ||
+                                        target.closest('.tlui-button') ||
+                                        target.closest('.tlui-tooltip') ||
+                                        target.closest('.slide-shape-name-input')) {
+                                        return;
+                                    }
+
+                                    // 只有点击画布背景时才清除选区
                                     if (window.getSelection) {
                                         const sel = window.getSelection();
                                         if (sel && !sel.isCollapsed) sel.removeAllRanges();
