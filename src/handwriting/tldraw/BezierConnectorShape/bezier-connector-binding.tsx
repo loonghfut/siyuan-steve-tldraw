@@ -90,6 +90,56 @@ const connectorBindingsCache = createComputedCache(
 )
 
 /**
+ * 自动端口 ID：绑定时不锁定具体端口，渲染时按两形状相对位置动态解析。
+ * 当形状被移动到另一侧时，连线会自动从合理的一侧进出（"自动换边"）。
+ */
+export const AUTO_PORT_ID = 'auto'
+
+/**
+ * 按目标形状中心与对侧锚点的相对位置，解析 auto 端口对应的实际端口 ID
+ */
+export function resolveAutoPortId(
+	editor: Editor,
+	targetShapeId: TLShapeId,
+	oppositePoint: { x: number; y: number }
+): string {
+	const bounds = editor.getShapePageBounds(targetShapeId)
+	if (!bounds) return 'input'
+	const dx = oppositePoint.x - (bounds.x + bounds.w / 2)
+	const dy = oppositePoint.y - (bounds.y + bounds.h / 2)
+	if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? 'output' : 'input'
+	return dy >= 0 ? 'bottom' : 'top'
+}
+
+/**
+ * 解析绑定的实际端口 ID（将 auto 端口解析为 input/output/top/bottom）。
+ * 对侧锚点取对侧绑定形状的中心；若对侧未绑定，则取连接器 props 中的自由端点。
+ * 解析只依赖形状中心（而非对侧端口位置），避免两端均为 auto 时的循环依赖。
+ */
+export function resolveConnectorBindingPortId(editor: Editor, binding: ConnectorBinding): string {
+	if (binding.props.portId !== AUTO_PORT_ID) return binding.props.portId
+
+	const connector = editor.getShape<IBezierConnectorShape>(binding.fromId)
+	if (!connector) return 'input'
+
+	const otherTerminal: PortTerminal = binding.props.terminal === 'start' ? 'end' : 'start'
+	const bindings = getConnectorBindings(editor, connector)
+	const other = bindings[otherTerminal]
+
+	let oppositePoint: { x: number; y: number } | undefined
+	if (other) {
+		const ob = editor.getShapePageBounds(other.toId)
+		if (ob) oppositePoint = { x: ob.x + ob.w / 2, y: ob.y + ob.h / 2 }
+	}
+	if (!oppositePoint) {
+		const pt = otherTerminal === 'start' ? connector.props.start : connector.props.end
+		oppositePoint = editor.getShapePageTransform(connector).applyToPoint(pt)
+	}
+
+	return resolveAutoPortId(editor, binding.toId, oppositePoint)
+}
+
+/**
  * 获取绑定位置（页面坐标）
  */
 export function getConnectorBindingPositionInPageSpace(
@@ -99,10 +149,18 @@ export function getConnectorBindingPositionInPageSpace(
 	const targetShape = editor.getShape(binding.toId)
 	if (!targetShape) return null
 
-	// 获取目标形状上的端口位置
+	// 获取目标形状上的端口位置（auto 端口先解析为实际端口）
 	const ports = getShapePorts(editor, targetShape)
-	const port = ports?.[binding.props.portId]
-	if (!port) return null
+	const portId = resolveConnectorBindingPortId(editor, binding)
+	const port = ports?.[portId]
+	if (!port) {
+		// 遗留数据保护：目标是连接线类形状时不回退（避免连接器互指造成几何递归）
+		if (targetShape.type === 'bezier-connector' || targetShape.type === 'arrow') return null
+		// 端口不存在（如思维导图节点被折叠/删除）：
+		// 回退到形状中心，保证连线仍然跟随形状移动而不是悬空在旧坐标
+		const bounds = editor.getShapePageBounds(binding.toId)
+		return bounds ? { x: bounds.x + bounds.w / 2, y: bounds.y + bounds.h / 2 } : null
+	}
 
 	// 转换为页面坐标
 	return editor.getShapePageTransform(targetShape).applyToPoint(port)
@@ -110,6 +168,10 @@ export function getConnectorBindingPositionInPageSpace(
 
 /**
  * 创建或更新绑定
+ *
+ * 统一策略：除 mind-map（端口按节点定位，auto 无法解析到具体节点）外，
+ * 所有绑定的 portId 一律归一化为 AUTO_PORT_ID——连线根据两形状相对位置
+ * 自动选择进出方向并随移动换边，所有调用点行为一致。
  */
 export function createOrUpdateConnectorBinding(
 	editor: Editor,
@@ -119,9 +181,16 @@ export function createOrUpdateConnectorBinding(
 ) {
 	const connectorId = typeof connector === 'string' ? connector : connector.id
 
+	// 归一化 portId：非 mind-map 目标一律使用 auto
+	const targetShape = editor.getShape(targetId)
+	const normalizedProps: ConnectorBinding['props'] =
+		targetShape && targetShape.type !== 'mind-map'
+			? { ...props, portId: AUTO_PORT_ID }
+			: props
+
 	const existing = editor
 		.getBindingsFromShape<ConnectorBinding>(connectorId, 'bezier-connector')
-		.filter((b) => b.props.terminal === props.terminal)
+		.filter((b) => b.props.terminal === normalizedProps.terminal)
 
 	if (existing.length > 1) {
 		editor.deleteBindings(existing.slice(1))
@@ -130,17 +199,18 @@ export function createOrUpdateConnectorBinding(
 	const current = existing[0]
 	if (current) {
 		// 如果没有变化则跳过，避免重复写 store
-		if (current.toId === targetId && current.props.portId === props.portId) {
+		if (current.toId === targetId && current.props.portId === normalizedProps.portId) {
 			return
 		}
 		editor.updateBinding({
 			...current,
 			toId: targetId,
-			props,
+			props: normalizedProps,
 		})
 		// 显示短暂的连接高亮反馈（端口和整个 connector）
 		try {
-			setFlashWithConnectorIfChanged(editor, { shapeId: targetId, portId: props.portId }, connectorId, 350)
+			const flashPortId = resolveConnectorBindingPortId(editor, { ...current, toId: targetId, props: normalizedProps })
+			setFlashWithConnectorIfChanged(editor, { shapeId: targetId, portId: flashPortId }, connectorId, 350)
 		} catch (e) {
 			// ignore
 		}
@@ -149,11 +219,15 @@ export function createOrUpdateConnectorBinding(
 			type: 'bezier-connector',
 			fromId: connectorId,
 			toId: targetId,
-			props,
+			props: normalizedProps,
 		})
 		// 显示短暂的连接高亮反馈（端口和整个 connector）
 		try {
-			setFlashWithConnectorIfChanged(editor, { shapeId: targetId, portId: props.portId }, connectorId, 350)
+			const created = editor
+				.getBindingsFromShape<ConnectorBinding>(connectorId, 'bezier-connector')
+				.find((b) => b.props.terminal === normalizedProps.terminal)
+			const flashPortId = created ? resolveConnectorBindingPortId(editor, created) : normalizedProps.portId
+			setFlashWithConnectorIfChanged(editor, { shapeId: targetId, portId: flashPortId }, connectorId, 350)
 		} catch (e) {
 			// ignore
 		}
@@ -178,6 +252,7 @@ export function removeConnectorBinding(
 
 /**
  * 获取与某个形状关联的所有连接
+ * ownPortId 已将 auto 端口解析为当前实际端口
  */
 export function getShapeConnections(
 	editor: Editor,
@@ -190,7 +265,7 @@ export function getShapeConnections(
 	const bindings = editor.getBindingsToShape<ConnectorBinding>(shapeId, 'bezier-connector')
 	return bindings.map((binding) => ({
 		connectionId: binding.fromId,
-		ownPortId: binding.props.portId,
+		ownPortId: resolveConnectorBindingPortId(editor, binding),
 		terminal: binding.props.terminal,
 	}))
 }
