@@ -1,5 +1,6 @@
 import { createShapePropsMigrationIds, createShapePropsMigrationSequence } from '@tldraw/tldraw'
-import { Editor, createShapeId } from '@tldraw/tldraw'
+import { Editor, TLShapePartial, createShapeId } from '@tldraw/tldraw'
+import type { ICardShape } from './card-shape-types'
 
 const versions = createShapePropsMigrationIds(
   // this must match the shape type in the shape definition
@@ -7,6 +8,7 @@ const versions = createShapePropsMigrationIds(
   {
     Addv: 1,
     AddrefreshNonce:2,
+    AddCollapsedTextStyle: 3,
   }
 )
 
@@ -31,6 +33,16 @@ export const cardShapeMigrations = createShapePropsMigrationSequence({
       },
       down(props) {
         delete props.refreshNonce
+      },
+    },
+    {
+      id: versions.AddCollapsedTextStyle,
+      up(_props) {
+        // 新属性使用默认值，无需显式设置
+      },
+      down(props) {
+        delete props.collapsedTextSize
+        delete props.collapsedTextAlign
       },
     },
   ],
@@ -59,7 +71,7 @@ export function initCardsWithBlockIds(
   } = options
 
   // 为每个 blockId 创建一个卡片
-  const shapes = blockIds.map((blockId) => {
+  const shapes: TLShapePartial<ICardShape>[] = blockIds.map((blockId) => {
     return {
       id: createShapeId(`card-${blockId}`),
       type: 'card',

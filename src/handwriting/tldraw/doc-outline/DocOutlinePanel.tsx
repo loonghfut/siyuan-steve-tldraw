@@ -2,59 +2,32 @@
  * 文档大纲面板组件
  * 显示白板绑定文档的大纲，支持将块添加到白板
  */
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     track,
     useEditor,
 } from '@tldraw/tldraw';
 import { api } from '@frostime/siyuan-plugin-kits';
-import { getDocOutline } from '@/api/api';
 import { openTab, showMessage } from 'siyuan';
-
-/**
- * 移除文本中的HTML实体和HTML标签
- */
-function stripHtmlEntities(text?: string): string {
-    if (!text) return '';
-    // 先移除HTML标签
-    const withoutTags = text.replace(/<[^>]*>/g, '');
-    // 再替换HTML实体
-    return withoutTags
-        .replace(/&nbsp;/gi, ' ')
-        .replace(/&amp;/gi, '&')
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>')
-        .replace(/&quot;/gi, '"')
-        .replace(/&#39;/gi, "'")
-        .replace(/&apos;/gi, "'")
-        .trim();
-}
+import type { ICardShape } from '../CardShape/card-shape-types';
+import { insertDocRelations } from './insert-doc-relations';
+import { collectAllOutlineNodeIds, loadOutlineForDoc, outlineNodeToRelationItem, type OutlineNode } from './doc-outline-data';
 
 interface DocOutlinePanelProps {
     isOpen: boolean;
     onClose: () => void;
     docId: string | null; // 绑定的文档ID
-}
-
-/** 大纲节点类型 */
-interface OutlineNode {
-    id: string;
-    name?: string;
-    type?: string;
-    subType?: string;
-    depth?: number;
-    content?: string; // blocks 中的内容字段
-    blocks?: OutlineNode[]; // 递归的大纲块
-    children?: OutlineNode[]; // 备用字段
+    selectedMainCard: ICardShape | null;
 }
 
 /**
  * 文档大纲面板组件
  */
-export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePanelProps) => {
+export const DocOutlinePanel = track(({ isOpen, onClose, docId, selectedMainCard }: DocOutlinePanelProps) => {
     const editor = useEditor();
     const [outline, setOutline] = useState<OutlineNode[]>([]);
     const [loading, setLoading] = useState(false);
+    const [insertingAll, setInsertingAll] = useState(false);
     const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
     const panelRef = useRef<HTMLDivElement | null>(null);
     const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
@@ -82,6 +55,14 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePane
     const isBlockInBoard = useCallback((blockId: string): boolean => {
         return addedBlockIds.has(blockId);
     }, [addedBlockIds]);
+
+    const canInsertAll = Boolean(
+        selectedMainCard &&
+        docId &&
+        selectedMainCard.props.blockId === docId &&
+        outline.length > 0 &&
+        !insertingAll
+    );
 
     // 获取白板中指定 blockId 对应的 shape
     const getShapeByBlockId = useCallback((blockId: string) => {
@@ -122,33 +103,6 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePane
         };
     }, [isOpen, editor, collectAddedBlockIds]);
 
-    // 收集所有大纲节点ID（包含 blocks 中的节点）
-    const collectAllNodeIds = useCallback((nodes: OutlineNode[]): string[] => {
-        const ids: string[] = [];
-        const collect = (n: OutlineNode) => {
-            ids.push(n.id);
-            // 收集 blocks 中的节点
-            if (n.blocks) {
-                n.blocks.forEach(block => collect(block));
-            }
-            // children 已废弃，统一使用 blocks
-        };
-        nodes.forEach(collect);
-        return ids;
-    }, []);
-
-    // 递归转换 blocks（包括 children 中的子项）
-    const transformBlock = (block: any): OutlineNode => ({
-        id: block.id,
-        name: stripHtmlEntities(block.content || block.name), // 使用 content 作为标题
-        type: block.type,
-        subType: block.subType,
-        depth: block.depth,
-        content: stripHtmlEntities(block.content),
-        blocks: block.children?.map(transformBlock), // children 转为 blocks
-        children: null,
-    });
-
     // 加载文档大纲
     const loadOutline = useCallback(async (signal?: AbortSignal) => {
         if (!docId) {
@@ -158,26 +112,11 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePane
 
         setLoading(true);
         try {
-            const result = await getDocOutline(docId);
+            const transformedOutline = await loadOutlineForDoc(docId, signal);
             if (signal?.aborted) return;
-            const outlineData = result as any;
-
-            // 转换数据格式 - 实际层级在 blocks 中
-            const transformNode = (node: any): OutlineNode => ({
-                id: node.id,
-                name: stripHtmlEntities(node.name), // 顶层是文档标题
-                type: node.type,
-                subType: node.subType,
-                depth: node.depth,
-                blocks: node.blocks?.map(transformBlock), // 递归转换 blocks
-                children: null,
-            });
-
-            const transformedOutline = outlineData.map(transformNode);
             setOutline(transformedOutline);
 
-            // 默认展开所有节点
-            const allIds = collectAllNodeIds(transformedOutline);
+            const allIds = collectAllOutlineNodeIds(transformedOutline);
             setExpandedNodes(new Set(allIds));
         } catch (err) {
             if (signal?.aborted) return;
@@ -188,7 +127,7 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePane
                 setLoading(false);
             }
         }
-    }, [docId, collectAllNodeIds]);
+    }, [docId]);
 
     // 初始化和监听更新
     useEffect(() => {
@@ -398,6 +337,38 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePane
         e.dataTransfer.effectAllowed = 'copy';
     }, []);
 
+    const handleInsertAll = useCallback(async () => {
+        if (!selectedMainCard || !docId || selectedMainCard.props.blockId !== docId) return;
+
+        setInsertingAll(true);
+        try {
+            const result = await insertDocRelations({
+                editor,
+                mainCard: selectedMainCard,
+                items: outline.map(outlineNodeToRelationItem),
+                kind: 'outline-block',
+            });
+
+            if (result.createdShapeIds.length === 0) {
+                showMessage('无可插入大纲块', 3000, 'info');
+                return;
+            }
+
+            showMessage(
+                result.skippedCount > 0
+                    ? `已插入 ${result.createdShapeIds.length} 个大纲块，跳过 ${result.skippedCount} 个已存在项`
+                    : `已插入 ${result.createdShapeIds.length} 个大纲块`,
+                3000,
+                'info'
+            );
+        } catch (err) {
+            console.error('insert all outline blocks failed', err);
+            showMessage('插入大纲块失败', 3000, 'error');
+        } finally {
+            setInsertingAll(false);
+        }
+    }, [selectedMainCard, docId, outline, editor]);
+
     // 获取标题图标
     const getHeadingIcon = (subType?: string): string => {
         switch (subType) {
@@ -588,6 +559,30 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId }: DocOutlinePane
                     文档大纲
                 </span>
                 <div style={{ display: 'flex', gap: '4px' }}>
+                    <button
+                        onClick={(e: React.MouseEvent) => { e.stopPropagation(); e.preventDefault(); void handleInsertAll(); }}
+                        disabled={!canInsertAll}
+                        style={{
+                            border: 'none',
+                            background: 'transparent',
+                            cursor: canInsertAll ? 'pointer' : 'not-allowed',
+                            color: canInsertAll ? 'var(--b3-theme-on-background)' : 'var(--b3-theme-on-surface-light)',
+                            fontSize: '12px',
+                            padding: '4px 8px',
+                            opacity: canInsertAll ? 1 : 0.6,
+                        }}
+                        title={
+                            !selectedMainCard
+                                ? '请先选中主文档卡片'
+                                : selectedMainCard.props.blockId !== docId
+                                    ? '当前选中主卡片与面板文档不一致'
+                                    : outline.length === 0
+                                        ? '当前没有可插入的大纲块'
+                                        : '插入全部大纲'
+                        }
+                    >
+                        {insertingAll ? '插入中...' : '插入全部'}
+                    </button>
                     <button
                         onClick={(e: React.MouseEvent) => { e.stopPropagation(); e.preventDefault(); loadOutline(); }}
                         style={{

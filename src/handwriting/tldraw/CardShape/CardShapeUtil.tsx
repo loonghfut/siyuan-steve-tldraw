@@ -5,13 +5,12 @@ import {
 	ShapeUtil,
 	SvgExportContext,
 	TLResizeInfo,
-	getDefaultColorTheme,
 	resizeBox,
 } from '@tldraw/tldraw'
 import { cardShapeMigrations } from './card-shape-migrations'
-import { cardShapeProps } from './card-shape-props'
+import { cardShapeProps, getCardShapeDefaultProps } from './card-shape-props'
 import { CardRenderMode, ICardShape } from './card-shape-types'
-import { Protyle, showMessage, TProtyleAction } from 'siyuan';
+import { openTab, Protyle, showMessage, TProtyleAction } from 'siyuan';
 import * as api from '@/api/api';
 import { settingdata } from '@/index';
 import { buildTldrawLink } from '../utils/link-builder';
@@ -21,10 +20,22 @@ import { PortsOverlay } from '../BezierConnectorShape/Port'
 import { renderAllContent } from '../utils/render/content-renderer'
 import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
 import { exportCardShapeToSvg } from './CardShapeExport'
+import { getCardCollapsedHeight } from './card-collapse'
+import { getDefaultColorTheme } from '../utils/color-theme'
+import { inputDialogSync } from '@/libs/dialog'
+import {
+	beginBranchAttachmentDrag,
+	clearBranchInteractionHint,
+	getBranchInteractionHintForShape,
+	setBranchInteractionHint,
+	syncBranchMoveForRootContent,
+	updateBranchAttachmentAfterDrag,
+	useBranchInteractionHint,
+} from '../BranchShape'
 
-let isCreatingBlock = false;
-// 仅用于并发创建控制，不再缓存最近创建的块ID
-let pendingCreationPromise: Promise<string> | null = null;
+// 按卡片隔离创建流程，避免多个新卡片互相复用创建结果
+const pendingCreationPromises = new Map<string, Promise<string>>();
+const draggingBranchCardIds = new Set<string>()
 
 // 静态预览 DOM 缓存：避免重复请求
 const staticPreviewCache = new Map<string, { html: string; fontSize: number }>();
@@ -33,6 +44,87 @@ const MAX_CACHE_SIZE = 50;
 // 限制首屏渲染规模，避免一次性插入过多 DOM
 const INITIAL_NODE_LIMIT = 80;
 const INITIAL_TEXT_LIMIT = 8000;
+const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
+const STEVE_TOOLS_PLUGIN_URL_RE = /^(?:https:\/\/|siyuan:\/\/)plugins\/siyuan-steve-tools\//i
+
+function decodeLinkTarget(value: string) {
+	return value
+		.replace(/&amp;/g, '&')
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.trim()
+}
+
+function getSiyuanBlockIdFromLink(rawHref: string): string | null {
+	const href = decodeLinkTarget(rawHref)
+	const directMatch = href.match(/^siyuan:\/\/blocks\/(\d{14}-[0-9a-z]{7})/i)
+	if (directMatch) return directMatch[1]
+	if (/^\d{14}-[0-9a-z]{7}$/i.test(href)) return href
+
+	try {
+		const parsed = new URL(href, window.location.href)
+		const idFromQuery = parsed.searchParams.get('id') || parsed.searchParams.get('blockId')
+		if (idFromQuery && SIYUAN_BLOCK_ID_RE.test(idFromQuery)) return idFromQuery.match(SIYUAN_BLOCK_ID_RE)![0]
+		const idFromHash = parsed.hash.match(SIYUAN_BLOCK_ID_RE)
+		if (idFromHash) return idFromHash[0]
+	} catch {
+		// ignore invalid or relative URLs
+	}
+
+	return null
+}
+
+function isSteveToolsPluginUrl(rawHref: string) {
+	return STEVE_TOOLS_PLUGIN_URL_RE.test(decodeLinkTarget(rawHref))
+}
+
+function clearStaticTextSelection() {
+	try {
+		window.getSelection()?.removeAllRanges()
+	} catch {
+		// ignore
+	}
+}
+
+function clearStaticTextSelectionSoon() {
+	clearStaticTextSelection()
+	if (typeof requestAnimationFrame === 'function') {
+		requestAnimationFrame(clearStaticTextSelection)
+	} else {
+		window.setTimeout(clearStaticTextSelection, 0)
+	}
+}
+
+function findStaticLinkTarget(target: EventTarget | null, root: HTMLElement | null) {
+	if (!(target instanceof HTMLElement) || !root) return null
+
+	let el: HTMLElement | null = target
+	while (el && root.contains(el)) {
+		const dataType = el.getAttribute('data-type') || ''
+		const dataHref = el.getAttribute('data-href') || ''
+		const href = el instanceof HTMLAnchorElement ? el.getAttribute('href') || dataHref : dataHref
+		const nodeId =
+			el.getAttribute('data-id') ||
+			el.getAttribute('data-node-id') ||
+			el.getAttribute('data-av-id') ||
+			''
+
+		if ((dataType.includes('block-ref') || dataType.includes('file-annotation-ref')) && SIYUAN_BLOCK_ID_RE.test(nodeId)) {
+			return { blockId: nodeId.match(SIYUAN_BLOCK_ID_RE)![0], href: '' }
+		}
+
+		if (href) {
+			return { blockId: getSiyuanBlockIdFromLink(href), href: decodeLinkTarget(href) }
+		}
+
+		if (el === root) break
+		el = el.parentElement
+	}
+
+	return null
+}
 
 function cacheStaticPreview(blockId: string, html: string, fontSize: number) {
 	if (staticPreviewCache.size >= MAX_CACHE_SIZE) {
@@ -118,9 +210,16 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		if (prev.props.blockId && next.props.blockId === '') {
 			next.props.blockId = prev.props.blockId;
 		}
+
+		if (draggingBranchCardIds.has(next.id as string) && (prev.x !== next.x || prev.y !== next.y)) {
+			syncBranchMoveForRootContent(this.editor, prev, next)
+			setBranchInteractionHint(getBranchInteractionHintForShape(this.editor, next))
+		}
 	}
 
 	getDefaultProps(): ICardShape['props'] {
+		return getCardShapeDefaultProps()
+		/*
 		return {
 			w: 300,
 			h: 300,
@@ -134,7 +233,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			isCollapsed: false, // 默认不折叠
 			renderMode: 'inherit' as CardRenderMode, // 卡片单独渲染模式: inherit | static-dom | live-protyle
 			// version: 1, // 版本号
+			collapsedTextSize: 21, // 折叠后的文字大小
+			collapsedTextAlign: 'center', // 折叠后的文字对齐方式
 		}
+		*/
 	}
 
 	// [5]
@@ -145,15 +247,29 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			isFilled: true,
 		})
 	}
+
+	override getIndicatorPath(shape: ICardShape) {
+		const path = new Path2D()
+		path.rect(0, 0, shape.props.w, shape.props.h)
+		return path
+	}
 	// [6]
 	component(shape: ICardShape) {
 		// const bounds = this.editor.getShapeGeometry(shape).bounds
+		const editor = this.editor
 		const theme = getDefaultColorTheme({ isDarkMode: this.editor.user.getIsDarkMode() })
 		const isEditing = this.editor.getEditingShapeId() === shape.id;
+		const branchInteractionHint = useBranchInteractionHint()
+		const isRootAttachTarget =
+			branchInteractionHint?.mode === 'attach' &&
+			branchInteractionHint.slot === 'root' &&
+			(branchInteractionHint.targetShapeId === shape.id ||
+				(!branchInteractionHint.targetShapeId && branchInteractionHint.draggingShapeId === shape.id))
 		const [isEditingState, setIsEditingState] = useState(isEditing);
 		const [isInViewport, setIsInViewport] = useState(true);
 		const [canLoad, setCanLoad] = useState(true); // gating heavy render by global manager
 		const [isHovered, setIsHovered] = useState(false);
+		const [hasMissingLinkedBlock, setHasMissingLinkedBlock] = useState(false);
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false;
 		const tldrawHeaderImage = settingdata['tldraw-header-image'] !== false;
 		const [collapsedText, setCollapsedText] = useState<string>('加载中...');
@@ -167,7 +283,19 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		} | null>(null);
 		const isCollapsed = shape.props.isCollapsed || false;
 		const isMainCard = Boolean(shape.props.isMain);
+		const collapsedTextSize = shape.props.collapsedTextSize || 21; // 折叠文字大小，默认21px
+		const collapsedTextAlign = shape.props.collapsedTextAlign || 'center'; // 折叠文字对齐，默认居中
+		const collapsedTextLineHeight = 1.4;
+		const collapsedTextAvailableHeight = Math.max(
+			shape.props.h - 20,
+			collapsedTextSize * collapsedTextLineHeight
+		);
+		const collapsedTextLineClamp = Math.max(
+			1,
+			Math.floor(collapsedTextAvailableHeight / (collapsedTextSize * collapsedTextLineHeight))
+		);
 		const headerGradientFallback = `linear-gradient(135deg, ${theme[shape.props.color].solid} 0%, ${theme[shape.props.color].semi} 100%)`;
+		const cardInnerGap = 4
 
 		// 计算有效渲染模式（不使用 useMemo，确保每次渲染都读取最新的全局设置）
 		const globalRenderMode: Exclude<CardRenderMode, 'inherit'> =
@@ -176,6 +304,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			shape.props.renderMode === 'inherit' || !shape.props.renderMode
 				? globalRenderMode
 				: (shape.props.renderMode as Exclude<CardRenderMode, 'inherit'>);
+		const cardInnerEdgeShadow = 'inset 0 0 0 5px var(--b3-body-background, var(--b3-theme-background, #fff))'
+		const cardOuterShadow = isRootAttachTarget
+			? '0 0 0 4px rgba(34, 197, 94, 0.42), 0 0 20px rgba(34, 197, 94, 0.32)'
+			: isEditingState
+				? '0 0 0 2px #3d8aff'
+				: ''
 
 		// 缓存 blockId 以减少属性访问
 		const blockId = shape.props.blockId;
@@ -184,7 +318,30 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// 追踪上一次的编辑状态，用于检测编辑->非编辑的切换
 		const prevIsEditingRef = useRef(isEditingState);
 		const refreshNonceRef = useRef(shape.props.refreshNonce);
+		// 每个新卡片只询问一次用户标题，避免编辑态重渲染时重复弹窗
+		const userTitlePromptedRef = useRef(false)
 		const prevCollapsedRef = useRef(isCollapsed);
+
+		// 稳定引用当前 shape props，供折叠图标点击回调使用，避免 useCallback 依赖 shape.props 导致频繁重建
+		const shapePropsRef = useRef(shape.props);
+		shapePropsRef.current = shape.props;
+
+		const handleUncollapse = useCallback((e: React.PointerEvent | React.MouseEvent) => {
+			e.stopPropagation();
+			e.preventDefault();
+			const props = shapePropsRef.current;
+			const storedHeight = props.preCollapseHeight;
+			this.editor.updateShape({
+				id: shape.id,
+				type: shape.type,
+				props: {
+					...props,
+					isCollapsed: false,
+					h: storedHeight && storedHeight > 0 ? storedHeight : props.h,
+					preCollapseHeight: undefined,
+				},
+			});
+		}, [shape.id, shape.type]);
 
 
 		// 仅在编辑时创建 Protyle 实例
@@ -193,6 +350,13 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const protyleHostRef = useRef<HTMLDivElement | null>(null)
 		// 非编辑态下的静态预览节点（由 Protyle contentElement 克隆而来）
 		const staticPreviewRef = useRef<HTMLElement | null>(null)
+		const staticPreviewHandlersRef = useRef<{
+			target: HTMLElement
+			pointerDown: (event: PointerEvent) => void
+			pointerUp: (event: PointerEvent) => void
+			click: (event: MouseEvent) => void
+			dragStart: (event: DragEvent) => void
+		} | null>(null)
 		// 防止重复销毁：为每个 Protyle 实例设置一个已销毁标记
 		const DESTROYED_MARK = '__st_destroyed__'
 		const safeDestroyProtyle = (pt: Protyle | null | undefined) => {
@@ -202,6 +366,96 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			try { pt.destroy() } catch { }
 			anyPt[DESTROYED_MARK] = true
 		}
+		const removeStaticPreviewLinkHandlers = useCallback((preview?: HTMLElement | null) => {
+			const handlers = staticPreviewHandlersRef.current
+			const target = handlers?.target || preview || staticPreviewRef.current
+			if (!target || !handlers) return
+			target.removeEventListener('pointerdown', handlers.pointerDown, true)
+			target.removeEventListener('pointerup', handlers.pointerUp, true)
+			target.removeEventListener('click', handlers.click, true)
+			target.removeEventListener('dragstart', handlers.dragStart, true)
+			target.classList.remove('card-static-content')
+			staticPreviewHandlersRef.current = null
+		}, [])
+		const openStaticLinkTarget = useCallback((target: { blockId: string | null; href: string }) => {
+			if (target.blockId) {
+				if (!window.siyuan?.ws?.app) return
+				void openTab({
+					app: window.siyuan.ws.app,
+					doc: {
+						id: target.blockId,
+						action: ['cb-get-hl', 'cb-get-all'],
+						zoomIn: false,
+					},
+					position: 'right',
+					keepCursor: false,
+				}).catch((err) => {
+					console.error('jump to card linked block failed', err)
+					try {
+						showMessage('跳转到链接块失败', 3000, 'error')
+					} catch {
+						// ignore
+					}
+				})
+				return
+			}
+
+			if (!target.href || target.href === '#') return
+			const href = target.href.startsWith('assets/') ? `/${target.href}` : target.href
+			if (isSteveToolsPluginUrl(href)) return
+
+			try {
+				if (href.startsWith('siyuan://')) {
+					window.location.href = href
+				} else {
+					window.open(href, '_blank', 'noopener')
+				}
+			} catch (err) {
+				console.error('open card static link failed', err)
+				try {
+					showMessage('打开链接失败', 3000, 'error')
+				} catch {
+					// ignore
+				}
+			}
+		}, [])
+		const installStaticPreviewLinkHandlers = useCallback((preview: HTMLElement) => {
+			removeStaticPreviewLinkHandlers()
+			preview.classList.add('card-static-content')
+			const pointerHandler = (event: PointerEvent) => {
+				if (findStaticLinkTarget(event.target, preview)) {
+					event.preventDefault()
+					clearStaticTextSelectionSoon()
+					event.stopPropagation()
+				}
+			}
+			const clickHandler = (event: MouseEvent) => {
+				if (event.defaultPrevented) return
+				const target = findStaticLinkTarget(event.target, preview)
+				if (!target) return
+				if (!target.blockId && target.href && isSteveToolsPluginUrl(target.href)) return
+				event.preventDefault()
+				event.stopPropagation()
+				clearStaticTextSelectionSoon()
+				openStaticLinkTarget(target)
+			}
+			const dragStartHandler = (event: DragEvent) => {
+				event.preventDefault()
+				event.stopPropagation()
+				clearStaticTextSelectionSoon()
+			}
+			staticPreviewHandlersRef.current = {
+				target: preview,
+				pointerDown: pointerHandler,
+				pointerUp: pointerHandler,
+				click: clickHandler,
+				dragStart: dragStartHandler,
+			}
+			preview.addEventListener('pointerdown', pointerHandler, true)
+			preview.addEventListener('pointerup', pointerHandler, true)
+			preview.addEventListener('click', clickHandler, true)
+			preview.addEventListener('dragstart', dragStartHandler, true)
+		}, [openStaticLinkTarget, removeStaticPreviewLinkHandlers])
 		// 全局由 shapeLoadManager 计算可见性，无需本地定时轮询
 		const loadHandleRef = useRef<ProtyleLoadHandle | null>(null)
 
@@ -210,6 +464,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				loadHandleRef.current.cancel()
 				loadHandleRef.current = null
 			}
+			removeStaticPreviewLinkHandlers()
 			if (staticPreviewRef.current?.parentElement) {
 				try {
 					staticPreviewRef.current.parentElement.removeChild(staticPreviewRef.current)
@@ -230,41 +485,93 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				}
 			}
 			protyleHostRef.current = null
-		}, [])
+		}, [removeStaticPreviewLinkHandlers])
 
 
 		const containerRef = useRef<HTMLDivElement>(null)
-		const cardRootRef = useRef<HTMLDivElement | null>(null)
 		const lastSizeRef = useRef({ h: shape.props.h })
 		// 保存进入编辑前的相机状态，用于退出编辑后恢复视角
 		const prevCameraRef = useRef<any | null>(null)
 		const hadFocusedRef = useRef(false)
+		// 保存编辑前的形状层级索引，用于退出编辑后恢复原层次
+		const originalIndexRef = useRef<string | null>(null)
+		const stopMissingStateEvent = (event: React.PointerEvent | React.MouseEvent) => {
+			event.preventDefault()
+			event.stopPropagation()
+		}
+		const enterMissingLinkedBlockState = useCallback(() => {
+			destroyRuntimeResources()
+			setHasMissingLinkedBlock(true)
+			try {
+				if (editor.getEditingShapeId() === shape.id) {
+					editor.setEditingShape(undefined)
+				}
+			} catch {
+				// ignore
+			}
+		}, [destroyRuntimeResources, editor, shape.id])
+		const handleRefreshMissingLinkedBlock = useCallback((event: React.PointerEvent | React.MouseEvent) => {
+			stopMissingStateEvent(event)
+			if (blockId) {
+				invalidatePreviewCache(blockId)
+			}
+			destroyRuntimeResources()
+			setHasMissingLinkedBlock(false)
+			editor.updateShape({
+				id: shape.id,
+				type: shape.type,
+				props: {
+					...shape.props,
+					refreshNonce: Date.now(),
+				},
+			})
+		}, [blockId, destroyRuntimeResources, editor, shape.id, shape.props, shape.type])
+		const handleDeleteMissingLinkedBlock = useCallback((event: React.PointerEvent | React.MouseEvent) => {
+			stopMissingStateEvent(event)
+			editor.deleteShape(shape.id)
+		}, [editor, shape.id])
 
 
 		useEffect(() => {
 			setIsEditingState(isEditing);
 		}, [isEditing]);
 
-		useLayoutEffect(() => {
-			const el = cardRootRef.current
-			if (!el) return
-			const prevH = lastSizeRef.current.h
-			const nextH = shape.props.h
-			if (prevH === nextH) return
-			if (typeof window !== 'undefined') {
-				const prefersReduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-				if (!prefersReduce) {
-					el.animate(
-						[
-							{ height: `${prevH}px`, opacity: isCollapsed ? 1 : 0.9 },
-							{ height: `${nextH}px`, opacity: 1 },
-						],
-						{ duration: 180, easing: 'ease-in-out' }
-					)
+		// 编辑时临时置顶，退出编辑后恢复原层次
+		useEffect(() => {
+			if (isEditing) {
+				// 进入编辑：保存原始 index 并用原生方法置顶
+				if (originalIndexRef.current === null) {
+					originalIndexRef.current = shape.index;
+				}
+				try {
+					this.editor.bringToFront([shape.id]);
+				} catch (e) {
+					// ignore
+				}
+			} else {
+				// 退出编辑：恢复原始层次
+				if (originalIndexRef.current !== null) {
+					try {
+						this.editor.updateShapes([{
+							id: shape.id,
+							type: shape.type,
+							index: originalIndexRef.current,
+						}]);
+					} catch (e) {
+						// ignore
+					}
+					originalIndexRef.current = null;
 				}
 			}
-			lastSizeRef.current = { h: nextH }
-		}, [shape.props.h, isCollapsed])
+		}, [isEditing, shape.id]);
+
+		useLayoutEffect(() => {
+			const prevH = lastSizeRef.current.h
+			const nextH = shape.props.h
+			if (prevH !== nextH) {
+				lastSizeRef.current = { h: nextH }
+			}
+		}, [shape.props.h])
 
 		// 检测编辑状态变化：从编辑 -> 非编辑时，使静态预览缓存失效
 		useEffect(() => {
@@ -280,7 +587,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// 折叠/展开时记录高度并在展开时恢复
 		useEffect(() => {
 			const prev = prevCollapsedRef.current;
-			const collapsedHeight = Math.max(fontSize * 6, isMainCard ? 260 : 100);
+			const collapsedHeight = getCardCollapsedHeight(shape);
 			const storedHeight = shape.props.preCollapseHeight;
 
 			// 折叠状态下进入编辑：临时恢复到折叠前高度，便于编辑
@@ -560,15 +867,17 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					// 使用批量检查机制
 					let cancelled = false;
 					scheduleBlockCheck(currentBlockId, shape.id).then((exists) => {
-						if (!cancelled && !exists) {
-							showMessage('块不存在,已被删除');
-							this.editor.deleteShape(shape.id);
+						if (cancelled) return;
+						if (exists) {
+							setHasMissingLinkedBlock(false);
+							return;
 						}
+						enterMissingLinkedBlockState();
 					});
 					return () => { cancelled = true; };
 				}
 			}
-		}, [isEditingState, blockId]);
+		}, [blockId, editor, enterMissingLinkedBlockState, isEditingState, shape.id, shape.props, shape.type, shape.props.refreshNonce]);
 		// Protyle 生命周期管理主 Effect
 		// 注意：对于 live-protyle 模式，编辑状态切换不应触发重建
 		useEffect(() => {
@@ -633,7 +942,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						showMessage('配置不完整,请检查设置');
 						return null;
 					}
-					if (isCreatingBlock && pendingCreationPromise) {
+					const pendingCreationPromise = pendingCreationPromises.get(shape.id as string);
+					if (pendingCreationPromise) {
 						try {
 							currentBlockId = await pendingCreationPromise;
 						} catch (e) {
@@ -641,35 +951,65 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						}
 						if (cancelled) return null;
 					} else if (!currentBlockId) {
-						isCreatingBlock = true;
+						const creationPromise = (async () => {
+							const customTitleTemplate = String(settingdata["tldraw-custom-card-title"] || "${timestamp}");
+							const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+							const initialTitle = customTitleTemplate
+								? customTitleTemplate.replace(/\$\{timestamp\}/g, () => timestamp)
+								: timestamp;
+							const idid = await api.generateSiyuanID() as string;
+							const link = buildTldrawLink(tldrawId, idid);
+							// 先创建一个可用的默认标题块，用户输入在创建完成后再更新标题。
+							const content =
+								'###### ' + initialTitle +
+								'\n' +
+								'{: id="' + idid + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
+								'\n\n' +
+								'{: custom-st-tldraw-none="1" }' +
+								'\n';
+							const redata = await api.appendBlock("markdown", content, tldrawId!);
+							const newBlockId = redata[0].doOperations[0].id as string;
+
+							if (isEditingState && !shape.props.blockId && !containerRef.current?.getAttribute('blockid') && settingdata["tldraw-prompt-card-title"] && !userTitlePromptedRef.current) {
+								userTitlePromptedRef.current = true;
+								try {
+									const input = await inputDialogSync({
+										title: '输入卡片标题',
+										placeholder: '请输入标题',
+										width: '520px',
+										confirmOnEnter: true,
+									});
+									const userTitle = input?.replace(/[\r\n]+/g, ' ').trim() || '';
+									if (userTitle) {
+										// updateBlock 会整体替换块内容，因此必须重新附带 Card 的 IAL。
+										await api.updateBlock(
+											'markdown',
+											'###### ' + userTitle +
+											'\n' +
+											'{: id="' + idid + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
+											'\n\n' +
+											'{: custom-st-tldraw-none="1" }' +
+											'\n',
+											newBlockId,
+										);
+									}
+								} catch (err) {
+									// 标题更新失败不应影响已创建块与 Card 的绑定。
+									console.log('更新卡片标题失败，继续使用默认标题', err);
+								}
+							}
+							return newBlockId;
+						})();
+						pendingCreationPromises.set(shape.id as string, creationPromise);
 						try {
-							pendingCreationPromise = (async () => {
-								const idid = await api.generateSiyuanID() as string;
-								const customTitleTemplate = settingdata["tldraw-custom-card-title"] || "${timestamp}";
-								const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-								const renderedTitle = customTitleTemplate
-									? customTitleTemplate.replace(/\$\{timestamp\}/g, timestamp)
-									: timestamp;
-								const link = buildTldrawLink(tldrawId, idid, title);
-								// 将链接保存到自定义属性中
-								const content =
-									'###### ' + renderedTitle +
-									'\n' +
-									'{: id="' + idid + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
-									'\n\n' +
-									'{: custom-st-tldraw-none="1" }' +
-									'\n';
-								const redata = await api.appendBlock("markdown", content, tldrawId!);
-								const newBlockId = redata[0].doOperations[0].id;
-								return newBlockId;
-							})();
-							currentBlockId = await pendingCreationPromise;
+							currentBlockId = await creationPromise;
 							if (cancelled) return null;
 						} catch (err) {
 							console.error('创建块失败', err);
 						} finally {
-							isCreatingBlock = false;
-							setTimeout(() => (pendingCreationPromise = null), 5000);
+							if (pendingCreationPromises.get(shape.id as string) === creationPromise) {
+								pendingCreationPromises.delete(shape.id as string);
+							}
 						}
 					}
 				}
@@ -689,6 +1029,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					const currentContainer = containerRef.current;
 					if (!currentContainer) return;
 					if (staticPreviewRef.current?.parentElement === currentContainer) {
+						removeStaticPreviewLinkHandlers()
 						try {
 							currentContainer.removeChild(staticPreviewRef.current);
 						} catch {
@@ -740,7 +1081,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 								resolveReady && resolveReady();
 							},
 							handleEmptyContent: () => {
-								showMessage('块已被删除');
+								enterMissingLinkedBlockState();
 							},
 						});
 					} catch (err) {
@@ -798,6 +1139,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					if (cachedHtml) {
 						// 使用缓存的预览
 						if (staticPreviewRef.current?.parentElement === containerRef.current) {
+							removeStaticPreviewLinkHandlers()
 							containerRef.current.removeChild(staticPreviewRef.current);
 						}
 						const wrapper = document.createElement('div');
@@ -814,6 +1156,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							protyleHostRef.current = null;
 
 							staticPreviewRef.current = clone;
+							installStaticPreviewLinkHandlers(clone);
 							containerRef.current.appendChild(clone);
 							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
 							await renderAllContent(clone);
@@ -848,6 +1191,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 				// 移除旧的静态预览
 				if (staticPreviewRef.current?.parentElement === containerRef.current) {
+					removeStaticPreviewLinkHandlers()
 					containerRef.current.removeChild(staticPreviewRef.current);
 				}
 				// 清理 Protyle host
@@ -1033,6 +1377,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 				// 渲染所有内容类型（公式、图表等）需要依赖已挂载的 DOM，先挂载再渲染
 				staticPreviewRef.current = previewWrapper;
+				installStaticPreviewLinkHandlers(previewWrapper);
 				containerRef.current.appendChild(previewWrapper);
 				// 先把 protyle-html 转为普通 DOM，再运行后续渲染
 				try { convertProtyleHtmlToDom(previewWrapper); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
@@ -1055,6 +1400,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				if (isEditingState) {
 					// 进入编辑：移除静态预览，创建或复用 Protyle
 					if (staticPreviewRef.current?.parentElement === containerRef.current) {
+						removeStaticPreviewLinkHandlers()
 						containerRef.current.removeChild(staticPreviewRef.current);
 					}
 					staticPreviewRef.current = null;
@@ -1072,6 +1418,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					if (protyleHostRef.current && containerRef.current && protyleHostRef.current.parentElement !== containerRef.current) {
 						containerRef.current.appendChild(protyleHostRef.current);
 					}
+					removeStaticPreviewLinkHandlers()
 					try { protyleRef.current?.enable(); } catch { }
 				} else {
 					// 非编辑
@@ -1085,6 +1432,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							// 普通块：使用 getDoc API 直接获取静态 DOM
 							if (protyleRef.current) {
 								if (protyleHostRef.current?.parentElement) {
+									removeStaticPreviewLinkHandlers()
 									protyleHostRef.current.parentElement.removeChild(protyleHostRef.current);
 								}
 								try { safeDestroyProtyle(protyleRef.current); } catch { }
@@ -1104,6 +1452,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						}
 						// 移除可能存在的静态预览
 						if (staticPreviewRef.current?.parentElement === containerRef.current) {
+							removeStaticPreviewLinkHandlers()
 							containerRef.current.removeChild(staticPreviewRef.current);
 						}
 						staticPreviewRef.current = null;
@@ -1112,6 +1461,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							containerRef.current.appendChild(protyleHostRef.current);
 						}
 						// 禁用交互但保留实例
+						if (protyleHostRef.current) {
+							removeStaticPreviewLinkHandlers()
+							installStaticPreviewLinkHandlers(protyleHostRef.current)
+						}
 						try { protyleRef.current?.disable(); } catch { }
 						// 如果刚从编辑状态退出，刷新内容以反映最新编辑
 						if (wasEditing) {
@@ -1140,15 +1493,13 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 		return (
 			<HTMLContainer
-				ref={cardRootRef}
 				onMouseEnter={() => setIsHovered(true)}
 				onMouseLeave={() => setIsHovered(false)}
-				id={shape.id}
 				style={{
 					display: 'flex',
 					flexDirection: 'column',
 					backgroundColor: theme[shape.props.color].semi,
-					color: theme[shape.props.color].solid,
+					// color: theme[shape.props.color].solid,
 					// 只有在非编辑状态时才禁用指针事件
 					position: 'relative',
 					isolation: 'isolate',
@@ -1159,18 +1510,48 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					width: '100%',
 					height: '100%',
 					overflow: 'visible', // 改为 visible 以显示端口
-					boxShadow: isEditingState ? '0 0 0 2px #3d8aff' : 'none',
+					boxShadow: cardOuterShadow
+						? `${cardOuterShadow}, ${cardInnerEdgeShadow}`
+						: cardInnerEdgeShadow,
 					cursor: isEditingState ? 'text' : 'default',
 					padding: 0,
 					border: settingdata["showCardBorder"] ? `3px solid ${theme[shape.props.color].solid}` : 'none', // 添加颜色边框
 					borderRadius: '10px', // 增加圆角
-					transition: 'height 180ms ease-in-out, width 180ms ease-in-out, box-shadow 120ms ease',
 				}}
 				// onDoubleClick={handleDoubleClick}
 				onPointerDown={handlePointerEvent}
 				onPointerMove={handlePointerEvent}
 				onPointerUp={handlePointerEvent}
 			>
+				<style>
+					{`
+						.card-static-content,
+						.card-static-content .protyle-wysiwyg {
+							pointer-events: none !important;
+							user-select: none !important;
+							-webkit-user-select: none !important;
+							-webkit-touch-callout: none !important;
+						}
+						.card-static-content * {
+							pointer-events: none !important;
+							user-select: none !important;
+							-webkit-user-select: none !important;
+							-webkit-user-drag: none !important;
+							-webkit-touch-callout: none !important;
+						}
+						.card-static-content a,
+						.card-static-content a *,
+						.card-static-content [data-href],
+						.card-static-content [data-href] *,
+						.card-static-content [data-type*="block-ref"],
+						.card-static-content [data-type*="block-ref"] *,
+						.card-static-content [data-type*="file-annotation-ref"],
+						.card-static-content [data-type*="file-annotation-ref"] * {
+							pointer-events: auto !important;
+							cursor: pointer;
+						}
+					`}
+				</style>
 				<div
 					ref={containerRef}
 					blockid={shape.props.blockId}
@@ -1178,16 +1559,19 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						width: '100%',
 						height: '100%',
 						overflow: 'auto', // 内容区域可滚动
-						pointerEvents: isEditingState ? 'all' : 'none',
-						touchAction: isEditingState ? 'auto' : 'none',
+						pointerEvents: isEditingState || (!isMainCard && isCollapsed) ? 'all' : 'none',
+						touchAction: isEditingState || (!isMainCard && isCollapsed) ? 'auto' : 'none',
 						contain: 'strict',
-						padding: '0px',
+						padding: `${cardInnerGap}px`,
+						boxSizing: 'border-box',
 					}}
 				>
 					{/* 折叠状态 */}
 					{isCollapsed && !isEditingState && (
 						isMainCard ? (
-							<div style={{
+							<div
+								className="card-shape-collapsed-content"
+								style={{
 								width: '100%',
 								height: '100%',
 								display: 'flex',
@@ -1199,7 +1583,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 								boxSizing: 'border-box',
 								color: theme[shape.props.color].solid,
 								overflow: 'hidden',
-								transition: 'opacity 140ms ease, transform 140ms ease',
 								opacity: 1,
 								transform: 'translateY(0)'
 							}}
@@ -1245,44 +1628,66 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							</div>
 						</div>
 						) : (
-							<div style={{
+							<div
+								className="card-shape-collapsed-content"
+								style={{
 								width: '100%',
 								height: '100%',
 								display: 'flex',
 								alignItems: 'center',
-								justifyContent: 'flex-start',
+								justifyContent: collapsedTextAlign === 'right' ? 'flex-end' : collapsedTextAlign === 'center' ? 'center' : 'flex-start',
 								padding: '10px 14px',
 								boxSizing: 'border-box',
-								gap: '10px',
-								transition: 'opacity 140ms ease, transform 140ms ease',
+								gap: collapsedTextAlign === 'center' ? '0px' : '10px',
+								position: 'relative',
 								opacity: 1,
 								transform: 'translateY(0)'
 							}}>
-								{/* 折叠图标 */}
+								{/* 折叠图标 — 点击展开 */}
 								<svg
-									width="18"
-									height="18"
+									className="card-shape-collapsed-toggle-icon"
+									width={Math.round(collapsedTextSize * 0.85)}
+									height={Math.round(collapsedTextSize * 0.85)}
 									viewBox="0 0 24 24"
 									fill="none"
 									stroke={theme[shape.props.color].solid}
 									strokeWidth="2"
 									strokeLinecap="round"
 									strokeLinejoin="round"
-									style={{ flexShrink: 0, opacity: 0.6 }}
+									style={{
+									flexShrink: 0,
+									cursor: 'pointer',
+									...(collapsedTextAlign === 'center'
+										? { position: 'absolute', left: '14px', zIndex: 1 }
+										: {}),
+								}}
+									onClick={handleUncollapse}
+									onPointerDown={(e) => e.stopPropagation()}
 								>
+									<title>点击展开</title>
 									<polyline points="4 14 10 14 10 20"></polyline>
 									<polyline points="20 10 14 10 14 4"></polyline>
 									<line x1="14" y1="10" x2="21" y2="3"></line>
 									<line x1="3" y1="21" x2="10" y2="14"></line>
 								</svg>
 								{/* 内容摘要文字 */}
-								<span style={{
-									fontSize: '21px',
+								<span data-card-collapsed-text style={{
+									flex: 1,
+									minWidth: 0,
+									fontSize: `${collapsedTextSize}px`,
 									fontWeight: 500,
 									color: theme[shape.props.color].solid,
-									wordBreak: 'break-all',
-									lineHeight: 1.4,
+									wordBreak: 'break-word',
+									overflowWrap: 'anywhere',
+									lineHeight: collapsedTextLineHeight,
 									opacity: 0.85,
+									textAlign: collapsedTextAlign as any,
+									overflow: 'hidden',
+									textOverflow: 'ellipsis',
+									display: '-webkit-box',
+									WebkitBoxOrient: 'vertical',
+									WebkitLineClamp: collapsedTextLineClamp,
+									maxHeight: `${collapsedTextLineClamp * collapsedTextSize * collapsedTextLineHeight}px`,
 								}}>
 									{collapsedText}
 								</span>
@@ -1325,6 +1730,77 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						</div>
 					)}
 				</div>
+				{!isEditingState && hasMissingLinkedBlock && (
+					<div
+						onPointerDown={stopMissingStateEvent}
+						onClick={stopMissingStateEvent}
+						style={{
+							position: 'absolute',
+							inset: '0',
+							zIndex: 20,
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'center',
+							padding: '16px',
+							background: 'rgba(127, 127, 127, 0.14)',
+							backdropFilter: 'blur(2px)',
+							pointerEvents: 'auto',
+						}}
+					>
+						<div
+							style={{
+								display: 'flex',
+								flexDirection: 'column',
+								alignItems: 'center',
+								gap: '12px',
+								maxWidth: '100%',
+								padding: '16px 18px',
+								borderRadius: '12px',
+								background: 'var(--b3-theme-background, #fff)',
+								border: '1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12))',
+								boxShadow: '0 8px 24px rgba(0, 0, 0, 0.12)',
+								color: theme[shape.props.color].solid,
+								textAlign: 'center',
+							}}
+						>
+							<div style={{ fontSize: `${Math.min(fontSize, 16)}px`, fontWeight: 500 }}>
+								找不到绑定块
+							</div>
+							<div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
+								<button
+									type="button"
+									onPointerDown={stopMissingStateEvent}
+									onClick={handleRefreshMissingLinkedBlock}
+									style={{
+										padding: '6px 12px',
+										borderRadius: '8px',
+										border: '1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12))',
+										background: 'transparent',
+										color: 'inherit',
+										cursor: 'pointer',
+									}}
+								>
+									刷新
+								</button>
+								<button
+									type="button"
+									onPointerDown={stopMissingStateEvent}
+									onClick={handleDeleteMissingLinkedBlock}
+									style={{
+										padding: '6px 12px',
+										borderRadius: '8px',
+										border: '1px solid var(--b3-card-error-color, #d23f31)',
+										background: 'var(--b3-card-error-background, rgba(210, 63, 49, 0.12))',
+										color: 'var(--b3-card-error-color, #d23f31)',
+										cursor: 'pointer',
+									}}
+								>
+									删除
+								</button>
+							</div>
+						</div>
+					</div>
+				)}
 				{/* 端口覆盖层 - 用于贝塞尔连接器 */}
 				<PortsOverlay shapeId={shape.id} parentHovered={isHovered} />
 			</HTMLContainer >
@@ -1341,8 +1817,20 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		return resizeBox(shape, info)
 	}
 
+	override onTranslateStart(shape: ICardShape) {
+		draggingBranchCardIds.add(shape.id as string)
+		beginBranchAttachmentDrag(this.editor, shape)
+		setBranchInteractionHint(getBranchInteractionHintForShape(this.editor, shape))
+	}
+
+	override onTranslateEnd(_initial: ICardShape, currentShape: ICardShape) {
+		draggingBranchCardIds.delete(currentShape.id as string)
+		clearBranchInteractionHint(currentShape.id as string)
+		updateBranchAttachmentAfterDrag(this.editor, currentShape)
+	}
+
 	override toSvg(shape: ICardShape, ctx: SvgExportContext): ReactElement | null {
-		return exportCardShapeToSvg(shape, ctx)
+		return exportCardShapeToSvg(shape, ctx, this.editor.getContainer())
 	}
 
 }

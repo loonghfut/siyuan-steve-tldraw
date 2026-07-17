@@ -5,6 +5,16 @@
 import { api } from "@frostime/siyuan-plugin-kits";
 import { Editor, TLShape, TLAsset, TLShapeId, createShapeId, TLAssetId, TLBinding, TLBindingId, createBindingId } from "@tldraw/tldraw";
 import { showMessage } from "siyuan";
+import type { IBranchShape } from "../BranchShape";
+import {
+    getAllBranchAttachedShapeIds,
+    layoutBranchChildren,
+    markExplicitCreatedBranchRelations,
+    relayoutBranchesContainingShapes,
+} from "../BranchShape";
+import { clearSvgExportSnapshotCache } from "../utils/export-dom-snapshot";
+import { getTldrawImageExportOptions } from "../utils/export-image-options";
+import { prepareSvgExportSnapshots } from "../utils/export-snapshot-preparer";
 
 /** 素材库项目接口 */
 export interface ShapeLibraryItem {
@@ -154,6 +164,31 @@ function collectBindingsForShapes(editor: Editor, shapes: TLShape[]): TLBinding[
     return bindings;
 }
 
+function expandShapesWithBranchAttachments(editor: Editor, shapes: TLShape[]): TLShape[] {
+    const expanded = new Map<string, TLShape>();
+    const queue = [...shapes];
+
+    for (const shape of shapes) {
+        expanded.set(shape.id as string, shape);
+    }
+
+    for (let index = 0; index < queue.length; index++) {
+        const shape = queue[index];
+        if (shape.type !== 'branch') continue;
+
+        for (const attachedId of getAllBranchAttachedShapeIds(shape as IBranchShape)) {
+            if (expanded.has(attachedId)) continue;
+            const attachedShape = editor.getShape(attachedId as TLShapeId);
+            if (!attachedShape) continue;
+
+            expanded.set(attachedId, attachedShape);
+            queue.push(attachedShape);
+        }
+    }
+
+    return Array.from(expanded.values());
+}
+
 /**
  * 生成形状的缩略图
  * @param editor tldraw编辑器实例
@@ -164,12 +199,21 @@ async function generateThumbnail(editor: Editor, shapeIds: TLShapeId[]): Promise
     try {
         console.debug('[素材库] 开始生成缩略图，形状数量:', shapeIds.length);
         
-        // 使用tldraw的toImage API生成图片
-        const imageResult = await editor.toImage(shapeIds, {
-            format: 'png',
-            background: true,
-            padding: 16,
-        });
+        const imageResult = await (async () => {
+            try {
+                await prepareSvgExportSnapshots(editor, shapeIds);
+
+                // 使用tldraw的toImage API生成图片
+                return await editor.toImage(shapeIds, {
+                    format: 'png',
+                    background: true,
+                    padding: 16,
+                    ...getTldrawImageExportOptions(),
+                });
+            } finally {
+                clearSvgExportSnapshotCache();
+            }
+        })();
 
         if (!imageResult || !imageResult.blob) {
             console.warn('[素材库] 生成缩略图失败：imageResult为空');
@@ -255,17 +299,19 @@ export async function addShapesToLibrary(
     }
 
     try {
+        const libraryShapes = expandShapesWithBranchAttachments(editor, selectedShapes);
+
         // 克隆形状数据
-        const shapes = selectedShapes.map(shape => JSON.parse(JSON.stringify(shape)));
+        const shapes = libraryShapes.map(shape => JSON.parse(JSON.stringify(shape)));
         
         // 收集相关资源
-        const assets = collectAssetsForShapes(editor, selectedShapes);
+        const assets = collectAssetsForShapes(editor, libraryShapes);
         
         // 收集相关绑定（连接器与形状的绑定关系）
-        const bindings = collectBindingsForShapes(editor, selectedShapes);
+        const bindings = collectBindingsForShapes(editor, libraryShapes);
         
         // 生成缩略图
-        const shapeIds = selectedShapes.map(s => s.id);
+        const shapeIds = libraryShapes.map(s => s.id);
         console.debug('[素材库] 准备为以下形状生成缩略图:', shapeIds);
         const thumbnail = await generateThumbnail(editor, shapeIds);
         console.debug('[素材库] 缩略图生成完成:', thumbnail ? '成功' : '失败');
@@ -299,7 +345,7 @@ export async function addShapesToLibrary(
         const library = await loadShapeLibrary();
         library.items.unshift(item); // 添加到开头
         await saveShapeLibrary(library);
-        showMessage(`已添加 ${selectedShapes.length} 个形状到素材库`);
+        showMessage(`已添加 ${libraryShapes.length} 个形状到素材库`);
 
         // 通知外部（UI）素材库已更新，便于面板刷新
         try {
@@ -467,6 +513,22 @@ function replaceIdsInShape(
     };
 
     replaceAssetIds(newShape.props);
+
+    if (newShape.type === 'branch') {
+        const props = (newShape as IBranchShape).props;
+        const replaceBranchChildIds = (ids: string[] | undefined) =>
+            (ids || [])
+                .map(id => shapeIdMap.get(id) as string | undefined)
+                .filter((id): id is string => !!id);
+        const rootShapeId = props.rootShapeId ? shapeIdMap.get(props.rootShapeId) as string | undefined : undefined;
+
+        newShape.props = {
+            ...props,
+            leftChildIds: replaceBranchChildIds(props.leftChildIds),
+            rightChildIds: replaceBranchChildIds(props.rightChildIds),
+            rootShapeId,
+        };
+    }
     
     return newShape;
 }
@@ -513,10 +575,15 @@ export function addLibraryItemToCanvas(
 
         // 按照层级顺序创建形状（先创建父级）
         const sortedShapes = sortShapesByParentage(newShapes, shapeIdMap);
-        
-        for (const shape of sortedShapes) {
-            editor.createShape(shape);
+        const createdBranchIds = sortedShapes
+            .filter((shape): shape is IBranchShape => shape.type === 'branch')
+            .map(shape => shape.id);
+
+        if (createdBranchIds.length > 0) {
+            markExplicitCreatedBranchRelations(editor, createdBranchIds);
         }
+        
+        editor.createShapes(sortedShapes);
 
         // 恢复绑定关系（连接器与形状的绑定）
         if (item.bindings && item.bindings.length > 0) {
@@ -538,6 +605,15 @@ export function addLibraryItemToCanvas(
         }
 
         // 选中新创建的形状
+        for (const branchId of createdBranchIds) {
+            const branch = editor.getShape<IBranchShape>(branchId);
+            if (branch?.type === 'branch') layoutBranchChildren(editor, branch);
+        }
+
+        if (createdBranchIds.length > 0) {
+            relayoutBranchesContainingShapes(editor, createdBranchIds);
+        }
+
         editor.select(...Array.from(shapeIdMap.values()));
         
         showMessage(`已添加 ${item.shapes.length} 个形状到画布`);

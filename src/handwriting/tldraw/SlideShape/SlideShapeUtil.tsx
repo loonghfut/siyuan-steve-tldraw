@@ -13,12 +13,12 @@ import {
 	useValue,
 	DefaultColorStyle,
 	TLDefaultColorStyle,
-	getDefaultColorTheme,
 	HTMLContainer,
 	stopEventPropagation,
 } from '@tldraw/tldraw'
 import { moveToSlide } from './useSlides'
 import { slideShapeMigrations } from './SlideShapeMigrations'
+import { getDefaultColorTheme } from '../utils/color-theme'
 
 export type SlideShape = TLBaseShape<
 	'slide',
@@ -29,7 +29,6 @@ export type SlideShape = TLBaseShape<
 		version?: number // 添加 version 属性定义
 		color: TLDefaultColorStyle
 		screenshot?: string
-		blockId?: string
 		borderStyle?: 'solid' | 'dashed' | 'wavy' // 边框样式：实线、虚线、流动效果
 	}
 >
@@ -43,7 +42,6 @@ export class SlideShapeUtil extends ShapeUtil<SlideShape> {
 		version: T.optional(T.number), // 添加 version 属性定义
 		color: DefaultColorStyle, // 添加 color 属性定义
 		screenshot: T.optional(T.string),
-		blockId: T.optional(T.string),
 		borderStyle: T.optional(T.string) as any, // 边框样式: solid, dashed, wavy
 	}
 	static override migrations = slideShapeMigrations
@@ -71,6 +69,12 @@ export class SlideShapeUtil extends ShapeUtil<SlideShape> {
 			height: shape.props.h,
 			isFilled: false,
 		})
+	}
+
+	override getIndicatorPath(shape: SlideShape) {
+		const path = new Path2D()
+		path.rect(0, 0, shape.props.w, shape.props.h)
+		return path
 	}
 
 	override onRotate(initial: SlideShape) {

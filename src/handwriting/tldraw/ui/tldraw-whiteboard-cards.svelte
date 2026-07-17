@@ -1,8 +1,12 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
-    import { showMessage, openTab, Plugin } from 'siyuan';
+    import { showMessage, openTab, Plugin, confirm } from 'siyuan';
     import { api } from '@frostime/siyuan-plugin-kits';
     import { whiteboardFilesUpdated } from '../whiteboards.store';
+    import { closeTab } from '../tldraw-instance-manager';
+    import { WhiteboardFileManager, WHITEBOARD_TRASH_DIR } from '../whiteboard-file-manager';
+    import type { PreviewShape } from '../utils/whiteboard-utils';
+    import { extractDrawingId, parseSyTimestamp, computeBounds, formatTime, projectShape, SVG_PAD, SHAPE_FILL, SHAPE_STROKE, BORDER_STROKE, SHAPE_RX } from '../utils/whiteboard-utils';
 
     // 父层传入 plugin 以便打开白板
     export let plugin: Plugin;
@@ -15,8 +19,17 @@
         exists: boolean;     // 块是否存在
         mtime: number;       // 文件修改时间 (用于排序)
         loadingPreview: boolean; // 缩略图是否加载中
-        shapes: Array<{ id?: string; type?: string; x: number; y: number; w: number; h: number }>; // 用于缩略图
+        shapes: PreviewShape[]; // 用于缩略图
         error?: string;      // 预览错误
+        docId?: string;      // 关联文档ID
+        tags?: string[];     // 标签列表
+    }
+
+    interface ContextMenuState {
+        visible: boolean;
+        x: number;
+        y: number;
+        card: WhiteboardCard | null;
     }
 
     let allCards: WhiteboardCard[] = [];
@@ -36,6 +49,8 @@
         title?: string;
         exists?: boolean;
         mtimeNum?: number; // derived from blk.updated/created or doc
+        docId?: string;    // 关联文档ID
+        tags?: string[];   // 标签列表
     }
     let allFileEntries: FileMeta[] = []; // 全部文件条目列表（扩展的元数据）
     let nextIndex = 0; // 下一个批次的起始索引
@@ -47,6 +62,8 @@
     let sentinel: HTMLDivElement; // 触底哨兵元素
     let cardsGridEl: HTMLDivElement; // 网格容器引用（用于滚动检测）
     let prevSortKey = sortKey;
+
+    let contextMenu: ContextMenuState = { visible: false, x: 0, y: 0, card: null };
 
     // 原逻辑拆成两阶段：读取文件列表 + 分批构造卡片
     async function loadWhiteboards() {
@@ -104,6 +121,8 @@
                                 if (blk) {
                                     f.exists = true;
                                     f.blkInfo = blk;
+                                    f.docId = blk.root_id || undefined;
+                                    f.tags = blk.tag ? blk.tag.match(/#([^#]+)#/g)?.map(t => t.replace(/#/g, '')) || [] : [];
                                     if (blk.root_id) {
                                         try {
                                             const docBlk = await api.getBlockByID(blk.root_id);
@@ -126,15 +145,6 @@
                         }
 
                         // compute mtimeNum from blk/doc
-                        const parseSyTimestamp = (ts: string | undefined | null) => {
-                            if (!ts || typeof ts !== 'string') return 0;
-                            const m2 = ts.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
-                            if (!m2) return 0;
-                            const [_, y, mo, d, hh, mm, ss] = m2 as string[];
-                            const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(hh), Number(mm), Number(ss));
-                            return date.getTime();
-                        };
-
                         let blkUpdated = f.blkInfo && typeof f.blkInfo.updated === 'string' ? parseSyTimestamp(f.blkInfo.updated) : 0;
                         let docUpdated = f.docBlkInfo && typeof f.docBlkInfo.updated === 'string' ? parseSyTimestamp(f.docBlkInfo.updated) : 0;
                         let blkCreated = f.blkInfo && typeof f.blkInfo.created === 'string' ? parseSyTimestamp(f.blkInfo.created) : 0;
@@ -199,6 +209,8 @@
             mtime: mtimeNum,
             loadingPreview: false,
             shapes: [],
+            docId: f.docId,
+            tags: f.tags || [],
         } as WhiteboardCard;
     }
 
@@ -238,14 +250,7 @@
         })();
     }
 
-    function formatTime(ms: number | undefined) {
-        if (!ms || !Number.isFinite(ms) || ms <= 0) return '';
-        try {
-            return new Date(ms).toLocaleString();
-        } catch { return '' }
-    }
-
-    // 滚动检测作为 IntersectionObserver 的补充（某些嵌套滚动环境下 IO 可能不触发）
+// 滚动检测作为 IntersectionObserver 的补充（某些嵌套滚动环境下 IO 可能不触发）
     function handleGridScroll() {
         if (!cardsGridEl || loadingBatch || allLoaded) return;
         const nearBottom = cardsGridEl.scrollTop + cardsGridEl.clientHeight >= cardsGridEl.scrollHeight - 160; // 160px 预加载阈值
@@ -263,13 +268,6 @@
                 await new Promise(r => setTimeout(r, 10));
             }
         })();
-    }
-
-    function extractDrawingId(filename: string): string {
-        const match = filename.match(/^tldraw-data-(.+)\.json$/);
-        const idPattern = /^\d{14}-\w{7}$/;
-        if (match && match[1] && idPattern.test(match[1])) return match[1];
-        return '未知画板';
     }
 
     // 过滤逻辑
@@ -351,6 +349,149 @@
         }
     }
 
+    // ========== 右键菜单 ==========
+
+    function handleContextMenu(event: MouseEvent, card: WhiteboardCard) {
+        event.preventDefault();
+        const menuWidth = 180;
+        const menuHeight = 200;
+        const posX = Math.min(event.clientX, window.innerWidth - menuWidth);
+        const posY = Math.min(event.clientY, window.innerHeight - menuHeight);
+        contextMenu = { visible: true, x: posX, y: posY, card };
+    }
+
+    function closeContextMenu() {
+        contextMenu = { visible: false, x: 0, y: 0, card: null };
+    }
+
+    function handleWindowClick(event: MouseEvent) {
+        if (!contextMenu.visible) return;
+        const target = event.target as HTMLElement;
+        if (target && target.closest('.whiteboard-context-menu')) return;
+        closeContextMenu();
+    }
+
+    function handleWindowKeydown(event: KeyboardEvent) {
+        if (event.key === 'Escape' && contextMenu.visible) {
+            closeContextMenu();
+        }
+    }
+
+    function handleWindowCtxMenu(event: MouseEvent) {
+        if (!event.defaultPrevented && contextMenu.visible) {
+            closeContextMenu();
+        }
+    }
+
+    async function openDocument(card: WhiteboardCard) {
+        if (!card.docId) {
+            showMessage('未找到关联文档', 3000, 'info');
+            return;
+        }
+        try {
+            await openTab({
+                app: plugin.app,
+                doc: {
+                    id: card.docId,
+                    action: ['cb-get-hl', 'cb-get-all'],
+                    zoomIn: false,
+                },
+                keepCursor: false,
+            });
+        } catch (e) {
+            console.error('打开文档失败:', e);
+            showMessage('打开文档失败', 3000, 'error');
+        }
+    }
+
+    async function refreshCard(card: WhiteboardCard) {
+        card.shapes = [];
+        card.error = undefined;
+        card.loadingPreview = false;
+        allCards = allCards;
+        filteredCards = [...filteredCards];
+        await loadPreview(card);
+        showMessage('预览已刷新', 1500, 'info');
+    }
+
+    async function backupCard(card: WhiteboardCard) {
+        try {
+            const results = await WhiteboardFileManager.batchBackupWhiteboards([card.id], {
+                reason: '手动备份',
+                includeTimestamp: true,
+            });
+            const stats = WhiteboardFileManager.getOperationStats(results);
+            if (stats.success > 0) {
+                showMessage(`已备份到 ${WHITEBOARD_TRASH_DIR}`, 3000, 'info');
+            } else {
+                showMessage('备份失败', 3000, 'error');
+            }
+        } catch (e) {
+            console.error('备份失败:', e);
+            showMessage('备份失败', 3000, 'error');
+        }
+    }
+
+    function deleteCard(card: WhiteboardCard) {
+        confirm(
+            '删除确认',
+            `确定要删除白板 "${card.title}" 的数据文件吗？此操作不可恢复！`,
+            async (dialog) => {
+                try {
+                    closeTab(card.id, 'user-delete');
+                    await api.removeFile(card.path);
+
+                    whiteboardFilesUpdated.set({
+                        action: 'delete',
+                        fileName: card.fileName,
+                        drawingId: card.id,
+                        timestamp: Date.now(),
+                    });
+
+                    showMessage(`已删除: ${card.fileName}`, 3000, 'info');
+
+                    setTimeout(async () => {
+                        try {
+                            await api.removeFile(card.path);
+                        } catch (e) {
+                            console.debug('延迟删除重试失败:', card.path, e);
+                        }
+                    }, 2000);
+                } catch (error) {
+                    console.error('删除失败:', error);
+                    showMessage('删除失败', 3000, 'error');
+                }
+                try { dialog && (dialog as any).close && (dialog as any).close(); } catch {}
+            },
+            (dialog) => {
+                try { dialog && (dialog as any).close && (dialog as any).close(); } catch {}
+            }
+        );
+    }
+
+    function handleMenuAction(action: 'board' | 'doc' | 'refresh' | 'backup' | 'delete') {
+        const card = contextMenu.card;
+        if (!card) return;
+        switch (action) {
+            case 'board':
+                openWhiteboard(card).finally(() => closeContextMenu());
+                break;
+            case 'doc':
+                openDocument(card).finally(() => closeContextMenu());
+                break;
+            case 'refresh':
+                refreshCard(card).finally(() => closeContextMenu());
+                break;
+            case 'backup':
+                backupCard(card).finally(() => closeContextMenu());
+                break;
+            case 'delete':
+                deleteCard(card);
+                closeContextMenu();
+                break;
+        }
+    }
+
     // 解析文件生成缩略图数据
     async function loadPreview(card: WhiteboardCard) {
         if (card.loadingPreview || card.shapes.length > 0 || card.error) return; // 已加载或正在加载
@@ -418,33 +559,6 @@
             filteredCards = [...filteredCards];
         }
     }
-
-    // 计算整体边界
-    function computeBounds(shapes: Array<{ x: number; y: number; w: number; h: number }>) {
-        if (!shapes || shapes.length === 0) return { minX: 0, minY: 0, maxX: 300, maxY: 200, width: 300, height: 200 };
-        let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY, maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY;
-        for (const s of shapes) {
-            const left = (s.x || 0) - (s.w || 0) / 2;
-            const top = (s.y || 0) - (s.h || 0) / 2;
-            minX = Math.min(minX, left); minY = Math.min(minY, top);
-            maxX = Math.max(maxX, left + (s.w || 0)); maxY = Math.max(maxY, top + (s.h || 0));
-        }
-        if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) return { minX: 0, minY: 0, maxX: 300, maxY: 200, width: 300, height: 200 };
-        const width = Math.max(maxX - minX, 1); const height = Math.max(maxY - minY, 1);
-        return { minX, minY, maxX, maxY, width, height };
-    }
-
-    function scaleShape(shape: { x: number; y: number; w: number; h: number }, shapes: any[]) {
-        const bounds = computeBounds(shapes as any);
-        const viewW = 300 - 8; const viewH = 200 - 8; const pad = 4;
-        const sx = viewW / bounds.width; const sy = viewH / bounds.height; const sScale = Math.min(sx, sy);
-        const tx = -bounds.minX * sScale + pad; const ty = -bounds.minY * sScale + pad;
-        const cx = shape.x || 0; const cy = shape.y || 0; const w = shape.w || 100; const h = shape.h || 60;
-        const left = cx - w / 2; const top = cy - h / 2;
-        return { x: left * sScale + tx, y: top * sScale + ty, w: Math.max(w * sScale, 1), h: Math.max(h * sScale, 1) };
-    }
-
-    // 已移除下载功能按钮; 保留接口后续可扩展（当前不使用）
 
     // 懒加载缩略图：使用 IntersectionObserver
     let observer: IntersectionObserver;
@@ -546,6 +660,8 @@
     }
 </script>
 
+<svelte:window on:click={handleWindowClick} on:keydown={handleWindowKeydown} on:contextmenu={handleWindowCtxMenu} />
+
 <div class="whiteboard-card-view">
     <div class="block__icons">
         <div class="block__logo">
@@ -629,6 +745,7 @@
             {#each filteredCards as card (card.path)}
                  <div class="card" role="button" tabindex="0"
                      on:click={() => openWhiteboard(card)}
+                     on:contextmenu={(e) => handleContextMenu(e, card)}
                      on:keydown={(e)=>{ if(e.key==='Enter'|| e.key===' ') { e.preventDefault(); openWhiteboard(card);} }}>
                     <div class="preview-wrapper" use:setupObserver={card}>
                         {#if card.error}
@@ -638,10 +755,15 @@
                         {:else}
                             <svg viewBox="0 0 300 200" class="preview-svg" preserveAspectRatio="xMidYMid meet">
                                 {#if card.shapes.length > 0}
+                                    {@const bounds = computeBounds(card.shapes)}
+                                    {@const viewW = 300 - SVG_PAD * 2}
+                                    {@const viewH = 200 - SVG_PAD * 2}
+                                    {@const scale = Math.min(viewW / bounds.width, viewH / bounds.height)}
                                     {#each card.shapes as s}
-                                        <rect x={scaleShape(s, card.shapes).x} y={scaleShape(s, card.shapes).y} width={scaleShape(s, card.shapes).w} height={scaleShape(s, card.shapes).h} rx="3" ry="3" fill="rgba(20,120,220,0.08)" stroke="rgba(20,120,220,0.6)" stroke-width="1" />
+                                        {@const pos = projectShape(s, bounds, scale, SVG_PAD)}
+                                        <rect x={pos.x} y={pos.y} width={pos.w} height={pos.h} rx={SHAPE_RX} ry={SHAPE_RX} fill={SHAPE_FILL} stroke={SHAPE_STROKE} stroke-width="1" />
                                     {/each}
-                                    <rect x="0.5" y="0.5" width="299" height="199" fill="none" stroke="rgba(0,0,0,0.06)" />
+                                    <rect x="1" y="1" width="298" height="198" fill="none" stroke={BORDER_STROKE} />
                                 {:else}
                                     <rect x="20" y="20" width="260" height="160" fill="rgba(0,0,0,0.02)" stroke="rgba(0,0,0,0.03)" />
                                 {/if}
@@ -682,6 +804,33 @@
             {/if}
         </div>
     {/if}
+
+    {#if contextMenu.visible && contextMenu.card}
+        <div
+            class="whiteboard-context-menu"
+            role="menu"
+            aria-label="白板菜单"
+            tabindex="0"
+            style={`left:${contextMenu.x}px;top:${contextMenu.y}px;`}
+            on:click={(event) => event.stopPropagation()}
+            on:keydown={(event) => event.stopPropagation()}>
+            <button type="button" role="menuitem" on:click={() => handleMenuAction('board')}>
+                打开白板
+            </button>
+            <button type="button" role="menuitem" on:click={() => handleMenuAction('doc')} disabled={!contextMenu.card.docId}>
+                跳转文档
+            </button>
+            <button type="button" role="menuitem" on:click={() => handleMenuAction('refresh')}>
+                刷新预览
+            </button>
+            <button type="button" role="menuitem" on:click={() => handleMenuAction('backup')}>
+                备份
+            </button>
+            <button type="button" role="menuitem" class="danger" on:click={() => handleMenuAction('delete')}>
+                删除
+            </button>
+        </div>
+    {/if}
 </div>
 
 <style>
@@ -689,56 +838,56 @@
 .whiteboard-card-view {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.625rem;
   height: 100%;
 }
 
-/* 顶栏 - 使用思源 block__icons 风格 */
+/* 顶栏 */
 .whiteboard-card-view .block__icons {
   display: flex;
   align-items: center;
-  /* padding: 4px 8px; */
+  padding: 5px 6px;
   background: var(--b3-theme-background);
-  border-bottom: 1px solid var(--b3-border-color);
   user-select: none;
   flex-shrink: 0;
+  gap: 2px;
 }
 
 .whiteboard-card-view .block__logo {
   display: flex;
   align-items: center;
-  /* padding: 0 8px; */
   color: var(--b3-theme-on-background);
-  font-size: 14px;
-  /* line-height: 20px; */
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.85;
 }
 
 .whiteboard-card-view .block__logoicon {
-  width: 20px;
-  height: 20px;
-  margin-right: 4px;
+  width: 18px;
+  height: 18px;
+  margin-right: 6px;
   fill: currentColor;
+  opacity: 0.7;
 }
 
 .whiteboard-card-view .stcounter {
-  /* background-color: var(--b3-theme-surface-lighter); */
   color: var(--b3-theme-on-surface);
-  /* padding: 2px 8px; */
-  /* border-radius: 10px; */
   font-size: 10px;
-  /* margin-left: 8px; */
+  opacity: 0.6;
 }
 
 .whiteboard-card-view .search__label {
-  transition: all 0.15s cubic-bezier(0, 0, 0.2, 1) 0ms;
+  transition: all 0.2s ease;
+  font-size: 0.76rem;
 }
 
 .whiteboard-card-view .block__icon {
-  padding: 4px;
+  padding: 5px;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: 6px;
   color: var(--b3-theme-on-background);
-  transition: background-color 0.15s cubic-bezier(0, 0, 0.2, 1) 0ms;
+  opacity: 0.65;
+  transition: all 0.15s ease;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -746,21 +895,23 @@
 
 .whiteboard-card-view .block__icon:hover {
   background-color: var(--b3-list-hover);
+  opacity: 1;
 }
-
 
 .whiteboard-card-view .block__icon--active {
   color: var(--b3-theme-primary);
+  opacity: 1;
 }
 
 /* 网格 */
 .cards-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(clamp(200px, 24%, 340px), 1fr));
-  gap: 1rem;
-  padding: 1rem;
+  gap: 0.875rem;
+  padding: 0.375rem 0.75rem 1rem;
   overflow-y: auto;
   flex: 1;
+  align-items: start;
 }
 
 /* 卡片 */
@@ -769,37 +920,36 @@
   flex-direction: column;
   background: var(--b3-theme-surface);
   border: 1px solid var(--b3-border-color);
-  border-radius: 12px;
-  box-shadow: 0 4px 12px -4px rgba(0,0,0,0.08), 0 2px 4px -2px rgba(0,0,0,0.06);
-  /* overflow: hidden; */
+  border-radius: 10px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
   cursor: pointer;
-  transition: box-shadow .25s, transform .25s, border-color .25s;
+  transition: all 0.2s ease;
   position: relative;
   outline: none;
-  backdrop-filter: saturate(160%) blur(4px);
+  height: fit-content;
 }
 .card:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 10px 20px -6px rgba(0,0,0,0.15), 0 4px 8px -3px rgba(0,0,0,0.12);
-  border-color: var(--b3-theme-primary);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  border-color: var(--b3-theme-primary-light);
 }
 .card:active {
-  transform: translateY(-1px) scale(.98);
+  transform: translateY(0) scale(0.99);
 }
 .card:focus-visible {
-  box-shadow: 0 0 0 2px var(--b3-theme-primary), 0 6px 16px -6px rgba(0,0,0,0.16);
+  box-shadow: 0 0 0 2px var(--b3-theme-primary), 0 2px 8px rgba(0,0,0,0.08);
 }
 
 /* 缩略图区 */
 .preview-wrapper {
   width: 100%;
   aspect-ratio: 3 / 2;
-  background: linear-gradient(135deg, var(--b3-theme-background) 0%, var(--b3-theme-surface) 70%);
+  background: var(--b3-theme-background);
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
-  /* overflow: hidden; */
+  border-radius: 10px 10px 0 0;
   border-bottom: 1px solid var(--b3-border-color);
 }
 .preview-svg {
@@ -809,123 +959,153 @@
   user-select: none;
 }
 .preview-loading, .preview-error {
-  font-size: 0.8rem;
-  color: var(--b3-theme-secondary);
-  animation: fadePulse 1.6s infinite;
+  font-size: 0.72rem;
+  color: var(--b3-theme-on-surface);
+  opacity: 0.5;
+}
+.preview-loading {
+  animation: fadePulse 1.8s infinite;
 }
 .preview-error {
   color: var(--b3-theme-error);
+  opacity: 0.7;
   animation: none;
 }
 @keyframes fadePulse {
-  0%,100% { opacity: .35; }
-  50% { opacity: 1; }
+  0%,100% { opacity: .3; }
+  50% { opacity: .7; }
 }
 
 /* 元数据 */
 .meta {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
-  padding: 0.55rem 0.75rem 0.7rem;
-  font-size: 0.76rem;
+  gap: 0.2rem;
+  padding: 0.55rem 0.7rem 0.65rem;
+  font-size: 0.74rem;
 }
 .title-line {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
-  line-height: 1.2;
+  gap: 0.35rem;
+  line-height: 1.3;
 }
 .doc-title {
   font-weight: 600;
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.id-line, .file-line {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  opacity: .8;
-}
-.id-line { font-family: var(--b3-font-family-code, monospace); }
-.file-line { opacity: .6; }
-
 .mtime-line {
-    font-size: 0.66rem;
-    color: var(--b3-theme-secondary);
-    opacity: 0.85;
+    font-size: 0.64rem;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.55;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.meta-loading { font-size: 0.72rem; color: var(--b3-theme-secondary); }
+.meta-loading { font-size: 0.68rem; color: var(--b3-theme-on-surface); opacity: 0.55; }
 
 /* 徽章 */
 .badge {
   display: inline-flex;
   align-items: center;
-  font-size: 0.58rem;
-  padding: 0.15rem 0.35rem;
+  font-size: 0.56rem;
+  padding: 0.12rem 0.35rem;
   border-radius: 4px;
-  letter-spacing: 0.5px;
-  font-weight: 600;
+  font-weight: 500;
   background: var(--b3-border-color);
   color: var(--b3-theme-on-surface);
   flex-shrink: 0;
 }
 .badge-warn {
-  background: var(--b3-theme-error);
-  color: #fff;
+  background: var(--b3-theme-error-background);
+  color: var(--b3-theme-error);
 }
 
 /* 状态 */
 .loading, .empty {
-  padding: 1.2rem 0.8rem;
-  font-size: 0.9rem;
-  color: var(--b3-theme-secondary);
+  padding: 1.5rem 1rem;
+  font-size: 0.82rem;
+  color: var(--b3-theme-on-surface);
+  opacity: 0.5;
   text-align: center;
 }
-.empty { opacity: .7; }
 
 /* 触底哨兵 */
 .load-sentinel {
     grid-column: 1 / -1;
     text-align: center;
-    padding: 0.75rem 0.5rem 1.5rem;
-    font-size: 0.7rem;
-    color: var(--b3-theme-secondary);
-    opacity: .8;
+    padding: 0.5rem 0.5rem 1.25rem;
+    font-size: 0.68rem;
+    color: var(--b3-theme-on-surface);
+    opacity: .55;
 }
-.load-sentinel.done { opacity: .5; }
-.loading-batch { animation: fadePulse 1.6s infinite; }
+.load-sentinel.done { opacity: .4; }
+.loading-batch { animation: fadePulse 1.8s infinite; }
 
 /* 小屏适配 */
 @media (max-width: 900px) {
   .cards-grid { 
     grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
-    padding: 0.75rem;
+    padding: 0.5rem;
   }
 }
 @media (max-width: 600px) {
   .cards-grid { 
     grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); 
     gap: 0.75rem; 
-    padding: 0.5rem;
+    padding: 0.375rem;
   }
-  .meta { padding: 0.5rem 0.6rem 0.6rem; }
-  .doc-title { font-size: 0.78rem; }
-  .id-line, .file-line { font-size: 0.68rem; }
+  .meta { padding: 0.45rem 0.55rem 0.55rem; }
+  .doc-title { font-size: 0.74rem; }
   .whiteboard-card-view .search__label { min-width: 100px; }
 }
 
-/* 深色模式微调 */
+/* 右键菜单 */
+.whiteboard-context-menu {
+    position: fixed;
+    z-index: 10;
+    background: var(--b3-theme-surface);
+    border: 1px solid var(--b3-border-color);
+    border-radius: 8px;
+    box-shadow: 0 16px 32px rgba(0, 0, 0, 0.18);
+    display: flex;
+    flex-direction: column;
+    min-width: 160px;
+    overflow: hidden;
+}
+
+.whiteboard-context-menu button {
+    border: none;
+    background: none;
+    padding: 10px 16px;
+    text-align: left;
+    font-size: 13px;
+    cursor: pointer;
+    color: var(--b3-theme-on-background);
+}
+
+.whiteboard-context-menu button:hover {
+    background: var(--b3-list-hover);
+}
+
+.whiteboard-context-menu button.danger {
+    color: var(--b3-theme-error);
+}
+
+.whiteboard-context-menu button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* 深色模式 */
 @media (prefers-color-scheme: dark) {
-  .card { box-shadow: 0 4px 14px -6px rgba(0,0,0,0.55); }
-  .card:hover { box-shadow: 0 10px 28px -10px rgba(0,0,0,0.7); }
-  .preview-wrapper { background: linear-gradient(135deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)); }
+  .card { box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+  .card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.35); }
+  .preview-wrapper { background: rgba(255,255,255,0.015); }
 }
 </style>

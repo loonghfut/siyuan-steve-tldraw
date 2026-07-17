@@ -14,7 +14,8 @@ import { buildTldrawLink } from '../../utils/link-builder'
 import { resetShapeLibraryPanelPosition } from '../../shapelibrary/shape-library-manager'
 import { resetDocOutlinePanelPosition } from '../../doc-outline/doc-outline-manager'
 import { resetChildDocsPanelPosition } from '../../doc-outline/child-docs-manager'
-import { toggleShapeLibrary, toggleDocOutline, toggleChildDocs } from '../panel-state'
+import { resetSearchPanelPosition } from '../../search/search-panel-manager'
+import { toggleShapeLibrary, toggleDocOutline, toggleChildDocs, toggleSearchPanel } from '../panel-state'
 import { isCardLikeShape, CardLikeShape } from '../types'
 
 export const CustomQuickActions: React.FC = () => {
@@ -55,9 +56,9 @@ export const CustomQuickActions: React.FC = () => {
                 <TldrawUiMenuItem id="external-link" icon="heading" label="复制白板链接" onSelect={() => {
                     let url: string
                     if (settingdata['copyLinkTitle']) {
-                        url = `[画板:${title}](${buildTldrawLink(rootId, undefined, title)})`
+                        url = `[画板:${title}](${buildTldrawLink(rootId)})`
                     } else {
-                        url = buildTldrawLink(rootId, undefined, title)
+                        url = buildTldrawLink(rootId)
                     }
                     navigator.clipboard.writeText(url).then(() => {
                         showMessage('链接已复制到剪贴板!')
@@ -139,6 +140,23 @@ export const CustomQuickActions: React.FC = () => {
                         icon="tool-note"
                         label="子文档"
                         onSelect={() => { toggleChildDocs() }}
+                    />
+                </div>
+            </div>
+            <div>
+                <div
+                    onMouseDown={(e: any) => {
+                        if (e?.detail === 2) {
+                            try { e.stopPropagation(); e.preventDefault() } catch (err) { }
+                            resetSearchPanelPosition()
+                        }
+                    }}
+                >
+                    <TldrawUiMenuItem
+                        id="search-text"
+                        icon="zoom-in"
+                        label="搜索文本"
+                        onSelect={() => { toggleSearchPanel() }}
                     />
                 </div>
             </div>

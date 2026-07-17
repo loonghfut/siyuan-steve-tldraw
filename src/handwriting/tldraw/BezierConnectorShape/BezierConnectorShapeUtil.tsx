@@ -18,8 +18,6 @@ import {
 	clamp,
 	useEditor,
 	useValue,
-	getDefaultColorTheme,
-	getColorValue,
 	toRichText,
 	createComputedCache,
 	renderHtmlFromRichTextForMeasurement,
@@ -38,6 +36,7 @@ import {
 } from './bezier-connector-binding'
 import { getPortAtPoint } from './port-utils'
 import { getPortState, setEligiblePortsIfChanged, setHintingPortIfChanged, setHighlightConnectorIfChanged } from './port-state'
+import { getDefaultColorTheme } from '../utils/color-theme'
 
 // 常量定义（参考 tldraw 的 default-shape-constants）
 const ARROW_LABEL_FONT_SIZES: Record<string, number> = {
@@ -251,6 +250,12 @@ function getConnectionPath(start: VecLike, end: VecLike, startPortId?: string, e
 	return `M ${start.x} ${start.y} C ${cp1.x} ${cp1.y} ${cp2.x} ${cp2.y} ${end.x} ${end.y}`
 }
 
+function getStrokeDasharray(strokeStyle?: IBezierConnectorShape['props']['strokeStyle']) {
+	if (strokeStyle === 'dashed') return '12 8'
+	if (strokeStyle === 'flowing') return '10 8'
+	return undefined
+}
+
 /**
  * 获取连接的实际端点（考虑绑定关系）
  */
@@ -359,7 +364,7 @@ function BezierConnectorComponent({ connector }: { connector: IBezierConnectorSh
 	const showLabel = isEditing || !isEmptyRichText(connector.props.richText)
 	const labelPosition = getBezierLabelPosition(editor, connector)
 	const fontSize = getBezierLabelFontSize(connector)
-	const labelColor = getColorValue(theme, connector.props.color, 'solid')
+	const labelColor = theme[connector.props.color].solid
 
 	const clipPathId = React.useMemo(
 		() => `bezier-connector-clip-${connector.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`,
@@ -549,10 +554,10 @@ function BezierConnectorComponent({ connector }: { connector: IBezierConnectorSh
 					<RichTextLabel
 						shapeId={connector.id}
 						type="bezier-connector"
-						font={connector.props.font}
+						fontFamily={FONT_FAMILIES[connector.props.font]}
 						fontSize={fontSize}
 						lineHeight={TEXT_PROPS.lineHeight}
-						align="middle"
+						textAlign="center"
 						verticalAlign="middle"
 						labelColor={labelColor}
 						richText={connector.props.richText}
@@ -586,7 +591,8 @@ function renderConnectorPathAndEndpoints(
 	const r = Math.max(3, (props.strokeWidth || 2) + 1)
 	const color = (theme && theme[props.color] && theme[props.color].solid) || props.color || theme.black.solid
 	const strokeStyle = props.strokeStyle ?? 'solid'
-	const strokeDasharray = strokeStyle === 'dashed' ? '12 8' : undefined
+	const strokeDasharray = getStrokeDasharray(strokeStyle)
+	const isFlowing = strokeStyle === 'flowing'
 	// 如果需要高亮或闪烁，先画一条宽的半透明路径作为 glow/halo
 	const highlight = isHighlighted || isFlashing
 	const highlightWidth = Math.max(0, (props.strokeWidth || 2) + (isHighlighted ? 3 : 0) + (isFlashing ? 2 : 0))
@@ -613,6 +619,7 @@ function renderConnectorPathAndEndpoints(
 				strokeLinecap="round"
 				fill="none"
 				strokeDasharray={strokeDasharray}
+				className={isFlowing ? 'bezier-connector-path bezier-connector-path--flowing' : 'bezier-connector-path'}
 				clipPath={clipPathId ? `url(#${clipPathId})` : undefined}
 			/>
 			{start && (
@@ -704,6 +711,11 @@ export class BezierConnectorShapeUtil extends ShapeUtil<IBezierConnectorShape> {
 		return new Group2d({
 			children: labelGeom ? [bodyGeom, labelGeom] : [bodyGeom],
 		})
+	}
+
+	override getIndicatorPath(connector: IBezierConnectorShape) {
+		const { start, end, startPortId, endPortId } = getConnectorTerminals(this.editor, connector)
+		return new Path2D(getConnectionPath(start, end, startPortId, endPortId))
 	}
 
 	override getText(shape: IBezierConnectorShape) {
@@ -806,7 +818,7 @@ export class BezierConnectorShapeUtil extends ShapeUtil<IBezierConnectorShape> {
 		setHintingPortIfChanged(this.editor, null)
 		setHighlightConnectorIfChanged(this.editor, null)
 		// clear eligible ports when not matching
-		setEligiblePortsIfChanged(this.editor, null)
+		// eligiblePorts stay during drag, cleared in onHandleDragEnd
 		pendingBindingTargets.set(connectorId, {
 			kind: 'remove',
 			terminal: draggingTerminal,
@@ -862,7 +874,7 @@ export class BezierConnectorShapeUtil extends ShapeUtil<IBezierConnectorShape> {
 		const labelPosition = getBezierLabelPosition(this.editor, connector)
 		const isEmpty = isEmptyRichText(connector.props.richText)
 		const fontSize = getBezierLabelFontSize(connector)
-		const labelColor = getColorValue(theme, connector.props.color, 'solid')
+		const labelColor = theme[connector.props.color].solid
 		const clipPathId = `bezier-connector-export-clip-${connector.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`
 		const [cp1, cp2] = getConnectionControlPoints(start, end, startPortId, endPortId)
 		const bezier = new CubicBezier2d({
@@ -918,8 +930,9 @@ export class BezierConnectorShapeUtil extends ShapeUtil<IBezierConnectorShape> {
 				{!isEmpty && (
 					<RichTextSVG
 						fontSize={fontSize}
-						font={connector.props.font}
-						align="middle"
+						fontFamily={FONT_FAMILIES[connector.props.font]}
+						lineHeight={TEXT_PROPS.lineHeight}
+						textAlign="center"
 						verticalAlign="middle"
 						labelColor={labelColor}
 						richText={connector.props.richText}
@@ -999,7 +1012,7 @@ export class BezierConnectorShapeUtil extends ShapeUtil<IBezierConnectorShape> {
 					d={getConnectionPath(start, end, startPortId, endPortId)}
 					strokeWidth={Math.max(0.5, (connector.props.strokeWidth || 0) - 1.5)}
 					strokeLinecap="round"
-					strokeDasharray={strokeStyle === 'dashed' ? '12 8' : undefined}
+					strokeDasharray={getStrokeDasharray(strokeStyle)}
 					fill="none"
 					clipPath={!isEmpty ? `url(#${clipPathId})` : undefined}
 				/>

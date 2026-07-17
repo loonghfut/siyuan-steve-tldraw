@@ -2,12 +2,13 @@
  * Slide 形状样式面板区块
  */
 import React from 'react'
-import { TldrawUiButton, StylePanelDropdownPicker, Editor } from '@tldraw/tldraw'
+import { TldrawUiButton, TldrawUiIcon, TldrawUiInput, StylePanelDropdownPicker, Editor } from '@tldraw/tldraw'
 import { showMessage, openTab } from 'siyuan'
-import { upload, appendBlock, updateBlock, getBlockByID } from '@/api/api'
-import { getCursorBlockId } from '@/api/api2'
+import { updateBlock } from '@/api/api'
 import { buildTldrawLink } from '../utils/link-builder'
 import { captureSlideScreenshot } from './captureSlideScreenshot'
+import { getActiveSlideScreenshotStore, slideScreenshotUrlToAssetPath, uploadSlideScreenshotImage } from './slide-screenshot-store'
+import { buildSlideScreenshotMarkdown, findSlideScreenshotBlockId, findSlideScreenshotBlockIds } from './slide-block-binding'
 import { settingdata } from '@/index'
 import { $currentSlide, setSlideFocusMode, useCurrentSlide, useSlideFocusMode } from './useSlides'
 import type { SlideShape } from './SlideShapeUtil'
@@ -17,7 +18,6 @@ export interface SlideStyleSectionProps {
     slideShape: SlideShape | null
     isSingleSlideSelected: boolean
     rootId: string | null | undefined
-    blockId: string | null | undefined
     title: string | null | undefined
 }
 
@@ -26,7 +26,6 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
     slideShape,
     isSingleSlideSelected,
     rootId,
-    blockId,
     title,
 }) => {
     const [isCapturingScreenshot, setIsCapturingScreenshot] = React.useState(false)
@@ -60,13 +59,13 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
     }, [isSingleSlideSelected, slideShape])
 
     const handleNameChange = React.useCallback(
-        (e: React.ChangeEvent<HTMLInputElement>) => {
+        (value: string) => {
             if (slideShape) {
                 editor.run(() => {
                     editor.updateShape({
                         id: slideShape.id,
                         type: 'slide',
-                        props: { name: e.target.value },
+                        props: { name: value },
                     })
                 })
             }
@@ -74,28 +73,18 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
         [editor, slideShape]
     )
 
-    const handleNameBlur = React.useCallback(
-        (e: React.FocusEvent<HTMLInputElement>) => {
-            if (slideShape && slideShape.props.name !== e.target.value.trim()) {
+    const handleNameTrim = React.useCallback(
+        (value: string) => {
+            const trimmed = value.trim()
+            if (slideShape && slideShape.props.name !== trimmed) {
                 editor.updateShape({
                     id: slideShape.id,
                     type: 'slide',
-                    props: { name: e.target.value.trim() },
+                    props: { name: trimmed },
                 })
             }
         },
         [editor, slideShape]
-    )
-
-    const handleKeyDown = React.useCallback(
-        (e: React.KeyboardEvent<HTMLInputElement>) => {
-            if (e.key === 'Enter') {
-                e.currentTarget.blur()
-            } else if (e.key === 'Escape') {
-                e.currentTarget.blur()
-            }
-        },
-        []
     )
 
     const handleCaptureScreenshot = React.useCallback(async () => {
@@ -103,109 +92,76 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
 
         setIsCapturingScreenshot(true)
         try {
-            let targetBlockId: string | null = (slideShape.props.blockId ?? '').trim()
-            if (!targetBlockId) {
-                targetBlockId = null
-            }
-
-            const cursorId = getCursorBlockId()
-
-            if (targetBlockId) {
-                try {
-                    const blk = await getBlockByID(targetBlockId)
-                    if (!blk || !blk.id) {
-                        console.warn('保存的 blockId 在思源中未找到: ', targetBlockId)
-                        showMessage('幻灯片保存的块在思源中未找到，后续将作为新块插入', 3000, 'info')
-                        targetBlockId = null
-                    }
-                } catch (err) {
-                    console.warn('检查保存的 blockId 时出错', err)
-                    targetBlockId = null
-                }
-            }
-
-            if (!targetBlockId && !cursorId) {
-                showMessage('未检测到已有截图块且未获取到光标位置，已取消操作', 3000, 'error')
-                return
-            }
-
+            // 先查找所有已关联的截图块；有绑定时更新原块，不再创建侧边栏暂存项。
+            const targetBlockIds = await findSlideScreenshotBlockIds(slideShape.id)
             const result = await captureSlideScreenshot(editor, slideShape.id, {
                 format: 'png',
-                updateShape: true,
+                includeDataUrl: false,
+                updateShape: false,
                 background: true,
             })
             if (result) {
                 try {
-                    const now = new Date()
-                    const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
-                    const rawName = slideShape?.props?.name || 'slide'
-                    const safeName = String(rawName).replace(/[^\w\u4e00-\u9fa5-]+/g, '_')
-                    const ext = result.format === 'svg' ? 'svg' : 'png'
-                    const fileName = `slide_${safeName}_${ts}.${ext}`
-                    const blobType = result.blob.type || 'image/png'
-                    const file = new File([result.blob], fileName, { type: blobType })
-                    const uploadDir = 'assets/st_slides'
+                    if (targetBlockIds.length > 0) {
+                        const imageUrl = await uploadSlideScreenshotImage(result.blob, slideShape.props.name || 'Slide')
+                        const assetPath = slideScreenshotUrlToAssetPath(imageUrl)
+                        if (!assetPath) throw new Error('invalid uploaded slide screenshot asset URL')
 
-                    const upRes = await upload(uploadDir, [file])
-                    const succMap = (upRes as any)?.succMap || {}
-                    const kernelPath: string | undefined = succMap[fileName]
-                    if (!kernelPath) {
-                        throw new Error('upload screenshot failed: no succMap path')
-                    }
-                    const assetPath = kernelPath.replace(/^data\//, '')
-
-                    const alt = rawName || 'slide'
-                    const md = `![${alt}](${assetPath})\n{: custom-st-slide-id="${slideShape.id}" custom-tldraw-link="${buildTldrawLink(rootId || '', blockId || '', title || '', slideShape.id)}" }`
-
-                    let fallbackFromUpdateFailure = false
-
-                    if (targetBlockId) {
-                        try {
-                            await updateBlock('markdown', md, targetBlockId)
-                            editor.updateShape({
-                                id: slideShape.id,
-                                type: 'slide',
-                                props: { blockId: targetBlockId },
-                            })
-                            showMessage('已更新之前插入的幻灯片截图')
-                            return
-                        } catch (updateErr) {
-                            console.error('更新现有幻灯片截图块失败', updateErr)
-                            if (!cursorId) {
-                                showMessage('更新截图块失败，且未检测到光标位置可新建截图', 4000, 'error')
-                                return
-                            }
-                            fallbackFromUpdateFailure = true
-                            targetBlockId = null
-                        }
-                    }
-
-                    if (!targetBlockId) {
-                        if (!cursorId) {
-                            showMessage('未检测到光标位置，已取消插入新的截图', 3000, 'error')
-                            return
-                        }
-
-                        const appendRes = await appendBlock('markdown', md, cursorId)
-                        const newBlockId = appendRes?.[0]?.doOperations?.[0]?.id as string | undefined
-                        if (typeof newBlockId === 'string' && newBlockId) {
-                            editor.updateShape({
-                                id: slideShape.id,
-                                type: 'slide',
-                                props: { blockId: newBlockId },
-                            })
-                        } else {
-                            console.warn('无法获取新建幻灯片截图块的 ID', appendRes)
-                        }
-                        showMessage(
-                            fallbackFromUpdateFailure
-                                ? '原块更新失败，已在光标位置插入新的幻灯片截图'
-                                : '已将幻灯片截图插入到当前光标位置'
+                        const markdown = buildSlideScreenshotMarkdown({
+                            assetPath,
+                            name: slideShape.props.name || 'slide',
+                            shapeId: slideShape.id,
+                            rootId: rootId || '',
+                            title: title || '',
+                        })
+                        const updateResults = await Promise.allSettled(
+                            targetBlockIds.map((blockId) => updateBlock('markdown', markdown, blockId))
                         )
+                        updateResults.forEach((updateResult, index) => {
+                            if (updateResult.status === 'rejected') {
+                                console.error('更新关联的幻灯片截图块失败', targetBlockIds[index], updateResult.reason)
+                            }
+                        })
+                        const failedCount = updateResults.filter((updateResult) => updateResult.status === 'rejected').length
+
+                        editor.updateShape({
+                            id: slideShape.id,
+                            type: 'slide',
+                            props: { screenshot: imageUrl },
+                        })
+
+                        if (failedCount === 0) {
+                            showMessage(`已更新 ${targetBlockIds.length} 个关联的幻灯片截图`)
+                        } else {
+                            showMessage(`已更新 ${targetBlockIds.length - failedCount} 个截图，${failedCount} 个更新失败`, 4000, 'error')
+                        }
+                        return
                     }
+
+                    const saveToDock = async () => {
+                        const store = getActiveSlideScreenshotStore()
+                        if (!store) throw new Error('slide screenshot store is not initialized')
+                        const item = await store.add({
+                            image: result.blob,
+                            width: result.width,
+                            height: result.height,
+                            name: slideShape.props.name || 'Slide',
+                            rootId: rootId || '',
+                            shapeId: slideShape.id,
+                            title: title || '',
+                        })
+                        editor.updateShape({
+                            id: slideShape.id,
+                            type: 'slide',
+                            props: { screenshot: item.imageUrl },
+                        })
+                    }
+
+                    await saveToDock()
+                    showMessage('Slide 截图已保存到侧边栏')
                 } catch (insErr) {
-                    console.error('insert slide screenshot to Siyuan failed', insErr)
-                    showMessage('已更新截图，但插入到思源失败', 4000, 'error')
+                    console.error('save slide screenshot to dock failed', insErr)
+                    showMessage('已生成截图，但保存到侧边栏失败', 4000, 'error')
                 }
             } else {
                 showMessage('生成幻灯片截图失败', -1, 'error')
@@ -216,14 +172,14 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
         } finally {
             setIsCapturingScreenshot(false)
         }
-    }, [editor, slideShape, isCapturingScreenshot, rootId, blockId, title])
+    }, [editor, slideShape, isCapturingScreenshot, rootId, title])
 
     const handleOpenSlideBlock = React.useCallback(async () => {
         if (!slideShape) return
 
-        const blockId = slideShape.props.blockId
+        const blockId = await findSlideScreenshotBlockId(slideShape.id)
         if (!blockId) {
-            showMessage('幻灯片暂未绑定思源块', 3000, 'error')
+            showMessage('幻灯片暂未绑定思源截图块', 3000, 'error')
             return
         }
 
@@ -248,9 +204,9 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
             const shapeId = slideShape.id
             let url: string
             if (settingdata['copyLinkTitle']) {
-                url = `[slide:${slideShape.props.name}](${buildTldrawLink(rootId, blockId, title, shapeId)})`
+                url = `[slide:${slideShape.props.name}](${buildTldrawLink(rootId, rootId, shapeId)})`
             } else {
-                url = buildTldrawLink(rootId, blockId, title, shapeId)
+                url = buildTldrawLink(rootId, rootId, shapeId)
             }
             try {
                 await navigator.clipboard.writeText(url)
@@ -264,20 +220,20 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
             showMessage('无法生成链接：缺少 rootId。', -1, 'error')
             console.error('Cannot copy link: rootId is not set.')
         }
-    }, [slideShape, rootId, blockId, title])
+    }, [slideShape, rootId, title])
 
     if (!isSingleSlideSelected || !slideShape) return null
 
     return (
         <div className="tlui-style-panel__section">
-            <input
-                className="tlui-input slide-name-input"
-                type="text"
+            <TldrawUiInput
+                className="slide-name-input"
                 value={slideShape.props.name}
-                onChange={handleNameChange}
-                onBlur={handleNameBlur}
-                onKeyDown={handleKeyDown}
-                spellCheck={false}
+                onValueChange={handleNameChange}
+                onBlur={handleNameTrim}
+                onCancel={handleNameTrim}
+                onComplete={handleNameTrim}
+                placeholder="幻灯片名称"
             />
             <StylePanelDropdownPicker
                 label="边框样式"
@@ -304,38 +260,46 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
                     })
                 }}
             />
-			<TldrawUiButton
-				type="normal"
-				onClick={handleToggleFocus}
-				style={{ marginTop: '-8px', width: '100%' }}
-				title={isThisSlideFocused ? '退出聚焦（Esc）' : '聚焦此 Slide（仅显示 Slide 内内容）'}
-			>
-				{isThisSlideFocused ? '退出聚焦' : '聚焦此 Slide'}
-			</TldrawUiButton>
-            <TldrawUiButton
-                type="normal"
-                onClick={handleCopyLink}
-                style={{ marginTop: '-8px', width: '100%' }}
-                disabled={rootId === ''}
-            >
-                复制链接
-            </TldrawUiButton>
-            <TldrawUiButton
-                type="normal"
-                onClick={handleOpenSlideBlock}
-                style={{ marginTop: '-8px', width: '100%' }}
-                disabled={!slideShape.props.blockId}
-            >
-                跳转到笔记
-            </TldrawUiButton>
-            <TldrawUiButton
-                type="normal"
-                onClick={handleCaptureScreenshot}
-                style={{ marginTop: '-8px', width: '100%' }}
-                disabled={isCapturingScreenshot}
-            >
-                {isCapturingScreenshot ? '生成中…' : '更新截图'}
-            </TldrawUiButton>
+            <div style={{ display: 'flex', gap: 0, marginTop: '-8px' }}>
+                <TldrawUiButton
+                    type="normal"
+                    onClick={handleToggleFocus}
+                    style={{ flex: '1 1 0', minWidth: 0 }}
+                    title={isThisSlideFocused ? '退出聚焦（Esc）' : '聚焦此 Slide（仅显示 Slide 内内容）'}
+                    aria-label={isThisSlideFocused ? '退出聚焦' : '聚焦此 Slide'}
+                >
+                    <TldrawUiIcon label="" icon={isThisSlideFocused ? 'slide-exit-focus' : 'slide-focus'} />
+                </TldrawUiButton>
+                <TldrawUiButton
+                    type="normal"
+                    onClick={handleCopyLink}
+                    style={{ flex: '1 1 0', minWidth: 0 }}
+                    title="复制链接"
+                    aria-label="复制链接"
+                    disabled={rootId === ''}
+                >
+                    <TldrawUiIcon label="" icon="copy-link-custom" />
+                </TldrawUiButton>
+                <TldrawUiButton
+                    type="normal"
+                    onClick={handleOpenSlideBlock}
+                    style={{ flex: '1 1 0', minWidth: 0 }}
+                    title="跳转到笔记"
+                    aria-label="跳转到笔记"
+                >
+                    <TldrawUiIcon label="" icon="open-block" />
+                </TldrawUiButton>
+                <TldrawUiButton
+                    type="normal"
+                    onClick={handleCaptureScreenshot}
+                    style={{ flex: '1 1 0', minWidth: 0 }}
+                    title={isCapturingScreenshot ? '生成中…' : '更新截图'}
+                    aria-label={isCapturingScreenshot ? '生成中…' : '更新截图'}
+                    disabled={isCapturingScreenshot}
+                >
+                    <TldrawUiIcon label="" icon={isCapturingScreenshot ? 'loading-spinner' : 'update-screenshot'} />
+                </TldrawUiButton>
+            </div>
         </div>
     )
 }

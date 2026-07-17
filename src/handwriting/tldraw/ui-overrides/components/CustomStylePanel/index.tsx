@@ -20,6 +20,7 @@ import { SlideStyleSection } from '../../../SlideShape/SlideStyleSection'
 import { JsShapeStyleSection } from '../../../JsShape/JsShapeStyleSection'
 import { MindMapStyleSection } from '../../../MindMapShape/MindMapStyleSection'
 import { BezierConnectorStyleSection } from '../../../BezierConnectorShape/BezierConnectorStyleSection'
+import { BranchStyleSection } from '../../../BranchShape/BranchStyleSection'
 
 // 类型导入
 import type { ICardShape } from '../../../CardShape/card-shape-types'
@@ -27,6 +28,7 @@ import type { ISingleBlockShape } from '../../../SingleBlockShape/single-block-s
 import type { IJsShape } from '../../../JsShape/js-shape-types'
 import type { IMindMapShape } from '../../../MindMapShape/mind-map-shape-types'
 import type { IBezierConnectorShape } from '../../../BezierConnectorShape/bezier-connector-types'
+import type { IBranchShape } from '../../../BranchShape/branch-shape-types'
 import type { SlideShape } from '../../../SlideShape/SlideShapeUtil'
 
 import { stylePanelStyles } from './styles'
@@ -69,8 +71,6 @@ export const CustomStylePanel = track(() => {
         () => selectedShapes.filter((s): s is ISingleBlockShape => s.type === 'single-block'),
         [selectedShapes]
     )
-    const hasSingleBlockSelection = selectedSingleBlockShapes.length > 0
-
     const selectedJsShapes = React.useMemo(
         () => selectedShapes.filter((shape): shape is IJsShape => shape.type === 'js-shape'),
         [selectedShapes]
@@ -87,12 +87,16 @@ export const CustomStylePanel = track(() => {
         [selectedShapes]
     )
 
+    const selectedBranchShapes = React.useMemo(
+        () => selectedShapes.filter((shape): shape is IBranchShape => shape.type === 'branch'),
+        [selectedShapes]
+    )
+
     // 获取 rootId
     const container = editor.getContainer()
     const editorElement = container?.closest('.tldraw__editor')
     const rootId = editorElement?.getAttribute('data-tldraw-id')
     const title = editorElement?.getAttribute('data-tldraw-title')
-    const blockId = rootId
 
     return (
         <DefaultStylePanel>
@@ -114,7 +118,6 @@ export const CustomStylePanel = track(() => {
                 slideShape={slideShape}
                 isSingleSlideSelected={isSingleSlideSelected}
                 rootId={rootId}
-                blockId={blockId}
                 title={title}
             />
 
@@ -132,6 +135,12 @@ export const CustomStylePanel = track(() => {
                 connectionMode={connectionMode}
                 connectionConnectorKind={connectionConnectorKind}
                 hasCardSelection={hasCardSelection}
+            />
+
+            {/* Branch 样式区块 */}
+            <BranchStyleSection
+                editor={editor}
+                selectedBranchShapes={selectedBranchShapes}
             />
 
             {/* JsShape 样式区块 */}

@@ -1,5 +1,8 @@
-import { Editor, TLShapeId, getDefaultColorTheme } from '@tldraw/tldraw'
+import { Editor, TLShapeId } from '@tldraw/tldraw'
 import { SlideShape } from './SlideShapeUtil'
+import { clearSvgExportSnapshotCache } from '../utils/export-dom-snapshot'
+import { getTldrawImageExportOptions } from '../utils/export-image-options'
+import { prepareSvgExportSnapshots } from '../utils/export-snapshot-preparer'
 
 export type SlideScreenshotFormat = 'png' | 'svg'
 
@@ -10,6 +13,7 @@ export interface CaptureSlideScreenshotOptions {
 	padding?: number
 	background?: boolean
 	includeSlideOutline?: boolean
+	includeDataUrl?: boolean
 	updateShape?: boolean
 }
 
@@ -40,13 +44,15 @@ export async function captureSlideScreenshot(
 		return null
 	}
 
+	const imageExportOptions = getTldrawImageExportOptions()
 	const {
 		format = 'png',
-		pixelRatio = typeof window !== 'undefined' && window.devicePixelRatio ? window.devicePixelRatio : 2,
-		quality = 1,
+		pixelRatio = imageExportOptions.pixelRatio ?? (typeof window !== 'undefined' && window.devicePixelRatio ? window.devicePixelRatio : 2),
+		quality = imageExportOptions.quality ?? 1,
 		padding = 0,
 		background = true,
 		includeSlideOutline = false,
+		includeDataUrl = true,
 		updateShape = false,
 	} = opts
 
@@ -79,37 +85,42 @@ export async function captureSlideScreenshot(
 	let dataUrl = ''
 
 	if (idsToExport.length > 0) {
-		if (format === 'svg') {
-			const svgResult = await editor.getSvgString(idsToExport, {
-				bounds: exportBounds,
-				background,
-			})
-			if (!svgResult) {
-				return null
+		try {
+			await prepareSvgExportSnapshots(editor, idsToExport)
+			if (format === 'svg') {
+				const svgResult = await editor.getSvgString(idsToExport, {
+					bounds: exportBounds,
+					background,
+				})
+				if (!svgResult) {
+					return null
+				}
+				width = svgResult.width
+				height = svgResult.height
+				blob = new Blob([svgResult.svg], { type: 'image/svg+xml' })
+				if (includeDataUrl || updateShape) dataUrl = await blobToDataUrl(blob)
+			} else {
+				const imageResult = await editor.toImage(idsToExport, {
+					format,
+					pixelRatio,
+					quality,
+					bounds: exportBounds,
+					background,
+				})
+				blob = imageResult.blob
+				width = imageResult.width
+				height = imageResult.height
+				if (includeDataUrl || updateShape) dataUrl = await blobToDataUrl(blob)
 			}
-			width = svgResult.width
-			height = svgResult.height
-			blob = new Blob([svgResult.svg], { type: 'image/svg+xml' })
-			dataUrl = await blobToDataUrl(blob)
-		} else {
-			const imageResult = await editor.toImage(idsToExport, {
-				format,
-				pixelRatio,
-				quality,
-				bounds: exportBounds,
-				background,
-			})
-			blob = imageResult.blob
-			width = imageResult.width
-			height = imageResult.height
-			dataUrl = await blobToDataUrl(blob)
+		} finally {
+			clearSvgExportSnapshotCache()
 		}
 	} else {
 		const backgroundColor = background ? 'var(--b3-theme-background)' : 'transparent'
 		if (format === 'svg') {
 			const svg = `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="background:${backgroundColor}"/>`
 			blob = new Blob([svg], { type: 'image/svg+xml' })
-			dataUrl = await blobToDataUrl(blob)
+			if (includeDataUrl || updateShape) dataUrl = await blobToDataUrl(blob)
 		} else {
 			const canvas = document.createElement('canvas')
 			const scaledWidth = Math.max(1, Math.round(width * pixelRatio))
@@ -127,7 +138,7 @@ export async function captureSlideScreenshot(
 			if (!blob) {
 				return null
 			}
-			dataUrl = await blobToDataUrl(blob)
+			if (includeDataUrl || updateShape) dataUrl = await blobToDataUrl(blob)
 		}
 	}
 
@@ -146,11 +157,6 @@ export async function captureSlideScreenshot(
 		height,
 		format,
 	}
-}
-
-function getDefaultBackground(editor: Editor) {
-	const theme = getDefaultColorTheme({ isDarkMode: editor.user.getIsDarkMode() })
-	return theme.background
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {

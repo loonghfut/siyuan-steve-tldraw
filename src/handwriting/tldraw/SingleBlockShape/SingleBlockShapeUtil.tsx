@@ -8,7 +8,6 @@ import {
 	TLResizeInfo,
 	TLShapeId,
 	createShapeId,
-	getDefaultColorTheme,
 	resizeBox,
 	AtomMap,
 	EditorAtom,
@@ -19,8 +18,9 @@ import {
 	invLerp,
 	lerp,
 	VecModel,
+	Editor,
 } from '@tldraw/tldraw'
-import { openAttributePanel, Protyle, showMessage, TProtyleAction } from 'siyuan'
+import { openAttributePanel, openTab, Protyle, showMessage, TProtyleAction } from 'siyuan'
 import * as api from '@/api/api'
 import { settingdata } from '@/index'
 import { buildTldrawLink } from '../utils/link-builder';
@@ -32,12 +32,27 @@ import { enqueueProtyleLoad, ProtyleLoadHandle } from '../protyle-load-queue'
 import { shapeLoadManager } from '../shape-load-manager'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
 import { createArrowBetweenShapes } from '../utils/addConnectedSingleBlock'
+import { getShapeHostElement } from '../utils/getShapeHostElement'
 import { getCachedHtml, setCachedHtml, cacheFromProtyleHost, invalidateCache, requestBlockDOM, getBlockContent, renderSimpleBlockHtml } from '../block-html-cache'
 import { renderAllContentIdle } from '../utils/render/content-renderer'
 import { cancelIdleRender } from '../utils/idle-scheduler'
+import { getDefaultColorTheme } from '../utils/color-theme'
+import { getCachedSvgExportSnapshot, getSvgExportGlobalStyles, isSvgExportOutlineOnly, serializeElementForSvgExport } from '../utils/export-dom-snapshot'
+import {
+	beginBranchAttachmentDrag,
+	clearBranchInteractionHint,
+	createSiblingSingleInBranch,
+	getSingleBranchParent,
+	getBranchInteractionHintForShape,
+	setBranchInteractionHint,
+	syncBranchMoveForRootContent,
+	relayoutBranchesContainingShape,
+	updateBranchAttachmentAfterDrag,
+	useBranchInteractionHint,
+} from '../BranchShape'
 
-let isCreatingBlock = false
-let pendingCreationPromise: Promise<string> | null = null
+const draggingBranchSingleBlockIds = new Set<string>()
+const pendingCreationPromises = new Map<string, Promise<string>>()
 
 // ===== DOM 尺寸测量（仅影响高度）=====
 // 用 EditorAtom 存储每个 shape 的测量尺寸，保证 getGeometry 响应式更新
@@ -51,16 +66,99 @@ const SingleBlockSizes = new EditorAtom('single-block sizes', (editor) => {
 const BORDER_PX = 3 // 与样式、SVG 导出保持一致
 const MIN_HEIGHT = 30
 
+function setMeasuredSingleBlockSize(editor: Editor, shapeId: TLShapeId, size: { width: number; height: number }) {
+	let changed = false
+	SingleBlockSizes.update(editor, (map) => {
+		const existing = map.get(shapeId)
+		if (existing && existing.width === size.width && existing.height === size.height) return map
+		changed = true
+		return map.set(shapeId, size)
+	})
+	if (changed) relayoutBranchesContainingShape(editor, shapeId)
+}
+const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
+const STEVE_TOOLS_PLUGIN_URL_RE = /^(?:https:\/\/|siyuan:\/\/)plugins\/siyuan-steve-tools\//i
+
+function decodeLinkTarget(value: string) {
+	return value
+		.replace(/&amp;/g, '&')
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.trim()
+}
+
+function getSiyuanBlockIdFromLink(rawHref: string): string | null {
+	const href = decodeLinkTarget(rawHref)
+	const directMatch = href.match(/^siyuan:\/\/blocks\/(\d{14}-[0-9a-z]{7})/i)
+	if (directMatch) return directMatch[1]
+	if (/^\d{14}-[0-9a-z]{7}$/i.test(href)) return href
+
+	try {
+		const parsed = new URL(href, window.location.href)
+		const idFromQuery = parsed.searchParams.get('id') || parsed.searchParams.get('blockId')
+		if (idFromQuery && SIYUAN_BLOCK_ID_RE.test(idFromQuery)) return idFromQuery.match(SIYUAN_BLOCK_ID_RE)![0]
+		const idFromHash = parsed.hash.match(SIYUAN_BLOCK_ID_RE)
+		if (idFromHash) return idFromHash[0]
+	} catch {
+		// ignore invalid or relative URLs
+	}
+
+	return null
+}
+
+function isSteveToolsPluginUrl(rawHref: string) {
+	return STEVE_TOOLS_PLUGIN_URL_RE.test(decodeLinkTarget(rawHref))
+}
+
+function clearStaticTextSelection() {
+	try {
+		window.getSelection()?.removeAllRanges()
+	} catch {
+		// ignore
+	}
+}
+
+function findStaticLinkTarget(target: EventTarget | null, root: HTMLElement | null) {
+	if (!(target instanceof HTMLElement) || !root) return null
+
+	let el: HTMLElement | null = target
+	while (el && root.contains(el)) {
+		const dataType = el.getAttribute('data-type') || ''
+		const dataHref = el.getAttribute('data-href') || ''
+		const href = el instanceof HTMLAnchorElement ? el.getAttribute('href') || dataHref : dataHref
+		const nodeId =
+			el.getAttribute('data-id') ||
+			el.getAttribute('data-node-id') ||
+			el.getAttribute('data-av-id') ||
+			''
+
+		if ((dataType.includes('block-ref') || dataType.includes('file-annotation-ref')) && SIYUAN_BLOCK_ID_RE.test(nodeId)) {
+			return { blockId: nodeId.match(SIYUAN_BLOCK_ID_RE)![0], href: '' }
+		}
+
+		if (href) {
+			return { blockId: getSiyuanBlockIdFromLink(href), href: decodeLinkTarget(href) }
+		}
+
+		if (el === root) break
+		el = el.parentElement
+	}
+
+	return null
+}
+
 // ===== 独立的尺寸测量 Hook =====
 // 参考 tldraw 官方示例，将尺寸测量逻辑抽取为可复用的 hook
 function useSingleBlockSize(
+	editor: Editor,
 	shape: ISingleBlockShape,
 	containerRef: React.RefObject<HTMLDivElement>,
 	protyleHostRef: React.RefObject<HTMLDivElement | null>,
 	isEditingState: boolean,
 	shouldSkipMeasurement: boolean
 ) {
-	const editor = (window as any).__tldrawEditor || null
 	// 用于在编辑态切换时临时锁定高度，防止闪烁
 	const heightLockRef = useRef(false)
 	const prevEditingRef = useRef(isEditingState)
@@ -88,11 +186,7 @@ function useSingleBlockSize(
 		if (heightLockRef.current && lastHeightRef.current !== null) {
 			const lockedHeight = lastHeightRef.current
 			const lockedWidth = Math.max(shape.props.w, 1)
-			SingleBlockSizes.update(editor, (map) => {
-				const existing = map.get(shape.id)
-				if (existing && existing.height === lockedHeight && existing.width === lockedWidth) return map
-				return map.set(shape.id, { width: lockedWidth, height: lockedHeight })
-			})
+			setMeasuredSingleBlockSize(editor, shape.id, { width: lockedWidth, height: lockedHeight })
 			return
 		}
 
@@ -101,11 +195,7 @@ function useSingleBlockSize(
 			const fallbackHeight = Math.max(shape.props.h, MIN_HEIGHT)
 			const fallbackWidth = Math.max(shape.props.w, 1)
 			lastHeightRef.current = fallbackHeight
-			SingleBlockSizes.update(editor, (map) => {
-				const existing = map.get(shape.id)
-				if (existing && existing.height === fallbackHeight && existing.width === fallbackWidth) return map
-				return map.set(shape.id, { width: fallbackWidth, height: fallbackHeight })
-			})
+			setMeasuredSingleBlockSize(editor, shape.id, { width: fallbackWidth, height: fallbackHeight })
 			return
 		}
 
@@ -131,11 +221,7 @@ function useSingleBlockSize(
 		lastHeightRef.current = nextHeight
 
 		// 更新全局 atom 中的尺寸
-		SingleBlockSizes.update(editor, (map) => {
-			const existing = map.get(shape.id)
-			if (existing && existing.height === nextHeight && existing.width === nextWidth) return map
-			return map.set(shape.id, { width: nextWidth, height: nextHeight })
-		})
+		setMeasuredSingleBlockSize(editor, shape.id, { width: nextWidth, height: nextHeight })
 	}, [
 		editor,
 		shape.id,
@@ -262,6 +348,11 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			next.props.blockId = prev.props.blockId
 		}
 
+		if (draggingBranchSingleBlockIds.has(next.id as string) && (prev.x !== next.x || prev.y !== next.y)) {
+			syncBranchMoveForRootContent(this.editor, prev, next)
+			setBranchInteractionHint(getBranchInteractionHintForShape(this.editor, next))
+		}
+
 		// 当从允许绑定切换到不允许绑定时，删除已有的 single-block 类型的绑定
 		if ((prev.props.allowBinding ?? true) && (next.props.allowBinding === false)) {
 			const bindings = this.editor.getBindingsFromShape(prev, 'single-block')
@@ -298,12 +389,28 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		})
 	}
 
+	override getBoundsSnapGeometry(shape: ISingleBlockShape) {
+		return { points: this.editor.getShapeGeometry(shape).bounds.cornersAndCenter }
+	}
+
+	override getIndicatorPath(shape: ISingleBlockShape) {
+		const { width, height } = this.editor.getShapeGeometry(shape).bounds
+		const path = new Path2D()
+		path.rect(0, 0, width, height)
+		return path
+	}
+
 	component(shape: ISingleBlockShape) {
 		const editor = this.editor
 		// 保存 editor 引用供 useSingleBlockSize hook 使用
-		;(window as any).__tldrawEditor = editor
 		const theme = getDefaultColorTheme({ isDarkMode: editor.user.getIsDarkMode() })
 		const isEditing = editor.getEditingShapeId() === shape.id
+		const branchInteractionHint = useBranchInteractionHint()
+		const isRootAttachTarget =
+			branchInteractionHint?.mode === 'attach' &&
+			branchInteractionHint.slot === 'root' &&
+			(branchInteractionHint.targetShapeId === shape.id ||
+				(!branchInteractionHint.targetShapeId && branchInteractionHint.draggingShapeId === shape.id))
 		const [isEditingState, setIsEditingState] = useState(isEditing)
 		const [isInViewport, setIsInViewport] = useState(true)
 		const [canLoad, setCanLoad] = useState(true)
@@ -317,6 +424,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const hadFocusedRef = useRef(false)
 		const protyleRef = useRef<Protyle | null>(null)
 		const protyleHostRef = useRef<HTMLDivElement | null>(null)
+		const refreshNonceRef = useRef(shape.props.refreshNonce)
 		// 静态 HTML 内容（非编辑态显示）
 		const [staticHtml, setStaticHtml] = useState<string>('')
 		// 静态内容容器的 ref，用于渲染后执行 renderAllContent
@@ -340,6 +448,10 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			}
 			anyPt[DESTROYED_MARK] = true
 		}
+		const stopMissingStateEvent = (event: React.PointerEvent | React.MouseEvent) => {
+			event.preventDefault()
+			event.stopPropagation()
+		}
 
 
 		const destroyRuntimeResources = useCallback(() => {
@@ -362,10 +474,45 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			}
 			protyleHostRef.current = null
 		}, [])
+		const enterMissingLinkedBlockState = useCallback(() => {
+			destroyRuntimeResources()
+			setStaticHtml('')
+			setIsLoadingContent(false)
+			setHasLoadError(true)
+			try {
+				if (editor.getEditingShapeId() === shape.id) {
+					editor.setEditingShape(undefined)
+				}
+			} catch {
+				// ignore
+			}
+		}, [destroyRuntimeResources, editor, shape.id])
+		const handleRefreshMissingLinkedBlock = useCallback((event: React.PointerEvent | React.MouseEvent) => {
+			stopMissingStateEvent(event)
+			if (shape.props.blockId) {
+				invalidateCache(shape.props.blockId)
+			}
+			destroyRuntimeResources()
+			setStaticHtml('')
+			setIsLoadingContent(false)
+			setHasLoadError(false)
+			editor.updateShape({
+				id: shape.id,
+				type: shape.type,
+				props: {
+					...shape.props,
+					refreshNonce: Date.now(),
+				},
+			})
+		}, [destroyRuntimeResources, editor, shape.id, shape.props, shape.type])
+		const handleDeleteMissingLinkedBlock = useCallback((event: React.PointerEvent | React.MouseEvent) => {
+			stopMissingStateEvent(event)
+			editor.deleteShape(shape.id)
+		}, [editor, shape.id])
 
 		// 使用独立的尺寸测量 hook（自动处理尺寸更新）
 	// 如果有加载错误，跳过测量以避免异常增长
-	useSingleBlockSize(shape, containerRef, protyleHostRef, isEditingState, isLoadingContent || hasLoadError)
+	useSingleBlockSize(editor, shape, containerRef, protyleHostRef, isEditingState, isLoadingContent || hasLoadError)
 		// 检测是否包含属性视图图标（数据库图标）
 		useEffect(() => {
 			let container = containerRef.current
@@ -483,17 +630,19 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			
 			const blockId = shape.props.blockId
 			if (!blockId) return
+			const fontSize = shape.props.fontSize || 16
 			
 			// 检查视口可见性
 			const shouldLoad = !isViewportCullingEnabled || (isInViewport && canLoad)
 			if (!shouldLoad) return
 			
 			// refreshNonce 变化时强制刷新缓存
-			const forceRefresh = shape.props.refreshNonce !== undefined
+			const forceRefresh = refreshNonceRef.current !== shape.props.refreshNonce
+			refreshNonceRef.current = shape.props.refreshNonce
 			
 			// 尝试从缓存获取（除非需要强制刷新）
 			if (!forceRefresh) {
-				const cached = getCachedHtml(blockId)
+				const cached = getCachedHtml(blockId, fontSize)
 				if (cached) {
 					setStaticHtml(cached)
 					return
@@ -507,7 +656,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			let cancelled = false
 			setIsLoadingContent(true)
 			setHasLoadError(false)
-			const fontSize = shape.props.fontSize || 16
 			
 			// 使用批量请求函数获取 DOM
 			requestBlockDOM(blockId, fontSize).then(async (html) => {
@@ -522,16 +670,20 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				if (cancelled) return
 				if (content) {
 					const fallbackHtml = await renderSimpleBlockHtml(content.content || content.markdown, fontSize)
-					setCachedHtml(blockId, fallbackHtml)
+					setCachedHtml(blockId, fallbackHtml, fontSize)
 					setStaticHtml(fallbackHtml)
 					setHasLoadError(false)
 				} else {
 					// 块不存在，设置错误状态
+					setStaticHtml('')
 					setHasLoadError(true)
 				}
 			}).catch(() => {
 				// API调用失败，设置错误状态
-				if (!cancelled) setHasLoadError(true)
+				if (!cancelled) {
+					setStaticHtml('')
+					setHasLoadError(true)
+				}
 			}).finally(() => {
 				if (!cancelled) setIsLoadingContent(false)
 			})
@@ -549,13 +701,14 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			
 			// 生成唯一的渲染任务 ID
 			const renderTaskId = `render-static-${shape.id}`
+			let cancelled = false
 			
 			// 使用 requestAnimationFrame 确保 DOM 已更新
 			const rafId = requestAnimationFrame(() => {
 				if (staticContentRef.current) {
 					// 使用空闲调度渲染，在交互时会暂停
-					renderAllContentIdle(staticContentRef.current, 10).then(() => {
-						setIsContentRendered(true)
+					renderAllContentIdle(staticContentRef.current, 10, renderTaskId).then(() => {
+						if (!cancelled) setIsContentRendered(true)
 					}).catch(() => {
 						// 忽略渲染错误
 					})
@@ -563,6 +716,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			})
 			
 			return () => {
+				cancelled = true
 				cancelAnimationFrame(rafId)
 				cancelIdleRender(renderTaskId)
 			}
@@ -571,13 +725,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		// ===== 编辑态专用：创建和管理 Protyle 实例 =====
 		useEffect(() => {
 			if (!isEditingState) {
-				// 退出编辑态时，保存静态快照到缓存并销毁 Protyle
-				if (protyleRef.current && protyleHostRef.current && shape.props.blockId) {
-					const html = cacheFromProtyleHost(shape.props.blockId, protyleHostRef.current, shape.props.fontSize || 16)
-					if (html) {
-						setStaticHtml(html)
-					}
-				}
+				// 退出编辑态时：静态快照的保存与 Protyle 的销毁统一在下方 cleanup 中处理，
+				// 因为 React 会先执行上一轮编辑态 effect 的 cleanup（此时 Protyle 仍存在），
+				// 再执行这里的 effect body（此时 Protyle 已被销毁），所以必须在那里保存快照。
 				destroyRuntimeResources()
 				return
 			}
@@ -608,18 +758,18 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					return null
 				}
 
-				if (isCreatingBlock && pendingCreationPromise) {
+				const pendingCreationPromise = pendingCreationPromises.get(shape.id as string)
+				if (pendingCreationPromise) {
 					try {
 						blockId = await pendingCreationPromise
 					} catch (err) {
 						console.error('等待块创建失败', err)
 					}
 				} else if (!blockId) {
-					isCreatingBlock = true
 					try {
-						pendingCreationPromise = (async () => {
+						const creationPromise = (async () => {
 							const idid = (await api.generateSiyuanID()) as string
-							const link = buildTldrawLink(tldrawId, idid, title)
+							const link = buildTldrawLink(tldrawId, idid)
 							// 将链接保存到自定义属性中
 							const redata = await api.appendBlock(
 								'markdown',
@@ -628,12 +778,12 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 							)
 							return redata[0].doOperations[0].id as string
 						})()
-						blockId = await pendingCreationPromise
+						pendingCreationPromises.set(shape.id as string, creationPromise)
+						blockId = await creationPromise
 					} catch (err) {
 						console.error('创建块失败', err)
 					} finally {
-						isCreatingBlock = false
-						setTimeout(() => (pendingCreationPromise = null), 5000)
+						pendingCreationPromises.delete(shape.id as string)
 					}
 				}
 
@@ -707,9 +857,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 								preventInsetEmptyBlock: true,
 							},
 							handleEmptyContent() {
-								showMessage('块已被删除')
 								if (!disposed && !signal.aborted) {
-									editor.deleteShape(shape.id)
+									enterMissingLinkedBlockState()
 								}
 							},
 						})
@@ -840,6 +989,15 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					} catch (e) {
 						// ignore
 					}
+					const branchParentInfo = !event.ctrlKey && !event.metaKey ? getSingleBranchParent(editor, shape.id) : null
+					if (branchParentInfo) {
+						const newId = createSiblingSingleInBranch(editor, shape.id)
+						if (!newId) return
+						editor.select(newId)
+						editor.setEditingShape(newId)
+						requestAnimationFrame(() => ensureShapeVisible(newId))
+						return
+					}
 					const offset = 40
 					const width = shape.props.w
 					const height = shape.props.h
@@ -926,6 +1084,15 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 			return () => {
 				disposed = true
+				// 退出编辑态时，在销毁 Protyle 之前先保存静态快照到缓存与本地状态
+				// 必须在此处（cleanup）执行：React 先跑上一轮 effect 的 cleanup（Protyle 仍在），
+				// 再跑新一轮非编辑态 effect 的 body（此时若已销毁则取不到内容）
+				if (protyleRef.current && protyleHostRef.current && shape.props.blockId) {
+					const html = cacheFromProtyleHost(shape.props.blockId, protyleHostRef.current, shape.props.fontSize || 16)
+					if (html) {
+						setStaticHtml(html)
+					}
+				}
 				destroyRuntimeResources()
 			}
 		}, [destroyRuntimeResources, isEditingState, shape.id, shape.props.blockId, shape.props.refreshNonce])
@@ -947,6 +1114,77 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			}
 		}
 
+		const handleStaticLinkPointerDown = useCallback(
+			(e: React.PointerEvent<HTMLDivElement>) => {
+				if (isEditingState) return
+				if (findStaticLinkTarget(e.target, staticContentRef.current)) {
+					clearStaticTextSelection()
+					e.stopPropagation()
+				}
+			},
+			[isEditingState]
+		)
+
+		const handleStaticLinkDragStart = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+			e.preventDefault()
+			e.stopPropagation()
+			clearStaticTextSelection()
+		}, [])
+
+		const handleStaticLinkClick = useCallback(
+			(e: React.MouseEvent<HTMLDivElement>) => {
+				if (isEditingState || e.defaultPrevented) return
+				const target = findStaticLinkTarget(e.target, staticContentRef.current)
+				if (!target) return
+
+				e.preventDefault()
+				e.stopPropagation()
+				clearStaticTextSelection()
+
+				if (target.blockId) {
+					if (!window.siyuan?.ws?.app) return
+					void openTab({
+						app: window.siyuan.ws.app,
+						doc: {
+							id: target.blockId,
+							action: ['cb-get-hl', 'cb-get-all'],
+							zoomIn: false,
+						},
+						position: 'right',
+						keepCursor: false,
+					}).catch((err) => {
+						console.error('jump to linked block failed', err)
+						try {
+							showMessage('跳转到链接块失败', 3000, 'error')
+						} catch {
+							// ignore
+						}
+					})
+					return
+				}
+
+				if (!target.href || target.href === '#') return
+				const href = target.href.startsWith('assets/') ? `/${target.href}` : target.href
+				if (isSteveToolsPluginUrl(href)) return
+
+				try {
+					if (href.startsWith('siyuan://')) {
+						window.location.href = href
+					} else {
+						window.open(href, '_blank', 'noopener')
+					}
+				} catch (err) {
+					console.error('open static link failed', err)
+					try {
+						showMessage('打开链接失败', 3000, 'error')
+					} catch {
+						// ignore
+					}
+				}
+			},
+			[isEditingState]
+		)
+
 		const handleAttrIconClick = useCallback(
 			async (e: React.MouseEvent<HTMLDivElement>) => {
 				e.preventDefault()
@@ -959,15 +1197,19 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					if (!window.siyuan?.ws?.app) return
 					const data = await (api as any).getBlockAttrs(blockId)
 					const tempContainer = document.createElement('div')
-					const protyle = new Protyle(window.siyuan.ws.app, tempContainer, {
+					const tempProtyle = new Protyle(window.siyuan.ws.app, tempContainer, {
 						blockId,
 						rootId: blockId,
-					}).protyle
+					})
+					const protyle = tempProtyle.protyle
 					openAttributePanel({
 						data,
 						focusName: 'av',
 						protyle,
 					})
+					window.setTimeout(() => {
+						safeDestroyProtyle(tempProtyle)
+					}, 0)
 				} catch (err) {
 					console.error('open attribute panel failed', err)
 					try {
@@ -992,7 +1234,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					display: 'flex',
 					flexDirection: 'column',
 					backgroundColor: shape.props.transparentBackground ? 'transparent' : theme[shape.props.color].semi,
-					color: theme[shape.props.color].solid,
+					// color: theme[shape.props.color].solid,
 					position: 'relative',
 					isolation: 'isolate',
 					// Always allow pointer events at the container level so hover can be detected
@@ -1002,7 +1244,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					width: '100%',
 					height: '100%',
 					overflow: 'visible', // 改为 visible 以显示端口
-					boxShadow: isEditingState ? '0 0 0 2px #3d8aff' : 'none',
+					boxShadow: isRootAttachTarget
+						? '0 0 0 4px rgba(34, 197, 94, 0.42), 0 0 20px rgba(34, 197, 94, 0.32)'
+						: isEditingState ? '0 0 0 2px #3d8aff' : 'none',
 					cursor: isEditingState ? 'text' : 'default',
 					padding: 0,
 					border: settingdata["showCardBorder"] ? (shape.props.transparentBackground ? 'none' : `${borderPx}px solid ${theme[shape.props.color].solid}`) : 'none',
@@ -1071,6 +1315,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				</div>
 				<div
 					ref={containerRef}
+					className="st-single-block-shape__content"
 					blockid={shape.props.blockId}
 					style={{
 						width: '100%',
@@ -1087,9 +1332,52 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					}}
 				>
 					{/* 非编辑态：显示静态 HTML 内容 */}
+					<style>
+						{`
+							.st-single-block-shape__content,
+							.st-single-block-shape__content * {
+								scrollbar-width: none !important;
+								-ms-overflow-style: none !important;
+							}
+							.st-single-block-shape__content::-webkit-scrollbar,
+							.st-single-block-shape__content *::-webkit-scrollbar {
+								width: 0 !important;
+								height: 0 !important;
+								display: none !important;
+							}
+							.single-block-static-content,
+							.single-block-static-content .protyle-wysiwyg {
+								pointer-events: none !important;
+								user-select: none !important;
+								-webkit-user-select: none !important;
+							}
+							.single-block-static-content * {
+								pointer-events: none !important;
+								user-select: none !important;
+								-webkit-user-select: none !important;
+								-webkit-user-drag: none !important;
+							}
+							.single-block-static-content a,
+							.single-block-static-content a *,
+							.single-block-static-content [data-href],
+							.single-block-static-content [data-href] *,
+							.single-block-static-content [data-type*="block-ref"],
+							.single-block-static-content [data-type*="block-ref"] *,
+							.single-block-static-content [data-type*="file-annotation-ref"],
+							.single-block-static-content [data-type*="file-annotation-ref"] * {
+								pointer-events: auto !important;
+								cursor: pointer;
+							}
+						`}
+					</style>
 					{!isEditingState && staticHtml && (
-						<div 
+						<div
+							className="single-block-static-content"
 							ref={staticContentRef}
+							onPointerDown={handleStaticLinkPointerDown}
+							onPointerUp={handleStaticLinkPointerDown}
+							onDragStart={handleStaticLinkDragStart}
+							onClick={handleStaticLinkClick}
 							dangerouslySetInnerHTML={{ __html: staticHtml }}
 							style={{
 								width: '100%',
@@ -1150,24 +1438,78 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 							双击编辑
 						</div>
 					)}
-					{/* 非编辑态：块不存在错误提示 */}
-					{!isEditingState && !staticHtml && !isLoadingContent && hasLoadError && (
-						<div style={{
-							width: '100%',
-							height: '100%',
+				</div>
+				{!isEditingState && hasLoadError && (
+					<div
+						onPointerDown={stopMissingStateEvent}
+						onClick={stopMissingStateEvent}
+						style={{
+							position: 'absolute',
+							inset: '0',
+							zIndex: 20,
 							display: 'flex',
 							alignItems: 'center',
 							justifyContent: 'center',
-							fontSize: `${Math.min(shape.props.fontSize, 14)}px`,
-							color: theme[shape.props.color].solid,
-							opacity: 0.6,
-							textAlign: 'center',
-							padding: '4px'
-						}}>
-							块不存在或已删除
+							padding: '12px',
+							background: shape.props.transparentBackground ? 'rgba(127, 127, 127, 0.08)' : 'rgba(127, 127, 127, 0.14)',
+							backdropFilter: 'blur(2px)',
+							pointerEvents: 'auto',
+						}}
+					>
+						<div
+							style={{
+								display: 'flex',
+								flexDirection: 'column',
+								alignItems: 'center',
+								gap: '10px',
+								maxWidth: '100%',
+								padding: '14px 16px',
+								borderRadius: '12px',
+								background: 'var(--b3-theme-background, #fff)',
+								border: '1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12))',
+								boxShadow: '0 8px 24px rgba(0, 0, 0, 0.12)',
+								color: theme[shape.props.color].solid,
+								textAlign: 'center',
+							}}
+						>
+							<div style={{ fontSize: `${Math.min(shape.props.fontSize, 14)}px`, fontWeight: 500 }}>
+								找不到绑定块
+							</div>
+							<div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
+								<button
+									type="button"
+									onPointerDown={stopMissingStateEvent}
+									onClick={handleRefreshMissingLinkedBlock}
+									style={{
+										padding: '6px 12px',
+										borderRadius: '8px',
+										border: '1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12))',
+										background: 'transparent',
+										color: 'inherit',
+										cursor: 'pointer',
+									}}
+								>
+									刷新
+								</button>
+								<button
+									type="button"
+									onPointerDown={stopMissingStateEvent}
+									onClick={handleDeleteMissingLinkedBlock}
+									style={{
+										padding: '6px 12px',
+										borderRadius: '8px',
+										border: '1px solid var(--b3-card-error-color, #d23f31)',
+										background: 'var(--b3-card-error-background, rgba(210, 63, 49, 0.12))',
+										color: 'var(--b3-card-error-color, #d23f31)',
+										cursor: 'pointer',
+									}}
+								>
+									删除
+								</button>
+							</div>
 						</div>
-					)}
-				</div>
+					</div>
+				)}
 				{/* 端口覆盖层 - 用于贝塞尔连接器 */}
 				{/* 在透明模式下不显示端点（PortsOverlay） */}
 				{!shape.props.transparentBackground && (
@@ -1179,7 +1521,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 	indicator(shape: ISingleBlockShape) {
 		const { width, height } = this.editor.getShapeGeometry(shape).bounds
-		return <rect width={width} height={height} />
+		return <rect width={width} height={height} rx={10} ry={10} />
 	}
 
 	override onResize(shape: ISingleBlockShape, info: TLResizeInfo<ISingleBlockShape>) {
@@ -1187,14 +1529,24 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 	}
 
 	override onTranslateStart(shape: ISingleBlockShape) {
+		draggingBranchSingleBlockIds.add(shape.id as string)
+		beginBranchAttachmentDrag(this.editor, shape)
+		setBranchInteractionHint(getBranchInteractionHintForShape(this.editor, shape))
+
 		const bindings = this.editor.getBindingsFromShape(shape, 'single-block')
 		this.editor.deleteBindings(bindings)
 	}
 
 	override onTranslateEnd(_initial: ISingleBlockShape, currentShape: ISingleBlockShape) {
+		draggingBranchSingleBlockIds.delete(currentShape.id as string)
+		clearBranchInteractionHint(currentShape.id as string)
+		if (updateBranchAttachmentAfterDrag(this.editor, currentShape)) return
+
         // 如果当前 shape 标记为不允许绑定，则跳过创建绑定
         if (currentShape.props.allowBinding === false) return
-		const pageAnchor = this.editor.getShapePageTransform(currentShape).applyToPoint({ x: 0, y: 0 })
+		const pageAnchor = this.editor
+			.getShapePageTransform(currentShape)
+			.applyToPoint(this.editor.getShapeGeometry(currentShape).bounds.center)
 		const target = this.editor.getShapeAtPoint(pageAnchor, {
 			hitInside: true,
 			filter: (shape) =>
@@ -1226,177 +1578,42 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const theme = getDefaultColorTheme({ isDarkMode: ctx.isDarkMode })
 		const { w, h: hProp, color, fontSize = 16, blockId, transparentBackground } = shape.props
 		const showBorder = settingdata["showCardBorder"] !== false && !transparentBackground
+		// 背景是否透明与是否显示边框是两个独立的选项。画布上的
+		// singleblock 在关闭边框时仍然保留颜色背景，导出也应保持一致。
+		const hasBackground = !transparentBackground
 		const border = showBorder ? BORDER_PX : 0
 		const radius = 10
 		const strokeColor = showBorder ? theme[color].solid : 'none'
-		const fillColor = showBorder ? theme[color].semi : 'none'
+		const fillColor = hasBackground ? theme[color].semi : 'none'
 		const textColor = theme[color].solid
-		let serialized = ''
-
 		const size = SingleBlockSizes.get(this.editor).get(shape.id)
 		// 使用实际渲染高度，如果没有则使用属性高度，确保导出与实际一致
 		const h = size?.height ?? Math.max(hProp, MIN_HEIGHT)
+		if (isSvgExportOutlineOnly()) {
+			return <rect width={w} height={h} fill="none" stroke={theme[color].solid} strokeWidth={border || 1} rx={radius} ry={radius} />
+		}
 
 		// Clamp inner dimensions to avoid negative <foreignObject> size during export
 		const innerW = Math.max(w - border * 2, 1)
 		const innerH = Math.max(h - border * 2, 1)
-
-		const binaryToBase64 = (binary: string) => {
-			let base64 = ''
-			const chunkSize = 0x6000
-			for (let i = 0; i < binary.length; i += chunkSize) {
-				const slice = binary.slice(i, i + chunkSize)
-				let normalized = ''
-				for (let j = 0; j < slice.length; j++) {
-					normalized += String.fromCharCode(slice.charCodeAt(j) & 0xff)
-				}
-				base64 += btoa(normalized)
+		const cachedSnapshot = getCachedSvgExportSnapshot(shape.id)
+		let serialized = cachedSnapshot ?? ''
+		if (cachedSnapshot === null && typeof document !== 'undefined') {
+			const host = getShapeHostElement(shape.id, this.editor.getContainer())
+			const content = host?.querySelector('[blockid]') as HTMLElement | null
+			if (content) {
+				serialized = serializeElementForSvgExport(content, {
+					viewportWidth: innerW,
+					viewportHeight: innerH,
+					fontSize,
+				})
 			}
-			return base64
 		}
-
-		const assetToDataUrl = (rawSrc: string | null) => {
-			if (!rawSrc) return ''
-			const trimmed = rawSrc.trim()
-			if (!trimmed || /^data:/i.test(trimmed) || /^https?:/i.test(trimmed) || trimmed.startsWith('//')) return trimmed
-			let logicalPath = trimmed.replace(/^\.\//, '')
-			if (logicalPath.startsWith('/')) logicalPath = logicalPath.slice(1)
-			let kernelPath = ''
-			if (logicalPath.startsWith('assets/')) kernelPath = `/data/${logicalPath}`
-			else if (logicalPath.startsWith('data/')) kernelPath = `/${logicalPath}`
-			else if (logicalPath.startsWith('/data/')) kernelPath = logicalPath
-			else return trimmed
-			try {
-				const xhr = new XMLHttpRequest()
-				xhr.open('POST', '/api/file/getFile', false)
-				xhr.overrideMimeType('text/plain; charset=x-user-defined')
-				xhr.setRequestHeader('Content-Type', 'application/json')
-				xhr.send(JSON.stringify({ path: kernelPath }))
-				if (xhr.status >= 200 && xhr.status < 300 && typeof xhr.responseText === 'string') {
-					const base64 = binaryToBase64(xhr.responseText)
-					const ext = (logicalPath.split('.').pop() || 'png').toLowerCase()
-					const mimeMap: Record<string, string> = {
-						png: 'image/png',
-						jpg: 'image/jpeg',
-						jpeg: 'image/jpeg',
-						gif: 'image/gif',
-						webp: 'image/webp',
-						svg: 'image/svg+xml',
-						bmp: 'image/bmp',
-						ico: 'image/x-icon',
-						avif: 'image/avif',
-					}
-					const mime = mimeMap[ext] || 'image/png'
-					return `data:${mime};base64,${base64}`
-				}
-			} catch (err) {
-				console.warn('Embedding asset failed', err)
-			}
-			return trimmed
-		}
-
-		const serializeContent = () => {
-			if (typeof document === 'undefined') return ''
-			const host = document.getElementById(shape.id)
-			if (!host) return ''
-			const content = host.querySelector('[blockid]') as HTMLElement | null
-			if (!content) return ''
-			const clone = content.cloneNode(true) as HTMLElement
-
-			const inlineComputedStyles = (source: Element, target: Element) => {
-				const computed = window.getComputedStyle(source)
-				const styleText = Array.from(computed)
-					.map((prop) => `${prop}:${computed.getPropertyValue(prop)};`)
-					.join('')
-				const existing = target.getAttribute('style') || ''
-				target.setAttribute('style', `${styleText}${existing}`)
-				const sourceChildren = Array.from(source.children)
-				const targetChildren = Array.from(target.children)
-				for (let i = 0; i < sourceChildren.length; i++) {
-					const srcChild = sourceChildren[i]
-					const tgtChild = targetChildren[i]
-					if (srcChild && tgtChild) {
-						inlineComputedStyles(srcChild, tgtChild)
-					}
-				}
-			}
-
-			inlineComputedStyles(content, clone)
-			clone.querySelectorAll('[contenteditable]').forEach((el) => el.removeAttribute('contenteditable'))
-			clone.querySelectorAll('[data-node-id]').forEach((el) => el.removeAttribute('data-node-id'))
-			clone.querySelectorAll('[data-node-index]').forEach((el) => el.removeAttribute('data-node-index'))
-			clone.querySelectorAll('[updated]').forEach((el) => el.removeAttribute('updated'))
-			clone.querySelectorAll('[data-realwidth]').forEach((el) => el.removeAttribute('data-realwidth'))
-			clone.querySelectorAll('[data-readonly]').forEach((el) => el.removeAttribute('data-readonly'))
-			clone.querySelectorAll('*').forEach((node) => {
-				if (node instanceof HTMLElement) {
-					node.style.setProperty('scrollbar-width', 'none', 'important')
-					node.style.setProperty('ms-overflow-style', 'none', 'important')
-					node.style.setProperty('overscroll-behavior', 'contain')
-				}
-			})
-			clone.querySelectorAll('img').forEach((img) => {
-				const embedded = assetToDataUrl(img.getAttribute('src'))
-				if (embedded) {
-					img.setAttribute('src', embedded)
-					img.removeAttribute('crossorigin')
-				}
-				const srcset = img.getAttribute('srcset')
-				if (srcset) {
-					const resolvedSet = srcset
-						.split(',')
-						.map((entry) => {
-							const [url, descriptor] = entry.trim().split(/\s+/, 2)
-							const resolved = assetToDataUrl(url)
-							return resolved ? (descriptor ? `${resolved} ${descriptor}` : resolved) : ''
-						})
-						.filter(Boolean)
-						.join(', ')
-					if (resolvedSet) img.setAttribute('srcset', resolvedSet)
-					else img.removeAttribute('srcset')
-				}
-			})
-			clone.querySelectorAll('source').forEach((sourceEl) => {
-				const src = sourceEl.getAttribute('src')
-				const resolved = assetToDataUrl(src)
-				if (resolved) {
-					sourceEl.setAttribute('src', resolved)
-					sourceEl.removeAttribute('crossorigin')
-				}
-				const srcset = sourceEl.getAttribute('srcset')
-				if (srcset) {
-					const resolvedSet = srcset
-						.split(',')
-						.map((entry) => {
-							const [url, descriptor] = entry.trim().split(/\s+/, 2)
-							const result = assetToDataUrl(url)
-							return result ? (descriptor ? `${result} ${descriptor}` : result) : ''
-						})
-						.filter(Boolean)
-						.join(', ')
-					if (resolvedSet) sourceEl.setAttribute('srcset', resolvedSet)
-					else sourceEl.removeAttribute('srcset')
-				}
-			})
-			clone.style.width = `${Math.max(innerW, 1)}px`
-			clone.style.height = `${Math.max(innerH, 1)}px`
-			clone.style.pointerEvents = 'none'
-			clone.style.overflow = 'hidden'
-			clone.style.fontSize = `${fontSize}px`
-			clone.style.boxSizing = 'border-box'
-			return clone.outerHTML
-		}
-
-		serialized = serializeContent()
-		const containerAttrSelector = `[data-sb-id="${shape.id}"]`
-		// 使用与实际渲染一致的样式：.protyle-wysiwyg padding-left: 8px
-		const hideScrollbarStyle = serialized
-			? `<style xmlns="http://www.w3.org/1999/xhtml">${containerAttrSelector} *::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}${containerAttrSelector} *::-webkit-scrollbar-thumb{display:none!important;}${containerAttrSelector} *{scrollbar-width:none!important;}${containerAttrSelector} .protyle-wysiwyg{position:relative;padding:0 0 0 8px!important;}</style>`
-			: ''
+		const scopeId = `st-single-block-export-${shape.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`
 
 		return (
 			<g>
-				{border > 0 ? (
+				{hasBackground || border > 0 ? (
 					<rect width={w} height={h} fill={fillColor} stroke={strokeColor} strokeWidth={border} rx={radius} ry={radius} />
 				) : (
 					// 保持形状几何但不绘制填充与边框
@@ -1406,9 +1623,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					<foreignObject x={border} y={border} width={Math.max(innerW, 1)} height={Math.max(innerH, 1)}>
 						<div
 							xmlns="http://www.w3.org/1999/xhtml"
-							data-sb-id={shape.id}
+							id={scopeId}
 							style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize: `${fontSize}px` }}
-							dangerouslySetInnerHTML={{ __html: `${hideScrollbarStyle}${serialized}` }}
+							dangerouslySetInnerHTML={{ __html: `${getSvgExportGlobalStyles(`#${scopeId}`)}${serialized}` }}
 						/>
 					</foreignObject>
 				) : (
@@ -1422,7 +1639,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 }
 
 // ===== Single Block Binding =====
-type SingleBlockBinding = TLBaseBinding<
+export type SingleBlockBinding = TLBaseBinding<
 	'single-block',
 	{
 		anchor: VecModel

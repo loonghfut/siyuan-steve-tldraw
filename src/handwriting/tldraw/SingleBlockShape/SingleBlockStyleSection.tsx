@@ -2,9 +2,10 @@
  * SingleBlock 形状样式面板区块
  */
 import React from 'react'
-import { TldrawUiButton, Editor } from '@tldraw/tldraw'
+import { TldrawUiButton, TldrawUiIcon, Editor } from '@tldraw/tldraw'
 import type { ISingleBlockShape } from './single-block-shape-types'
 import { arrangeConnectedSingleBlocks } from '../utils/arrangeSingleBlocks'
+import { fitSingleBlockWidth } from '../utils/fitSingleBlockWidth'
 import { ConnectionModeManager } from '../utils/connectionMode'
 
 export interface SingleBlockStyleSectionProps {
@@ -68,7 +69,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                 }
                             }}
                         >
-                            直线
+                            <TldrawUiIcon label="" icon="connector-arrow" />
                         </TldrawUiButton>
                         <TldrawUiButton
                             type={connectionConnectorKind === 'bezier' ? 'primary' : 'normal'}
@@ -81,7 +82,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                 }
                             }}
                         >
-                            曲线
+                            <TldrawUiIcon label="" icon="connector-curve" />
                         </TldrawUiButton>
                     </div>
                 </div>
@@ -117,7 +118,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                     opacity: connectOnEnterState === 'mixed' ? 0.85 : undefined,
                                 }}
                             >
-                                <span className="tlui-toggle-icon">↵</span>
+                                <TldrawUiIcon label="" icon="enter-connect" />
                             </TldrawUiButton>
 
                             <TldrawUiButton
@@ -144,7 +145,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                     opacity: transparentBackgroundState === 'mixed' ? 0.85 : undefined,
                                 }}
                             >
-                                <span className="tlui-toggle-icon">◻️</span>
+                                <TldrawUiIcon label="" icon="transparent-background" />
                             </TldrawUiButton>
 
                             <TldrawUiButton
@@ -171,7 +172,19 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                     opacity: allowBindingState === 'mixed' ? 0.85 : undefined,
                                 }}
                             >
-                                <span className="tlui-toggle-icon">🔗</span>
+                                <TldrawUiIcon label="" icon="binding-link" />
+                            </TldrawUiButton>
+
+                            <TldrawUiButton
+                                type="normal"
+                                className="tlui-toggle-button"
+                                onClick={() => {
+                                    fitSingleBlockWidth(editor, selectedSingleBlockShapes)
+                                }}
+                                title="自适应收缩宽度：根据内容紧凑收紧块宽度（只收缩不增宽）"
+                                aria-label="自适应宽度"
+                            >
+                                <TldrawUiIcon label="" icon="fit-width" />
                             </TldrawUiButton>
                         </div>
                     </div>
@@ -183,7 +196,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                 onClick={() => arrangeConnectedSingleBlocks(editor, 'up')}
                                 title="将相连块排列到上方"
                             >
-                                ↑
+                                <TldrawUiIcon label="" icon="arrange-up" />
                             </TldrawUiButton>
                             <TldrawUiButton
                                 type="normal"
@@ -191,7 +204,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                 onClick={() => arrangeConnectedSingleBlocks(editor, 'down')}
                                 title="将相连块排列到下方"
                             >
-                                ↓
+                                <TldrawUiIcon label="" icon="arrange-down" />
                             </TldrawUiButton>
                             <TldrawUiButton
                                 type="normal"
@@ -199,7 +212,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                 onClick={() => arrangeConnectedSingleBlocks(editor, 'left')}
                                 title="将相连块排列到左侧"
                             >
-                                ←
+                                <TldrawUiIcon label="" icon="arrange-left" />
                             </TldrawUiButton>
                             <TldrawUiButton
                                 type="normal"
@@ -207,7 +220,7 @@ export const SingleBlockStyleSection: React.FC<SingleBlockStyleSectionProps> = (
                                 onClick={() => arrangeConnectedSingleBlocks(editor, 'right')}
                                 title="将相连块排列到右侧"
                             >
-                                →
+                                <TldrawUiIcon label="" icon="arrange-right" />
                             </TldrawUiButton>
                         </div>
                     </div>

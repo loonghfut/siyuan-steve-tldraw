@@ -3,14 +3,34 @@
  * https://github.com/frostime/sy-plugin-template-vite
  * 
  * See API Document in [API.md](https://github.com/siyuan-note/siyuan/blob/master/API.md)
- * API 文档见 [API_zh_CN.md](https://github.com/siyuan-note/siyuan/blob/master/API_zh_CN.md)
+ * API 文档见 [API.zh-CN.md](https://github.com/siyuan-note/siyuan/blob/master/API.zh-CN.md)
  */
 
-import { fetchPost, fetchSyncPost, IOperation, IWebSocketData, Protyle, showMessage } from "siyuan";
+import { fetchPost, fetchSyncPost, IOperation, IWebSocketData, Protyle } from "siyuan";
+import { ISelectOption } from "@/calendar/interface";
 import { settingdata } from "..";
 import { AVManager } from "./db_pro";
+import {
+    markCalendarCellWrite,
+    type CalendarWriteReason,
+} from "@/calendar/calendar-self-write";
 // 创建 AVManager 实例 - 可以根据需要进行配置
 const avManager = new AVManager();
+
+/**
+ * AV 单元格写入选项。仅在调用方主动声明 source==='calendar' 时影响行为：
+ * - markSelfWrite (默认 true): 入队即把 (avID, itemID, keyID) 标记为日历自写，
+ *   transactionListener 看到 ws/fetch 回声会跳过 refreshKanban。
+ * - suppressPostRefresh (默认 true): 本批结尾的 refreshAttributeView 跳过——
+ *   若一批里全部为自写，省掉一次全量 refetch；只要混入一条非自写仍会刷新。
+ * 不传 options 时与历史行为完全一致。
+ */
+export interface AVCellWriteOptions {
+    source?: 'calendar' | 'other';
+    reason?: CalendarWriteReason;
+    markSelfWrite?: boolean;
+    suppressPostRefresh?: boolean;
+}
 
 // 请求队列，使用批量处理优化性能
 const cellUpdateQueue: Array<{
@@ -22,6 +42,7 @@ const cellUpdateQueue: Array<{
     value: any;
     type: string;
     endtime?: string;
+    options?: AVCellWriteOptions;
     resolve: (value: any) => void;
     reject: (reason: any) => void;
 }> = [];
@@ -245,6 +266,24 @@ export async function insertBlock(
     }
     let url = '/api/block/insertBlock';
     return request(url, payload);
+}
+
+/**
+ * 智能插入块：若 targetId 为文档块（type='d'）则作为其子块插入（parentID），
+ * 否则作为其后置兄弟块插入（previousID）。
+ */
+export async function smartInsertBlock(dataType: DataType, data: string, targetId: BlockId | DocumentId): Promise<IResdoOperations[]> {
+    let isDoc = false;
+    try {
+        const rows: { type: string }[] = await sql(`SELECT type FROM blocks WHERE id='${String(targetId).replace(/'/g, "''")}' LIMIT 1`);
+        isDoc = rows?.[0]?.type === 'd';
+    } catch (e) {
+        console.warn('查询块类型失败，按普通块插入', e);
+    }
+    if (isDoc) {
+        return insertBlock(dataType, data, undefined, undefined, targetId);
+    }
+    return insertBlock(dataType, data, undefined, targetId);
 }
 
 
@@ -956,7 +995,7 @@ export async function updateAttrViewCell_pro(
     avID: string,
     keyID: string,
     itemID: string,
-    value: string | Date  | boolean | {
+    value: string | Date | ISelectOption[] | boolean | {
         itemID: string,
         content: string,
         oldrelation: {
@@ -966,7 +1005,8 @@ export async function updateAttrViewCell_pro(
         action: string
     },
     type: 'date' | 'select' | 'relation' | 'checkbox' | 'text' | 'mSelect' | 'url',
-    endtime?: string
+    endtime?: string,
+    options?: AVCellWriteOptions,
 ): Promise<any> {
     return new Promise((resolve, reject) => {
         // 将所有请求添加到队列中
@@ -978,9 +1018,21 @@ export async function updateAttrViewCell_pro(
             value,
             type,
             endtime,
+            options,
             resolve,
             reject
         });
+
+        // 日历自写：入队时立刻登记标记。原因：队列有 150-2000ms 延迟，
+        // ws-main 广播可能在 await batchUpdateCells 返回前到达，提前标记保证
+        // transactionListener 命中。
+        if (options?.source === 'calendar' && options.markSelfWrite !== false) {
+            try {
+                markCalendarCellWrite(avID, itemID, keyID, options.reason);
+            } catch (e) {
+                console.warn('[CalendarSelfWrite] markCalendarCellWrite 失败', e);
+            }
+        }
 
         // console.debug(`📝 [队列] 添加单元格更新请求，队列当前长度: ${cellUpdateQueue.length}, avID: ${avID}`);
 
@@ -1091,7 +1143,12 @@ async function processQueue() {
 
                 // console.debug(`✅ [批量更新单元格] 成功更新 ${batchUpdates.length} 个单元格，avID: ${avID}`);
                 // 批量更新完成后的后续处理
-                await handlePostBatchUpdateActions(avID);
+                // 仅当本批"全部"为日历自写且未禁用 suppressPostRefresh 时，跳过 refreshKanban。
+                // 混入任何非自写更新仍触发刷新，保证外部调用方行为不变。
+                const allCalendarSelf = updates.every(u =>
+                    u.options?.source === 'calendar' && u.options.suppressPostRefresh !== false
+                );
+                await handlePostBatchUpdateActions(avID, { skipRefresh: allCalendarSelf });
             } else {
                 // 如果没有有效更新，拒绝所有Promise
                 updates.forEach(update => update.reject(new Error('Invalid keyName for update')));
@@ -1117,8 +1174,12 @@ async function processQueue() {
 }
 
 // 处理批量更新完成后的后续操作
-async function handlePostBatchUpdateActions(avID: string) {
+async function handlePostBatchUpdateActions(avID: string, opts?: { skipRefresh?: boolean }) {
     try {
+        if (opts?.skipRefresh) {
+            console.debug(`[CalendarSelfWrite] skip post-batch refresh for av ${avID}`);
+            return;
+        }
         // 1. 触发视图刷新
         await refreshAttributeView(avID);
 
@@ -1134,6 +1195,7 @@ async function handlePostBatchUpdateActions(avID: string) {
 // 刷新属性视图
 async function refreshAttributeView(avID: string) {
     try {
+        refreshKanban();
         // console.debug(`🔄 [视图刷新] 成功刷新视图，avID: ${avID}`);
     } catch (error) {
         console.warn(`⚠️ [视图刷新] 刷新视图失败，avID: ${avID}`, error);
@@ -1161,6 +1223,24 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
 
     switch (type) {
         case 'date':
+            if (value === undefined || value === null || value === '') {
+                console.debug("[属性视图] 日期值为空，按清空字段处理", {
+                    value,
+                    endtime,
+                });
+                processedValue = {
+                    date: {
+                        content: null,
+                        content2: null,
+                        formattedContent: "",
+                        hasEndDate: false,
+                        isNotEmpty: false,
+                        isNotEmpty2: false,
+                        isNotTime: true
+                    }
+                };
+                break;
+            }
             const { start, end } = await getDateTimestamps(value as string);
             processedValue = {
                 date: {
@@ -1176,7 +1256,7 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
 
         case 'select':
             processedValue = {
-                mSelect: (value as any[]).map(option => ({
+                mSelect: (value as ISelectOption[]).map(option => ({
                     content: option.content,
                     color: option.color
                 }))
@@ -1185,7 +1265,7 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
 
         case 'mSelect':
             processedValue = {
-                mSelect: (value as any[]).map(option => ({
+                mSelect: (value as ISelectOption[]).map(option => ({
                     content: option.content,
                     color: option.color
                 }))
@@ -1210,10 +1290,12 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
                 },
                 action: string
             };
-            const readyContents = transformBlockData(oldrelation.contents);
+            const relationIds = Array.isArray(oldrelation?.ids) ? oldrelation.ids : [];
+            const relationContents = Array.isArray(oldrelation?.contents) ? oldrelation.contents : [];
+            const readyContents = transformBlockData(relationContents);
             if (action === 'add') {
-                if (!oldrelation.ids.includes(itemID)) {
-                    oldrelation.ids.push(itemID);
+                if (!relationIds.includes(itemID)) {
+                    relationIds.push(itemID);
                     readyContents.push({
                         block: { content: content, id: itemID },
                         isDetached: false,
@@ -1221,9 +1303,9 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
                     });
                 }
             } else if (action === 'remove') {
-                const index = oldrelation.ids.indexOf(itemID);
+                const index = relationIds.indexOf(itemID);
                 if (index !== -1) {
-                    oldrelation.ids.splice(index, 1);
+                    relationIds.splice(index, 1);
                     readyContents.splice(index, 1);
                 }
             } else {
@@ -1231,7 +1313,7 @@ async function processCellValue(value: any, type: string, endtime?: string): Pro
             }
             processedValue = {
                 relation: {
-                    blockIDs: oldrelation.ids,
+                    blockIDs: relationIds,
                     contents: readyContents
                 }
             };
@@ -1329,7 +1411,7 @@ async function getDateTimestamps(dateStr: string): Promise<{ start: number, end:
     }
 }
 
-
+import { refreshKanban } from "@/calendar/kanban";
 
 
 

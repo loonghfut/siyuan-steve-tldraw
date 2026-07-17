@@ -15,10 +15,10 @@ import {
     TLShapeId,
     defaultBindingUtils,
     ArrowShapeUtil,
+    TLOverlayUtilConstructor,
 } from '@tldraw/tldraw';
 import '@tldraw/tldraw/tldraw.css';
 import '../custom-tldraw.css';
-import { getAssetUrls } from '@tldraw/assets/selfHosted'
 import { initCardsWithBlockIds } from './CardShape/card-shape-migrations';
 import { createTLStore, getSnapshot, loadSnapshot, throttle } from '@tldraw/tldraw';
 import * as api from '@/api/api';
@@ -26,7 +26,9 @@ import { SlideShapeUtil } from './SlideShape/SlideShapeUtil';
 import { SlideShapeTool } from './SlideShape/SlideShapeTool';
 import { captureSlideScreenshot, CaptureSlideScreenshotOptions, CaptureSlideScreenshotResult } from './SlideShape/captureSlideScreenshot';
 import { getSlides } from './SlideShape/useSlides';
+import { importMermaidDiagram } from './mermaid/mermaid-import';
 import { ICardShape } from './CardShape/card-shape-types';
+import { ISingleBlockShape } from './SingleBlockShape/single-block-shape-types';
 import { showMessage, Dialog } from 'siyuan';
 import { WhiteboardFileManager } from './whiteboard-file-manager';
 import TldrawBackupManager from './ui/tldraw-backup-manager.svelte';
@@ -35,24 +37,25 @@ import { JsShapeUtil } from './JsShape/JsShapeUtil';
 import { JsShapeTool } from './JsShape/JsShapeTool';
 import { MindMapShapeUtil } from './MindMapShape/MindMapShapeUtil';
 import { MindMapShapeTool } from './MindMapShape/MindMapShapeTool';
+import { BranchShapeUtil } from './BranchShape/BranchShapeUtil';
+import { BranchShapeTool } from './BranchShape/BranchShapeTool';
+import { keepBranchLayoutsUpdated } from './BranchShape/keep-branch-layouts-updated';
 import { setupDoubleClickHandler } from './utils/setupDoubleClickHandler';
-import { allEmbeds } from './utils/custom-embeds';
+import { ConfiguredEmbedShapeUtil } from './utils/custom-embeds';
 import { tldrawkey } from '@/../my/key';
 import { setupShapeLibraryDropHandler } from './shapelibrary/ShapeLibraryPanel';
 import { buildTldrawLink } from './utils/link-builder';
 import { setInteracting } from './utils/idle-scheduler';
-import { registerInstance, unregisterInstance } from './tldraw-instance-manager';
-const assetUrls = getAssetUrls({
-    baseUrl: 'plugins/siyuan-steve-tldraw/asset/',
-})
-
-// 为返回的 assetUrls 添加自定义图标映射（运行时赋值以避免类型定义冲突）
-try {
-    assetUrls.icons['mindmap'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/mindmap.svg';
-    assetUrls.icons['iconParagraph'] = 'plugins/siyuan-steve-tldraw/asset/icons/custom/iconParagraph.svg';
-} catch (err) {
-    console.warn('无法在 assetUrls 上添加 custom-icon 映射', err);
-}
+import { markFocusedInstance, registerInstance, unregisterInstance } from './tldraw-instance-manager';
+import { createAssetUrlsWithCustomIcons } from './utils/custom-icons';
+import * as agentOps from './agent/tools/internal/operations/manager-ops';
+import { focusAgentShapesById } from './agent/tools/internal/core/camera';
+import type { AgentAlignOperation, AgentArrangeOperation, AgentBasicShapeCreateArgs, AgentBoardEditRequest, AgentConnectorCreateArgs, AgentCreateShapeArgs, AgentResultMode, AgentShapeCommandRequest, AgentShapeUpdatePatch, AgentVisualContextOptions } from './agent/tools/internal/core/types';
+import type { AgentDocOutlineBoardOptions } from './agent/tools/internal/documents/doc-to-board';
+import type { AgentPlanApplyOptions } from './agent/tools/internal/planning/plan-runner';
+import { InteractionHintOverlayUtil } from './ui-overrides/overlay-utils/InteractionHintOverlayUtil';
+import { syncTldrawThemeFromSiyuan } from './utils/siyuan-theme';
+const assetUrls = createAssetUrlsWithCustomIcons();
 
 
 // There's a guide at the bottom of this file!
@@ -60,13 +63,14 @@ try {
 // [1]
 // 配置精准箭头功能
 const configuredArrowShapeUtil = ArrowShapeUtil.configure({
-    shouldBeExact: (editor, isPrecise) => settingdata['tldraw-exact-arrow-mode'] && isPrecise,
+    shouldBeExact: (_editor, isPrecise) => settingdata['tldraw-exact-arrow-mode'] && isPrecise,
 })
 // 从默认形状工具中过滤掉原始的ArrowShapeUtil，避免重复定义
-const filteredDefaultShapeUtils = defaultShapeUtils.filter(util => util.type !== 'arrow')
-const customShapeUtils = [...filteredDefaultShapeUtils, configuredArrowShapeUtil, CardShapeUtil, SingleBlockShapeUtil, SlideShapeUtil, JsShapeUtil, MindMapShapeUtil, BezierConnectorShapeUtil]
+const filteredDefaultShapeUtils = defaultShapeUtils.filter(util => util.type !== 'arrow' && util.type !== 'embed')
+const customShapeUtils = [...filteredDefaultShapeUtils, configuredArrowShapeUtil, ConfiguredEmbedShapeUtil, CardShapeUtil, SingleBlockShapeUtil, SlideShapeUtil, JsShapeUtil, MindMapShapeUtil, BranchShapeUtil, BezierConnectorShapeUtil]
 const customBindingUtils = [...defaultBindingUtils, SingleBlockBindingUtil, BezierConnectorBindingUtil]
-const customTools = [CardShapeTool, SingleBlockShapeTool, SlideShapeTool, JsShapeTool, MindMapShapeTool]
+const customTools = [CardShapeTool, SingleBlockShapeTool, SlideShapeTool, JsShapeTool, MindMapShapeTool, BranchShapeTool]
+const customOverlayUtils: readonly TLOverlayUtilConstructor[] = [InteractionHintOverlayUtil]
 
 /**
  * TldrawManager类，用于管理tldraw实例和操作
@@ -88,9 +92,14 @@ export class TldrawManager {
     private applyingRemoteChanges = false;
     private title: string;
     private themeObserver: MutationObserver | null = null;
+    private themeSyncFrame: number | null = null;
     private _autosaveUnsub: (() => void) | null = null;
     private _realtimeUnsub: (() => void) | null = null;
     private _broadcastChannel: BroadcastChannel | null = null;
+    private _focusTrackingCleanup: (() => void) | null = null;
+    private _agentActivityDepth = 0;
+    private _agentActivityClearTimer: ReturnType<typeof setTimeout> | null = null;
+    private _agentActivityStartedAt = 0;
     private _destroying = false;
     private _destroyed = false;
     private _mouseDownPos: { x: number; y: number } | null = null;
@@ -122,6 +131,8 @@ export class TldrawManager {
     private async initialize() {
         if (this._destroyed) return;
         // 清空container中的旧内容（如果有）
+        this.clearAgentActivityIndicator();
+
         this.container.innerHTML = '';
         const root = document.createElement('div');
         root.style.width = '100%';
@@ -317,9 +328,36 @@ export class TldrawManager {
         }
     }
 
+    // 性能优化：使用更激进的节流策略
+    private _throttledSave: (() => void) | null = null;
+    private _pendingSave = false;
+    private getThrottledSave() {
+        if (!this._throttledSave) {
+            // 使用更激进的节流：500ms内最多保存一次
+            this._throttledSave = throttle(() => {
+                if (this._pendingSave) {
+                    this._pendingSave = false;
+                    this.saveData();
+                }
+            }, 500);
+        }
+        return this._throttledSave;
+    }
+
+    private triggerSave() {
+        this._pendingSave = true;
+        this.getThrottledSave()();
+    }
+
+
+    // 兼容旧版布尔设置：true 创建单块，false 创建文本。
+    private readonly doubleClickCreationType = settingdata['enableDoubleClickCreateSingleBlock'] === 'text'
+        || settingdata['enableDoubleClickCreateSingleBlock'] === false
+        ? 'text'
+        : 'single-block'
 
     private options: Partial<TldrawOptions> = {
-        createTextOnCanvasDoubleClick: settingdata['enableDoubleClickCreateSingleBlock'] ? false : true,
+        createTextOnCanvasDoubleClick: this.doubleClickCreationType === 'text',
         maxFontsToLoadBeforeRender: 10,
         cameraSlideFriction: 1,
     }
@@ -348,13 +386,13 @@ export class TldrawManager {
                     shapeUtils={customShapeUtils}
                     bindingUtils={customBindingUtils}
                     tools={customTools}
+                    overlayUtils={customOverlayUtils}
                     overrides={uiOverrides}
                     options={this.options}
-                    inferDarkMode={isDarkTheme()}
                     components={components}
-                    embeds={allEmbeds}
                     onMount={(editor) => {
                         this.editor = editor;
+                        this.setupAgentFocusTracking(editor);
                         editor.user.updateUserPreferences({ isSnapMode:  settingdata['isSnapMode'] || false })
                         this.applyThemeToEditor();
                         this.setupThemeObserver();
@@ -428,8 +466,8 @@ export class TldrawManager {
                             });
                         }
 
-                        // 设置双击画布创建 single-block 的处理器
-                        if (settingdata['enableDoubleClickCreateSingleBlock'] !== false) {
+                        // 单块使用自定义处理器；文本使用 tldraw 原生双击创建行为。
+                        if (this.doubleClickCreationType === 'single-block') {
                             setupDoubleClickHandler(editor);
                         }
                         
@@ -445,6 +483,9 @@ export class TldrawManager {
                         
                         // 设置素材库拖放处理程序
                         setupShapeLibraryDropHandler(editor);
+
+                        // 保持 Branch 在子形状尺寸变化后同步重排
+                        keepBranchLayoutsUpdated(editor);
                         
                         // 设置交互状态监听，用于优化拖动时的性能
                         // 在拖动、缩放画布时暂停内容加载和渲染
@@ -507,6 +548,14 @@ export class TldrawManager {
                                         target.closest('.tlui-button') ||
                                         target.closest('.tlui-tooltip') ||
                                         target.closest('.slide-shape-name-input')) {
+                                        return;
+                                    }
+
+                                    // 排除自定义浮动面板（素材库/文档大纲/子文档/搜索），避免面板内输入框被立刻失焦
+                                    if (target.closest('.shape-library-panel') ||
+                                        target.closest('.doc-outline-panel') ||
+                                        target.closest('.child-docs-panel') ||
+                                        target.closest('.search-panel')) {
                                         return;
                                     }
 
@@ -613,13 +662,13 @@ export class TldrawManager {
                             // console.debug("拖拽块的内容", content);
                             if (blockIdo_rigin.includes('nodeheading')) {
                                 aproblock = blockId;
-                                const link = buildTldrawLink(this.id, aproblock, this.title);
+                                const link = buildTldrawLink(this.id, aproblock);
                                 // 将链接保存到块的自定义属性中
                                 await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw':"1"})
                             } else if (blockIdo_rigin.includes('paragraph')) {
                                 aproblock = blockId;
                                 // 将链接保存到块的自定义属性中
-                                const link = buildTldrawLink(this.id, aproblock, this.title);
+                                const link = buildTldrawLink(this.id, aproblock);
                                 await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw-single':"1"})
                             } else if (blockIdo_rigin.startsWith('application/siyuan-file')) {
                                 aproblock = blockId;
@@ -627,7 +676,7 @@ export class TldrawManager {
                             } else if (blockIdo_rigin.startsWith('application/doc-outline-block')) {
                                 aproblock = blockId;
                                 console.debug("拖拽的是文档大纲块");
-                                const link = buildTldrawLink(this.id, aproblock, this.title);
+                                const link = buildTldrawLink(this.id, aproblock);
                                 await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw':"1"})
                             } else if(blockIdo_rigin.startsWith('application/child-doc')) {
                                 aproblock = blockId;
@@ -635,7 +684,7 @@ export class TldrawManager {
                                 await api.prependBlock("markdown", `((${blockId} '${docname}'))`, this.id)
                             } else {
                                 aproblock = idid as string;
-                                const link = buildTldrawLink(this.id, aproblock, this.title);
+                                const link = buildTldrawLink(this.id, aproblock);
                                 await api.insertBlock("markdown", `###### ${timestamp}
 {: id="${idid}" custom-st-tldraw="1" custom-tldraw-link="${link}"}`, blockId)
                             }
@@ -716,10 +765,17 @@ export class TldrawManager {
                             if (shape.type === 'card') {
                                 await this.handleCardShapeDeletion(editor, shape as ICardShape);
                             } else if (shape.type === 'single-block') {
-                                await this.handleSingleBlockDeletion(editor, shape as ICardShape);
+                                await this.handleSingleBlockDeletion(editor, shape as ISingleBlockShape);
                             } else {
                                 // Ignore other shape types
                                 return;
+                            }
+                        });
+
+                        // 每次新建的 slide/frame/branch 形状默认在最底层
+                        editor.sideEffects.registerAfterCreateHandler('shape', (shape) => {
+                            if (shape.type === 'slide' || shape.type === 'frame' || shape.type === 'branch') {
+                                editor.sendToBack([shape.id]);
                             }
                         });
 
@@ -749,18 +805,43 @@ export class TldrawManager {
         // 为识别消息源，生成一个唯一的会话ID
         const sessionId = Date.now().toString() + Math.random().toString(36).slice(2);
 
+        // 性能优化：使用节流减少广播频率
+        let broadcastPending = false;
+        let broadcastTimer: ReturnType<typeof setTimeout> | null = null;
+        let pendingChanges: any = null;
+
+        const flushBroadcast = () => {
+            if (broadcastTimer) {
+                clearTimeout(broadcastTimer);
+                broadcastTimer = null;
+            }
+            if (pendingChanges) {
+                broadcastChannel.postMessage({
+                    changes: pendingChanges,
+                    timestamp: Date.now(),
+                    source: sessionId
+                });
+                pendingChanges = null;
+                broadcastPending = false;
+            }
+        };
+
         // 监听本地变更并广播
         this._realtimeUnsub = this.store.listen(
             (update) => {
                 // 如果当前正在应用远程更改，不广播以避免循环
                 if (this.applyingRemoteChanges) return;
 
-                // 通过广播频道发送更改
-                broadcastChannel.postMessage({
-                    changes: update,
-                    timestamp: Date.now(),
-                    source: sessionId // 使用会话ID标识消息来源
-                });
+                // 性能优化：合并快速连续的操作
+                if (!broadcastPending) {
+                    broadcastPending = true;
+                    pendingChanges = update;
+                    // 16ms后发送，合并同一帧内的多次操作
+                    broadcastTimer = setTimeout(flushBroadcast, 16);
+                } else {
+                    // 合并更新：保留最新的changes
+                    pendingChanges = update;
+                }
             },
             { scope: 'document', source: 'user' } // 只监听用户操作引起的文档变更
         );
@@ -942,10 +1023,11 @@ export class TldrawManager {
         container.addEventListener('wheel', handleWheel, { passive: true });
         
         // 使用 store 监听器来检测形状变化（拖动、调整大小等）
+        // 性能优化：增加节流间隔，减少CPU占用
         const unsubscribe = editor.store.listen(
             throttle(() => {
                 checkInteractionState();
-            }, 50),
+            }, 100), // 从50ms增加到100ms，减少CPU占用
             { source: 'user', scope: 'document' }
         );
         
@@ -974,37 +1056,50 @@ export class TldrawManager {
         if (!this.store) return;
 
         // 使用节流函数确保不会过于频繁地保存
+        // 性能优化：使用更激进的节流策略，避免频繁保存
         const throttledSave = throttle(() => {
-            this.saveData();
-        }, 3000); // 3秒节流
+            this.triggerSave();
+        }, 2000); // 2秒节流，减少等待时间
 
-        // 监听存储变化
-        this._autosaveUnsub = this.store.listen(throttledSave);
+        // 监听存储变化，只监听用户操作
+        this._autosaveUnsub = this.store.listen(throttledSave, {
+            scope: 'document',
+            source: 'user' // 只监听用户操作，减少不必要的保存
+        });
     }
 
     private applyThemeToEditor() {
         if (!this.editor) return;
-        const isDark = isDarkTheme();
         try {
-            this.editor.user.updateUserPreferences({ colorScheme: isDark ? 'dark' : 'light' });
+            syncTldrawThemeFromSiyuan(this.editor);
         } catch (err) {
-            console.warn('更新 tldraw 主题偏好失败', err);
+            console.warn('同步思源主题到 tldraw 失败', err);
         }
     }
 
     private setupThemeObserver() {
         if (this.themeObserver) return;
-        const target = document.documentElement;
-        if (!target) return;
+        const root = document.documentElement;
+        if (!root) return;
+
+        const scheduleThemeSync = () => {
+            if (this.themeSyncFrame !== null) return;
+
+            this.themeSyncFrame = requestAnimationFrame(() => {
+                this.themeSyncFrame = null;
+                if (!this._destroyed) this.applyThemeToEditor();
+            });
+        };
+
         this.themeObserver = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                if (mutation.type === 'attributes' && mutation.attributeName === 'data-theme-mode') {
-                    this.applyThemeToEditor();
-                    break;
-                }
+            if (mutations.some((mutation) => mutation.attributeName === 'data-theme-mode')) {
+                scheduleThemeSync();
             }
         });
-        this.themeObserver.observe(target, { attributes: true, attributeFilter: ['data-theme-mode'] });
+        this.themeObserver.observe(root, {
+            attributes: true,
+            attributeFilter: ['data-theme-mode'],
+        });
     }
 
     /**
@@ -1215,6 +1310,7 @@ export class TldrawManager {
     public async destroy(options?: { skipSave?: boolean; reason?: string }) {
         if (this._destroyed || this._destroying) return;
         this._destroying = true;
+        this.clearAgentActivityIndicator();
 
         // 销毁前保存当前状态（数据文件已被删除时必须跳过，否则会被重新写回）
         if (!options?.skipSave) {
@@ -1237,6 +1333,15 @@ export class TldrawManager {
         }
 
         // 取消订阅 store listeners / 广播频道
+        try {
+            if (this._focusTrackingCleanup) {
+                this._focusTrackingCleanup();
+                this._focusTrackingCleanup = null;
+            }
+        } catch (err) {
+            console.warn('cleanup agent focus tracking failed', err);
+        }
+
         try {
             if (this._autosaveUnsub) {
                 this._autosaveUnsub();
@@ -1310,6 +1415,10 @@ export class TldrawManager {
             this.themeObserver.disconnect();
             this.themeObserver = null;
         }
+        if (this.themeSyncFrame !== null) {
+            cancelAnimationFrame(this.themeSyncFrame);
+            this.themeSyncFrame = null;
+        }
 
         // 销毁React根节点
         if (this.root) {
@@ -1363,9 +1472,232 @@ export class TldrawManager {
         return cardShape?.id || null;
     }
 
-    /**
-     * Helper: find the number of remaining shapes referencing a blockId for specified types
-     */
+    public beginAgentActivity(): () => void {
+        if (this._destroyed || this._destroying) return () => {};
+
+        const minVisibleMs = 900;
+        let ended = false;
+        this._agentActivityDepth += 1;
+        this._agentActivityStartedAt = Date.now();
+
+        if (this._agentActivityClearTimer) {
+            clearTimeout(this._agentActivityClearTimer);
+            this._agentActivityClearTimer = null;
+        }
+        this.setAgentActivityVisible(true);
+
+        return () => {
+            if (ended) return;
+            ended = true;
+            this._agentActivityDepth = Math.max(0, this._agentActivityDepth - 1);
+            if (this._agentActivityDepth > 0) return;
+
+            const elapsed = Date.now() - this._agentActivityStartedAt;
+            const delay = Math.max(0, minVisibleMs - elapsed);
+            this._agentActivityClearTimer = setTimeout(() => {
+                this._agentActivityClearTimer = null;
+                if (this._agentActivityDepth === 0) {
+                    this.setAgentActivityVisible(false);
+                }
+            }, delay);
+        };
+    }
+
+    private setAgentActivityVisible(visible: boolean) {
+        const element = this.container.querySelector('.tldraw__editor') as HTMLElement | null;
+        this.container.classList.toggle('st-tldraw-agent-active', visible);
+        this.container.toggleAttribute('data-st-agent-active', visible);
+        if (element) {
+            element.classList.toggle('st-tldraw-agent-active', visible);
+            element.toggleAttribute('data-st-agent-active', visible);
+        }
+    }
+
+    private clearAgentActivityIndicator() {
+        if (this._agentActivityClearTimer) {
+            clearTimeout(this._agentActivityClearTimer);
+            this._agentActivityClearTimer = null;
+        }
+        this._agentActivityDepth = 0;
+        this.setAgentActivityVisible(false);
+    }
+
+    private getAgentRuntime(): agentOps.AgentManagerRuntime {
+        return {
+            id: this.id,
+            title: this.title,
+            editor: this.editor ?? null,
+            store: this.store,
+            saveData: () => this.saveData(),
+            triggerSave: () => this.triggerSave(),
+            findShapeByBlockId: (blockId) => this.findShapeByBlockId(blockId),
+        };
+    }
+
+    private setupAgentFocusTracking(editor: Editor) {
+        try {
+            if (this._focusTrackingCleanup) {
+                this._focusTrackingCleanup();
+                this._focusTrackingCleanup = null;
+            }
+
+            const container = editor.getContainer();
+            const markFocused = () => markFocusedInstance(this.id);
+            const events: Array<keyof HTMLElementEventMap> = [
+                'pointerdown',
+                'mousedown',
+                'focusin',
+                'keydown',
+                'wheel',
+                'touchstart',
+            ];
+
+            markFocused();
+            events.forEach((eventName) => container.addEventListener(eventName, markFocused, true));
+            this._focusTrackingCleanup = () => {
+                events.forEach((eventName) => container.removeEventListener(eventName, markFocused, true));
+            };
+        } catch (error) {
+            console.warn('setup agent focus tracking failed', error);
+        }
+    }
+
+    public getAgentSummary(options?: { includeShapeSamples?: boolean; sampleLimit?: number }) {
+        return agentOps.getAgentSummary(this.getAgentRuntime(), options);
+    }
+
+    public getAgentVisualContext(options?: AgentVisualContextOptions) {
+        return agentOps.getAgentVisualContext(this.getAgentRuntime(), options);
+    }
+
+    public async createAgentShape(options: AgentCreateShapeArgs) {
+        return agentOps.createAgentShape(this.getAgentRuntime(), options);
+    }
+
+    public async insertDocOutlineMindmapForAgent(options: AgentDocOutlineBoardOptions) {
+        return agentOps.insertDocOutlineMindmap(this.getAgentRuntime(), options);
+    }
+
+    public selectAgentShape(shapeId: string, zoom = true) {
+        return agentOps.selectAgentShape(this.getAgentRuntime(), shapeId, zoom);
+    }
+
+    public navigateAgentToBlock(options: { blockId: string; shapeId?: string; zoom?: boolean }) {
+        return agentOps.navigateAgentToBlock(this.getAgentRuntime(), options);
+    }
+
+    public zoomAgentToShapes(options: { shapeIds: string[] }) {
+        return agentOps.zoomAgentToShapes(this.getAgentRuntime(), options);
+    }
+
+    public async saveAgentWhiteboard() {
+        return agentOps.saveAgentWhiteboard(this.getAgentRuntime());
+    }
+
+    public async applyAgentPlan(options: AgentPlanApplyOptions) {
+        return agentOps.applyAgentPlan(this.getAgentRuntime(), options);
+    }
+
+    public async editAgentBoard(options: AgentBoardEditRequest) {
+        return agentOps.editAgentBoard(this.getAgentRuntime(), options);
+    }
+
+    public async runAgentShapeCommand(options: AgentShapeCommandRequest) {
+        return agentOps.runAgentShapeCommand(this.getAgentRuntime(), options);
+    }
+
+    public updateAgentShape(options: { shapeId: string; x?: number; y?: number; w?: number; h?: number; color?: string; isCollapsed?: boolean; select?: boolean; zoom?: boolean; resultMode?: AgentResultMode }) {
+        return agentOps.updateAgentShape(this.getAgentRuntime(), options);
+    }
+
+    public getAgentShapeDetails(options: { shapeIds?: string[]; type?: string; limit?: number; includeBindings?: boolean; includeLinkedBlockContent?: boolean }) {
+        return agentOps.getAgentShapeDetails(this.getAgentRuntime(), options);
+    }
+
+    public createAgentBasicShape(options: AgentBasicShapeCreateArgs) {
+        return agentOps.createAgentBasicShape(this.getAgentRuntime(), options);
+    }
+
+    public async createAgentConnector(options: AgentConnectorCreateArgs) {
+        return agentOps.createAgentConnector(this.getAgentRuntime(), options);
+    }
+
+    public updateAgentShapesBatch(options: { patches: AgentShapeUpdatePatch[]; select?: boolean; zoom?: boolean; resultMode?: AgentResultMode }) {
+        return agentOps.updateAgentShapesBatch(this.getAgentRuntime(), options);
+    }
+
+    public async deleteAgentShapes(options: { shapeIds: string[]; confirm?: boolean; allowLinkedBlockShapes?: boolean; confirmLinkedBlockShapes?: boolean; resultMode?: AgentResultMode }) {
+        return agentOps.deleteAgentShapes(this.getAgentRuntime(), options);
+    }
+
+    public convertAgentConnectors(options: { shapeIds: string[]; to: 'arrow' | 'bezier-connector' }) {
+        return agentOps.convertAgentConnectors(this.getAgentRuntime(), options);
+    }
+
+    public getAgentBoardSnapshotSummary() {
+        return agentOps.getAgentBoardSnapshotSummary(this.getAgentRuntime());
+    }
+
+    public async backupAgentWhiteboard(options: { reason?: string } = {}) {
+        return agentOps.backupAgentWhiteboard(this.getAgentRuntime(), options);
+    }
+
+    public async importAgentMermaid(options: { mermaidText: string; select?: boolean; zoom?: boolean; save?: boolean }) {
+        if (!this.editor) {
+            throw new Error('Tldraw editor is not initialized');
+        }
+
+        const beforeIds = new Set(this.editor.getCurrentPageShapes().map((shape) => String(shape.id)));
+        await importMermaidDiagram(this.editor, options.mermaidText);
+        const createdShapeIds = this.editor
+            .getCurrentPageShapes()
+            .map((shape) => String(shape.id))
+            .filter((id) => !beforeIds.has(id));
+
+        if (options.select !== false && createdShapeIds.length) {
+            this.editor.setSelectedShapes(createdShapeIds as TLShapeId[]);
+        }
+        if (options.zoom !== false && createdShapeIds.length) {
+            focusAgentShapesById(this.editor, createdShapeIds, { force: true });
+        }
+        if (options.save === true) {
+            await this.saveData();
+        } else {
+            this.triggerSave();
+        }
+
+        return {
+            ok: true,
+            whiteboardId: this.id,
+            createdShapeIds,
+            createdShapeCount: createdShapeIds.length,
+            selected: options.select !== false,
+            zoomed: options.zoom !== false,
+            saved: options.save === true,
+        };
+    }
+
+    public duplicateAgentShapes(options: { shapeIds: string[]; offsetX?: number; offsetY?: number; select?: boolean; zoom?: boolean; resultMode?: AgentResultMode }) {
+        return agentOps.duplicateAgentShapes(this.getAgentRuntime(), options);
+    }
+
+    public arrangeAgentShapes(options: { shapeIds: string[]; operation: AgentArrangeOperation; resultMode?: AgentResultMode }) {
+        return agentOps.arrangeAgentShapes(this.getAgentRuntime(), options);
+    }
+
+    public alignAgentShapes(options: { shapeIds: string[]; operation: AgentAlignOperation; resultMode?: AgentResultMode }) {
+        return agentOps.alignAgentShapes(this.getAgentRuntime(), options);
+    }
+
+    public groupAgentShapes(options: { shapeIds: string[]; ungroup?: boolean; select?: boolean; resultMode?: AgentResultMode }) {
+        return agentOps.groupAgentShapes(this.getAgentRuntime(), options);
+    }
+
+    public lockAgentShapes(options: { shapeIds: string[]; locked: boolean; resultMode?: AgentResultMode }) {
+        return agentOps.lockAgentShapes(this.getAgentRuntime(), options);
+    }
+
+
     private countRemainingShapesReferencingBlock(editor: Editor, blockId: string, types: string[]): number {
         const allShapes = editor.store.query.records('shape').get();
         return allShapes.filter(s => types.includes(s.type) && (s as ICardShape).props?.blockId === blockId).length;
@@ -1407,7 +1739,7 @@ export class TldrawManager {
      * 当 single-block 类型形状被删除后，调用该函数处理块的清理逻辑。
      * 扩展点：在这里添加任何 single-block 特有的自定义逻辑（例如不同的属性或行为）。
      */
-    private async handleSingleBlockDeletion(editor: Editor, shape: ICardShape) {
+    private async handleSingleBlockDeletion(editor: Editor, shape: ISingleBlockShape) {
         try {
             const blockId = shape.props?.blockId;
             if (!blockId) return;
@@ -1589,12 +1921,6 @@ export class TldrawManager {
 
 }
 
-function isDarkTheme(): boolean {
-    // 思源笔记暗色主题通常通过 data-theme 属性判断
-    // console.debug("判断思源主题", document.documentElement.getAttribute('data-theme-mode'));
-    return document.documentElement.getAttribute('data-theme-mode') === 'dark';
-}
-
 //暴露给全局
 // const waytotldraw = {
 //     TldrawManager
@@ -1605,4 +1931,3 @@ function isDarkTheme(): boolean {
 //     }
 // }
 // window.tldraw=waytotldraw;
-

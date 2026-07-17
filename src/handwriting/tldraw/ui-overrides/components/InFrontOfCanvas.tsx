@@ -8,6 +8,7 @@ import { showMessage, openTab } from 'siyuan'
 import { ShapeLibraryPanel } from '../../shapelibrary/ShapeLibraryPanel'
 import { DocOutlinePanel } from '../../doc-outline/DocOutlinePanel'
 import { ChildDocsPanel } from '../../doc-outline/ChildDocsPanel'
+import { SearchPanel } from '../../search/SearchPanel'
 import {
     useShapeLibraryOpen,
     toggleShapeLibrary,
@@ -16,18 +17,31 @@ import {
     setDocOutlineDocId,
     useChildDocsOpen,
     toggleChildDocs,
+    useSearchPanelOpen,
+    toggleSearchPanel,
 } from '../panel-state'
 import { CardLikeShape, isCardLikeShape, isOverlayShape } from '../types'
 import type { ICardShape } from '../../CardShape/card-shape-types'
 import type { IJsShape } from '../../JsShape/js-shape-types'
 import { armAddConnectedSingleBlock, isArmed as isAddPending } from '../../utils/pendingConnectedSingleBlock'
 import { SlideFocusOverlay } from '../../SlideShape/SlideFocusOverlay'
+import { MermaidPasteHandler } from '../../mermaid/MermaidPasteHandler'
+import { buildCardCollapseUpdate } from '../../CardShape/card-collapse'
+import {
+    createCenterBranchForShape,
+    createCenterBranchForCard,
+    deleteEmptyCenterBranchForShape,
+    getEmptyCenterBranchForShape,
+} from '../../CardShape/create-card-center-branch'
+import { createSingleBlockForBranch, getBranchRootParent } from '../../BranchShape'
+import type { ISingleBlockShape } from '../../SingleBlockShape/single-block-shape-types'
 
 export const InFrontOfCanvas: React.FC = () => {
     const editor = useEditor()
     const isLibraryOpen = useShapeLibraryOpen()
     const isDocOutlineOpen = useDocOutlineOpen()
     const isChildDocsOpen = useChildDocsOpen()
+    const isSearchOpen = useSearchPanelOpen()
 
     // 获取白板绑定的文档ID
     const container = editor.getContainer()
@@ -73,11 +87,48 @@ export const InFrontOfCanvas: React.FC = () => {
 
     const selectedShape = selectionInfo ? editor.getShape(selectionInfo.id) : null
     const isValidSelection = selectedShape && isOverlayShape(selectedShape)
+    const selectedMainCard =
+        selectedShape &&
+        selectedShape.type === 'card' &&
+        Boolean((selectedShape as ICardShape).props?.isMain) &&
+        Boolean((selectedShape as ICardShape).props?.blockId)
+            ? (selectedShape as ICardShape)
+            : null
 
     const isSingleBlockSelection = isValidSelection && selectedShape.type === 'single-block'
     const isCardOrBlock = isValidSelection && isCardLikeShape(selectedShape)
+    const isCollapsedCard =
+        isValidSelection &&
+        selectedShape.type === 'card' &&
+        Boolean((selectedShape as ICardShape).props?.isCollapsed)
+    const isBranchSelection = isValidSelection && selectedShape.type === 'branch'
     const isJsShapeSelection = isValidSelection && selectedShape.type === 'js-shape'
     const selectedJsShape = isJsShapeSelection ? (selectedShape as IJsShape) : null
+    const selectedCardShapes = useValue(
+        'selected card shapes',
+        () => editor.getSelectedShapes().filter((shape): shape is ICardShape => shape.type === 'card'),
+        [editor]
+    )
+    const rootParentBranch = useValue(
+        'selected root parent branch',
+        () => (isCardOrBlock && selectedShape ? getBranchRootParent(editor, selectedShape.id) : null),
+        [editor, selectedShape?.id, isCardOrBlock]
+    )
+    const emptyCenterBranch = useValue(
+        'selected empty center branch',
+        () => {
+            if (!selectionInfo) return null
+            const shape = editor.getShape(selectionInfo.id)
+            return shape && (shape.type === 'card' || shape.type === 'single-block')
+                ? getEmptyCenterBranchForShape(editor, shape as ICardShape | ISingleBlockShape)
+                : null
+        },
+        [editor, selectionInfo?.id]
+    )
+    const canCreateCenterBranch =
+        isValidSelection &&
+        (selectedShape.type === 'card' || selectedShape.type === 'single-block') &&
+        !rootParentBranch
 
     // 手形工具点击跳转功能
     const pointerDownPoint = React.useRef<{ x: number; y: number } | null>(null)
@@ -208,21 +259,27 @@ export const InFrontOfCanvas: React.FC = () => {
     }
 
     const Icons = {
-        Edit: () => <TldrawUiIcon icon="tool-pencil" small />,
-        Refresh: () => <TldrawUiIcon icon="arrow-cycle" small />,
-        ChevronRight: () => <TldrawUiIcon icon="chevron-right" small />,
-        ChevronDown: () => <TldrawUiIcon icon="chevron-down" small />,
-        FontIncrease: () => <TldrawUiIcon icon="plus" small />,
-        FontDecrease: () => <TldrawUiIcon icon="minus" small />,
-        Plus: () => <TldrawUiIcon icon="tool-text" small />,
-        Link: () => <TldrawUiIcon icon="external-link" small />,
-        Code: () => <TldrawUiIcon icon="code" small />,
-        Zap: () => <TldrawUiIcon icon="arrow-cycle" small />,
-        MousePointer: () => <TldrawUiIcon icon="tool-hand" small />,
+        Edit: () => <TldrawUiIcon label="" icon="tool-pencil" small />,
+        Refresh: () => <TldrawUiIcon label="" icon="arrow-cycle" small />,
+        ChevronRight: () => <TldrawUiIcon label="" icon="chevron-right" small />,
+        ChevronDown: () => <TldrawUiIcon label="" icon="chevron-down" small />,
+        FontIncrease: () => <TldrawUiIcon label="" icon="plus" small />,
+        FontDecrease: () => <TldrawUiIcon label="" icon="minus" small />,
+        Plus: () => <TldrawUiIcon label="" icon="tool-text" small />,
+        Link: () => <TldrawUiIcon label="" icon="external-link" small />,
+        Code: () => <TldrawUiIcon label="" icon="code" small />,
+        Zap: () => <TldrawUiIcon label="" icon="arrow-cycle" small />,
+        MousePointer: () => <TldrawUiIcon label="" icon="tool-hand" small />,
+        SelectBranch: () => <TldrawUiIcon label="" icon="tool-pointer" small />,
+        CenterBranch: () => <TldrawUiIcon label="" icon="branch" />,
+        DetachCenterBranch: () => <TldrawUiIcon label="" icon="branch-detach" />,
+        BranchAddLeft: () => <TldrawUiIcon label="" icon="branch-add-left" />,
+        BranchAddRight: () => <TldrawUiIcon label="" icon="branch-add-right" />,
     }
 
     return (
         <>
+            <MermaidPasteHandler />
             <SlideFocusOverlay />
 
             {/* 素材库面板 */}
@@ -236,6 +293,7 @@ export const InFrontOfCanvas: React.FC = () => {
                 isOpen={isDocOutlineOpen}
                 onClose={() => toggleDocOutline()}
                 docId={boundDocId || null}
+                selectedMainCard={selectedMainCard}
             />
 
             {/* 子文档面板 */}
@@ -243,6 +301,13 @@ export const InFrontOfCanvas: React.FC = () => {
                 isOpen={isChildDocsOpen}
                 onClose={() => toggleChildDocs()}
                 docId={boundDocId || null}
+                selectedMainCard={selectedMainCard}
+            />
+
+            {/* 搜索面板 */}
+            <SearchPanel
+                isOpen={isSearchOpen}
+                onClose={() => toggleSearchPanel()}
             />
 
             {/* 选中元素的操作按钮 */}
@@ -265,8 +330,112 @@ export const InFrontOfCanvas: React.FC = () => {
                         alignItems: 'center'
                     }}
                 >
+                    {isBranchSelection && (
+                        <>
+                            <HoverButton
+                                style={buttonStyle}
+                                onClick={() => {
+                                    const newShapeId = createSingleBlockForBranch(editor, selectionInfo.id, 'left')
+                                    if (!newShapeId) {
+                                        showMessage('左侧添加单块失败', 3000, 'error')
+                                    }
+                                }}
+                                title="左侧添加单块"
+                            >
+                                <Icons.BranchAddLeft />
+                            </HoverButton>
+                            <HoverButton
+                                style={buttonStyle}
+                                onClick={() => {
+                                    const newShapeId = createSingleBlockForBranch(editor, selectionInfo.id, 'right')
+                                    if (!newShapeId) {
+                                        showMessage('右侧添加单块失败', 3000, 'error')
+                                    }
+                                }}
+                                title="右侧添加单块"
+                            >
+                                <Icons.BranchAddRight />
+                            </HoverButton>
+                        </>
+                    )}
                     {isCardOrBlock && (
                         <>
+                            {canCreateCenterBranch && (
+                                <HoverButton
+                                    style={buttonStyle}
+                                    onClick={() => {
+                                        const shape = editor.getShape(selectionInfo.id)
+                                        if (!shape || (shape.type !== 'card' && shape.type !== 'single-block')) return
+
+                                        const newBranchId =
+                                            shape.type === 'card'
+                                                ? createCenterBranchForCard(editor, shape as ICardShape)
+                                                : createCenterBranchForShape(editor, shape as ISingleBlockShape)
+                                        if (!newBranchId) {
+                                            showMessage('创建中心 Branch 失败', 3000, 'error')
+                                        }
+                                    }}
+                                    title="添加 Branch 并中心吸附"
+                                >
+                                    <Icons.CenterBranch />
+                                </HoverButton>
+                            )}
+                            {emptyCenterBranch && (
+                                <HoverButton
+                                    style={buttonStyle}
+                                    onClick={() => {
+                                        const shape = editor.getShape(selectionInfo.id)
+                                        if (!shape || (shape.type !== 'card' && shape.type !== 'single-block')) return
+
+                                        const removedBranchId = deleteEmptyCenterBranchForShape(editor, shape as ICardShape | ISingleBlockShape)
+                                        if (!removedBranchId) {
+                                            showMessage('取消中心吸附失败：Branch 已吸附其他组件', 3000, 'error')
+                                        }
+                                    }}
+                                    title="取消中心吸附并删除空 Branch"
+                                >
+                                    <Icons.DetachCenterBranch />
+                                </HoverButton>
+                            )}
+                            {rootParentBranch && (
+                                <>
+                                    <HoverButton
+                                        style={buttonStyle}
+                                        onClick={() => {
+                                            const newShapeId = createSingleBlockForBranch(editor, rootParentBranch.id, 'left')
+                                            if (!newShapeId) {
+                                                showMessage('宸︿晶娣诲姞鍗曞潡澶辫触', 3000, 'error')
+                                            }
+                                        }}
+                                        title="宸︿晶娣诲姞鍗曞潡"
+                                    >
+                                        <Icons.BranchAddLeft />
+                                    </HoverButton>
+                                    <HoverButton
+                                        style={buttonStyle}
+                                        onClick={() => {
+                                            const newShapeId = createSingleBlockForBranch(editor, rootParentBranch.id, 'right')
+                                            if (!newShapeId) {
+                                                showMessage('鍙充晶娣诲姞鍗曞潡澶辫触', 3000, 'error')
+                                            }
+                                        }}
+                                        title="鍙充晶娣诲姞鍗曞潡"
+                                    >
+                                        <Icons.BranchAddRight />
+                                    </HoverButton>
+                                </>
+                            )}
+                            {rootParentBranch && (
+                                <HoverButton
+                                    style={buttonStyle}
+                                    onClick={() => {
+                                        editor.select(rootParentBranch.id)
+                                    }}
+                                    title="选中中心所属 Branch"
+                                >
+                                    <Icons.SelectBranch />
+                                </HoverButton>
+                            )}
                             <HoverButton
                                 style={buttonStyle}
                                 onClick={() => {
@@ -303,29 +472,13 @@ export const InFrontOfCanvas: React.FC = () => {
                                     display: selectedShape.type === 'card' ? undefined : 'none',
                                 }}
                                 onClick={() => {
-                                    const shape = editor.getShape(selectionInfo.id)
-                                    if (!shape || shape.type !== 'card') return
-
-                                    const card = shape as ICardShape
-                                    const collapsed = !!card.props?.isCollapsed
-                                    const nextCollapsed = !collapsed
-                                    const collapsedHeight = Math.max((card.props.fontSize || 16) * 6, card.props.isMain ? 260 : 180)
-                                    const nextProps = {
-                                        ...card.props,
-                                        isCollapsed: nextCollapsed,
-                                    } as ICardShape['props']
-
-                                    if (nextCollapsed) {
-                                        nextProps.preCollapseHeight = card.props.h
-                                        nextProps.h = collapsedHeight
-                                    } else if (card.props.preCollapseHeight && card.props.preCollapseHeight > 0) {
-                                        nextProps.h = card.props.preCollapseHeight
-                                    }
-
-                                    editor.updateShape({
-                                        id: card.id,
-                                        type: 'card',
-                                        props: nextProps,
+                                    if (!selectedCardShapes.length) return
+                                    const allCollapsed = selectedCardShapes.every((shape) => !!shape.props.isCollapsed)
+                                    const nextCollapsed = !allCollapsed
+                                    editor.run(() => {
+                                        editor.updateShapes(
+                                            selectedCardShapes.map((shape) => buildCardCollapseUpdate(shape, nextCollapsed))
+                                        )
                                     })
                                 }}
                                 title={
@@ -337,7 +490,10 @@ export const InFrontOfCanvas: React.FC = () => {
                                 {((editor.getShape(selectionInfo.id) as ICardShape | undefined)?.props?.isCollapsed) ? <Icons.ChevronRight /> : <Icons.ChevronDown />}
                             </HoverButton>
                             <HoverButton
-                                style={buttonStyle}
+                                style={{
+                                    ...buttonStyle,
+                                    display: isCollapsedCard ? 'none' : undefined,
+                                }}
                                 onClick={() => {
                                     const shape = editor.getShape(selectionInfo.id)
                                     if (!isCardLikeShape(shape)) return
@@ -358,7 +514,10 @@ export const InFrontOfCanvas: React.FC = () => {
                                 <Icons.FontIncrease />
                             </HoverButton>
                             <HoverButton
-                                style={buttonStyle}
+                                style={{
+                                    ...buttonStyle,
+                                    display: isCollapsedCard ? 'none' : undefined,
+                                }}
                                 onClick={() => {
                                     const shape = editor.getShape(selectionInfo.id)
                                     if (!isCardLikeShape(shape)) return

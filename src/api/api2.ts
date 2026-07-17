@@ -1,4 +1,5 @@
 import { showMessage } from "siyuan";
+import { getWpsAcceptLanguages, getWpsBrowserEnvScript, getWpsPartition, getWpsWebPreferences, getWpsWebviewUserAgent } from "@/wps/webview_env";
 
 let resizeObserver: ResizeObserver | null = null;
 let resizeTimeout: number = 0;
@@ -131,6 +132,13 @@ interface WebviewExtraOptions {
     onRoamingIntercept?: (data: { kind: string; url: string; body: string }) => void; // 监听 /api/v3/roaming 拦截数据回调
     roamingTransportMode?: 'console' | 'poll'; // webview 与宿主数据传输模式，默认 console
     initRun?: () => void;                 // 初始化运行函数
+    emulateBrowserEnv?: boolean;          // 尽量模拟真实桌面浏览器环境（默认 true）
+    partition?: string;                   // webview partition（默认 persist:st-wps）
+    acceptLanguages?: string;             // 语言偏好，默认 zh-CN,zh,en-US,en
+    webPreferences?: string;              // 覆盖 webpreferences
+    enableSleep?: boolean;                // 是否启用空闲休眠（默认 false）
+    sleepMinutes?: number;                // 空闲休眠阈值（分钟，默认 10）
+    sleepBlankUrl?: string;               // 休眠时加载的空白页（默认 about:blank）
 }
 interface WebviewButtonConfig {
     id?: string;                           // 按钮 id，不含容器前缀；最终实际 id = `${containerClass}-btn-${id}`
@@ -177,9 +185,20 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
         buttons,
         onRoamingIntercept,
         roamingTransportMode = 'console',
+        emulateBrowserEnv = true,
+        partition = 'persist:st-wps',
+        acceptLanguages = 'zh-CN,zh,en-US,en',
+        webPreferences,
+        enableSleep = false,
+        sleepMinutes = 10,
+        sleepBlankUrl = 'about:blank',
     } = options as IframeDockOptions & WebviewExtraOptions;
 
-    const mobileUA = userAgent || "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15A372 Safari/604.1";
+    const desktopUA = getWpsWebviewUserAgent(userAgent);
+    const defaultWebPreferences = getWpsWebPreferences(emulateBrowserEnv);
+    const finalWebPreferences = webPreferences || defaultWebPreferences;
+    const finalPartition = getWpsPartition(partition);
+    const finalAcceptLanguages = getWpsAcceptLanguages(acceptLanguages);
 
     const finalButtonText = {
         copy: buttonTexts.copy ?? "复制",
@@ -187,7 +206,13 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
         dev: buttonTexts.dev ?? "调试",
     };
 
+    const escapeHtmlAttr = (s: string) => String(s || '').replace(/&/g, '&amp;').replace(/\"/g, '&quot;');
+
     const createWebviewHTML = (containerClass: string, url: string, style: string, zoom: number) => {
+        const uaAttr = escapeHtmlAttr(desktopUA);
+        const partitionAttr = escapeHtmlAttr(finalPartition);
+        const langAttr = escapeHtmlAttr(finalAcceptLanguages);
+        const webprefsAttr = escapeHtmlAttr(finalWebPreferences);
         if (!enableButtons) {
             return `
             <div id="${containerClass}" class="${containerClass}" style="position: relative; height: 100%; width: 100%; overflow: hidden;">
@@ -195,8 +220,11 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                     src="${url}" 
                     style="${style}; zoom: ${zoom}; position: absolute; inset: 0; width: 100%; height: 100%;"
                     allowpopups
-                    webpreferences="contextIsolation, nativeWindowOpen, javascript=yes"
-                    useragent="${mobileUA}"
+                    partition="${partitionAttr}"
+                    httpreferrer="https://www.kdocs.cn/"
+                    webpreferences="${webprefsAttr}"
+                    useragent="${uaAttr}"
+                    acceptlanguages="${langAttr}"
                 ></webview>
             </div>`;
         }
@@ -227,8 +255,11 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                 src="${url}" 
                 style="${style}; zoom: ${zoom}; position: absolute; inset: 0; width: 100%; height: 100%;"
                 allowpopups
-                webpreferences="contextIsolation, nativeWindowOpen, javascript=yes"
-                useragent="${mobileUA}"
+                partition="${partitionAttr}"
+                httpreferrer="https://www.kdocs.cn/"
+                webpreferences="${webprefsAttr}"
+                useragent="${uaAttr}"
+                acceptlanguages="${langAttr}"
             ></webview>
             <div id="${containerClass}-btns" style="
                 position: absolute; top: 8px; left: 50%; transform: translateX(-50%) translateY(-8px); z-index: 9999; display: flex; gap: 8px; align-items: center; opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease;">
@@ -250,7 +281,94 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                 try { (rootEl as any).__btnCleanup(); } catch (e) { /* ignore */ }
                 try { delete (rootEl as any).__btnCleanup; } catch (e) { /* ignore */ }
             }
+            // sleep 清理
+            if ((rootEl as any).__sleepCleanup) {
+                try { (rootEl as any).__sleepCleanup(); } catch (e) { /* ignore */ }
+                try { delete (rootEl as any).__sleepCleanup; } catch (e) { /* ignore */ }
+            }
         } catch (e) { /* ignore */ }
+    };
+
+    const bindSleepLifecycle = (rootEl: HTMLElement | null, originalUrl: string) => {
+        if (!enableSleep || !rootEl) return;
+        const webviewEl = rootEl.querySelector('webview') as any | null;
+        if (!webviewEl) return;
+
+        const sleepMs = Math.max(1, sleepMinutes) * 60 * 1000;
+        let lastActive = Date.now();
+        let timer: number | null = null;
+        let sleeping = false;
+        let lastUrl = originalUrl;
+
+        const markActive = () => {
+            lastActive = Date.now();
+            if (sleeping) {
+                wake();
+            }
+        };
+
+        const getCurrentUrl = () => {
+            try {
+                if (typeof webviewEl.getURL === 'function') {
+                    return webviewEl.getURL() || '';
+                }
+                return webviewEl.getAttribute?.('src') || webviewEl.src || '';
+            } catch {
+                return '';
+            }
+        };
+
+        const sleep = () => {
+            if (sleeping) return;
+            try {
+                const current = getCurrentUrl();
+                if (current && current !== sleepBlankUrl) lastUrl = current;
+                webviewEl.setAttribute?.('src', sleepBlankUrl);
+                sleeping = true;
+            } catch (e) {
+                console.warn('webview sleep failed', e);
+            }
+        };
+
+        const wake = () => {
+            if (!sleeping) return;
+            try {
+                webviewEl.setAttribute?.('src', lastUrl || originalUrl);
+                sleeping = false;
+            } catch (e) {
+                console.warn('webview wake failed', e);
+            }
+        };
+
+        const activityEvents: Array<keyof HTMLElementEventMap> = ['mousemove', 'mousedown', 'wheel', 'keydown', 'mouseenter', 'touchstart'];
+        activityEvents.forEach((evt) => rootEl.addEventListener(evt, markActive as EventListener, { passive: true }));
+
+        const onVisibility = () => {
+            if (document.hidden) {
+                if (Date.now() - lastActive > 3000) sleep();
+            } else {
+                markActive();
+            }
+        };
+        document.addEventListener('visibilitychange', onVisibility);
+
+        timer = window.setInterval(() => {
+            const idle = Date.now() - lastActive;
+            if (!sleeping && idle >= sleepMs) {
+                sleep();
+            }
+        }, 30 * 1000);
+
+        (rootEl as any).__sleepCleanup = () => {
+            try {
+                if (timer !== null) {
+                    window.clearInterval(timer);
+                    timer = null;
+                }
+                document.removeEventListener('visibilitychange', onVisibility);
+                activityEvents.forEach((evt) => rootEl.removeEventListener(evt, markActive as EventListener));
+            } catch { /* ignore */ }
+        };
     };
 
     const setupResizeObserver = (targetElement: HTMLElement) => {
@@ -372,6 +490,14 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
         if (hideCSS) hideCssArray.push(...(Array.isArray(hideCSS) ? hideCSS : [hideCSS]));
         const extraCssArray: string[] = injectCSS ? (Array.isArray(injectCSS) ? injectCSS : [injectCSS]) : [];
         const jsArray: string[] = injectJS ? (Array.isArray(injectJS) ? injectJS : [injectJS]) : [];
+        const browserEnvScript = emulateBrowserEnv
+            ? getWpsBrowserEnvScript({
+                userAgent: desktopUA,
+                acceptLanguages: finalAcceptLanguages,
+                partition: finalPartition,
+                emulateBrowserEnv,
+            })
+            : '';
 
         // 注入函数：优先使用 webview.insertCSS，退回到 executeJavaScript 插入 <style>
         const performInjection = async () => {
@@ -392,7 +518,8 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
                         console.error("inject css failed snippet:", cssSnippet, cssErr);
                     }
                 }
-                for (const jsSnippet of jsArray) {
+                const allJsSnippets = browserEnvScript ? [browserEnvScript, ...jsArray] : jsArray;
+                for (const jsSnippet of allJsSnippets) {
                     try {
                         // 简单移除 TS 断言 (as any) / (window as any) / (this as any) 以避免在纯 JS 环境下语法错误
                         let sanitized = jsSnippet;
@@ -734,6 +861,7 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
             const targetElement = this.element.querySelector(`#${containerClass} webview`);
             setupResizeObserver(targetElement as HTMLElement);
             bindCopyButton(this.element, containerClass);
+            bindSleepLifecycle(this.element, url);
         },
         init: (dock) => {
             if (url === "") {
@@ -742,11 +870,15 @@ export function createWebviewDock_for_wps(options: IframeDockOptions & WebviewEx
             // 在覆盖 innerHTML 前先清理旧 root（防止重复绑定）
             const existing = dock.element.querySelector(`#${containerClass}`) as HTMLElement | null;
             cleanupRoot(existing);
-            options.initRun();
+            // 安全调用 initRun（如果存在）
+            if (typeof options.initRun === 'function') {
+                options.initRun();
+            }
             dock.element.innerHTML = createWebviewHTML(containerClass, url, iframeStyle, zoom);
             const targetElement = dock.element.querySelector(`#${containerClass} webview`);
             setupResizeObserver(targetElement as HTMLElement);
             bindCopyButton(dock.element, containerClass);
+            bindSleepLifecycle(dock.element, url);
         },
         destroy() {
             console.debug("destroy dock:", type);
@@ -803,6 +935,7 @@ interface RoamingItem {
   name: string;
   file_type: string;
   file_src: string;
+  time: string;
 }
 
 function normalizeToArray(input: any): any[] {
@@ -831,6 +964,29 @@ function normalizeToArray(input: any): any[] {
   return [];
 }
 
+/**
+ * 格式化时间戳为可读日期时间字符串
+ * @param timestamp 毫秒级时间戳
+ * @returns 格式化后的日期时间字符串，如 "2025-01-20 14:30:25"
+ */
+function formatTimestamp(timestamp: number | string | undefined): string {
+  if (!timestamp) return '';
+  const ts = typeof timestamp === 'string' ? parseInt(timestamp, 10) : timestamp;
+  if (isNaN(ts) || ts <= 0) return '';
+  try {
+    const date = new Date(ts);
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    const hh = String(date.getHours()).padStart(2, '0');
+    const min = String(date.getMinutes()).padStart(2, '0');
+    const ss = String(date.getSeconds()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  } catch {
+    return '';
+  }
+}
+
 export function pickRoamingFields(raw: any): RoamingItem[] {
   const arr = normalizeToArray(raw);
   return arr.map(o => ({
@@ -839,5 +995,6 @@ export function pickRoamingFields(raw: any): RoamingItem[] {
     name: o?.name ?? '',
     file_type: o?.file_type ?? '',
     file_src: o?.file_src ?? '',
+    time: formatTimestamp(o?.mtime),
   }));
 }

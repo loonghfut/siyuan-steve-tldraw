@@ -5,11 +5,27 @@ import { TldrawManager } from './tldraw/tldraw-manager';
 // 替换为新的卡片视图组件
 import TldrawWhiteboardCards from './tldraw/ui/tldraw-whiteboard-cards.svelte';
 import TldrawWhiteboardManager from './tldraw/ui/tldraw-whiteboard-manager.svelte';
+import SlideScreenshotDock from './tldraw/ui/slide-screenshot-dock.svelte';
 import { addWhiteboardButton, setupFileTreeObserver } from "./function/assist";
+import { TldrawLinkIconController } from './function/tldraw-link-icon-controller';
 import * as api from "@/api/api";
+import { getCursorBlockId } from "@/api/api2";
 import { TLShapeId } from "@tldraw/tldraw";
 import { registerTab, unregisterTab } from './tldraw/tldraw-instance-manager';
 import { settingdata } from "@/index";
+import { buildH6CSS, H6_STYLE_DEFAULTS, type H6StyleConfig } from "@/settings/style-h6";
+import { registerTldrawAgentActions, syncTldrawAgentActions } from "./tldraw/agent/ai/siyuan-agent-adapter";
+import { buildTldrawLink } from './tldraw/utils/link-builder';
+import { buildSlideScreenshotMarkdown } from './tldraw/SlideShape/slide-block-binding';
+import {
+    clearActiveSlideScreenshotStore,
+    getActiveSlideScreenshotStore,
+    setActiveSlideScreenshotStore,
+    SlideScreenshotStore,
+    SLIDE_SCREENSHOT_DRAG_TYPE,
+    slideScreenshotUrlToAssetPath,
+    type SlideScreenshotRecord,
+} from './tldraw/SlideShape/slide-screenshot-store';
 export class M_handwriting {
     private plugin: Plugin;
     // 存储画布实例的映射表
@@ -17,22 +33,23 @@ export class M_handwriting {
     private currentid: string = "";
     // svelte dock component instance
     private dockComponent: any | null = null;
+    private slideScreenshotDockComponent: any | null = null;
+    private slideScreenshotStore: SlideScreenshotStore;
+    private slideScreenshotDragOverHandler?: (event: DragEvent) => void;
+    private slideScreenshotDropHandler?: (event: DragEvent) => void;
     // 记录点击拦截器以便卸载时移除
     private clickHandler?: (e: MouseEvent) => void;
     // 委托的 icon 点击处理，用于单点管理所有注入的 icon
     private delegatedIconClickHandler?: (e: MouseEvent) => void;
     // 复用的插件 URL 处理函数
     private handlePluginUrl?: (url: string) => Promise<void>;
-    // 监听带 custom-tldraw-link 元素的观察器
-    private tldrawLinkObserver?: MutationObserver;
-    private pendingTldrawNodes?: Set<HTMLElement>;
-    private mutationFlushHandle?: number;
-    private mutationFlushHandleIsTimeout?: boolean;
+    private tldrawLinkIconController?: TldrawLinkIconController;
     // 文档树观察器实例
     private fileTreeObserver?: MutationObserver;
 
     constructor(plugin: Plugin) {
         this.plugin = plugin;
+        this.slideScreenshotStore = new SlideScreenshotStore(plugin);
     }
 
     // 公开访问 plugin 的 getter
@@ -40,7 +57,45 @@ export class M_handwriting {
         return this.plugin;
     }
 
+    private h6StyleEl: HTMLStyleElement | null = null;
+
+    private applyH6Style(css: string) {
+        if (!this.h6StyleEl) {
+            this.h6StyleEl = document.createElement('style');
+            this.h6StyleEl.id = 'st-tldraw-h6-custom';
+            document.head.appendChild(this.h6StyleEl);
+        }
+        this.h6StyleEl.textContent = css || '';
+    }
+
+    private async getWhiteboardTitle(docId: string): Promise<string> {
+        const fallbackTitle = `画板${docId}`;
+        const escapedDocId = String(docId).replace(/'/g, "''");
+        try {
+            const rows = await api.sql(
+                `SELECT content FROM blocks WHERE id='${escapedDocId}' AND type='d' LIMIT 1`
+            );
+            const title = String(rows[0]?.content || '').trim();
+            return title || fallbackTitle;
+        } catch (error) {
+            console.warn('通过 SQL 查询白板文档标题失败:', docId, error);
+            return fallbackTitle;
+        }
+    }
+
     async init(settingdata) {
+        registerTldrawAgentActions(this.plugin);
+        await this.slideScreenshotStore.load();
+        setActiveSlideScreenshotStore(this.slideScreenshotStore);
+        this.bindSlideScreenshotDropHandlers();
+
+        const h6cfg = settingdata['style-h6-config'];
+        if (h6cfg && typeof h6cfg === 'object') {
+            this.applyH6Style(buildH6CSS(h6cfg as H6StyleConfig));
+        } else if (settingdata['tldraw-h6-style']) {
+            this.applyH6Style(settingdata['tldraw-h6-style']);
+        }
+
         // 添加图标
         this.plugin.addIcons(`
             <symbol id="iconSTWhiteboard" viewBox="0 0 24 24">
@@ -67,10 +122,10 @@ export class M_handwriting {
                 let rootid = params.get('rootid');
                 const blockid = params.get('blockid');
                 const shapeid = params.get('shapeid');
-                const title = params.get('title') || "画板" + rootid;
 
                 // 如果只有 rootid（且 blockid 显式为 null），直接打开空白画板
                 if (rootid && blockid === null) {
+                    const title = await this.getWhiteboardTitle(rootid);
                     await openTab({
                         app: this.plugin.app,
                         custom: {
@@ -107,6 +162,7 @@ export class M_handwriting {
                         showMessage('未找到此blockid对应的块');
                         return;
                     }
+                    const title = await this.getWhiteboardTitle(rootid);
 
                     const tab = await openTab({
                         app: this.plugin.app,
@@ -198,7 +254,7 @@ export class M_handwriting {
             if (!href) return;
 
             // 只拦截目标前缀，避免影响其他链接
-            if (href.startsWith('https://plugins/siyuan-steve-tools/')) {
+            if (href.startsWith('https://plugins/siyuan-steve-tools/') || href.startsWith('siyuan://plugins/siyuan-steve-tools/')) {
                 e.preventDefault();
                 e.stopPropagation();
                 try {
@@ -368,6 +424,77 @@ export class M_handwriting {
             },
         });
 
+        this.plugin.addDock({
+            config: {
+                position: "RightTop",
+                size: { width: 300, height: 0 },
+                icon: "iconImage",
+                title: "Slide截图",
+            },
+            data: null,
+            type: "steveTool-slide-screenshots",
+            resize: async () => {
+
+            },
+            update() {
+                try {
+                    const existing = (this as any).__svelteComponent;
+                    if (!existing) {
+                        this.element.innerHTML = '';
+                        const root = document.createElement('div');
+                        root.className = 'steve-slide-screenshot-dock-root';
+                        root.style.width = '100%';
+                        root.style.height = '100%';
+                        this.element.appendChild(root);
+                        // @ts-ignore
+                        self.slideScreenshotDockComponent = new SlideScreenshotDock({
+                            target: root,
+                            props: {
+                                store: self.slideScreenshotStore,
+                                onOpen: (item: SlideScreenshotRecord) => self.openSlideScreenshotTarget(item),
+                            },
+                        });
+                        (this as any).__svelteComponent = self.slideScreenshotDockComponent;
+                    }
+                } catch (err) {
+                    console.error('更新 Slide 截图 dock 时出错:', err);
+                }
+            },
+            init: async (dock) => {
+                try {
+                    dock.element.innerHTML = '';
+                    const root = document.createElement('div');
+                    root.className = 'steve-slide-screenshot-dock-root';
+                    root.style.width = '100%';
+                    root.style.height = '100%';
+                    dock.element.appendChild(root);
+                    // @ts-ignore
+                    self.slideScreenshotDockComponent = new SlideScreenshotDock({
+                        target: root,
+                        props: {
+                            store: self.slideScreenshotStore,
+                            onOpen: (item: SlideScreenshotRecord) => self.openSlideScreenshotTarget(item),
+                        },
+                    });
+                    (dock as any).__svelteComponent = self.slideScreenshotDockComponent;
+                } catch (err) {
+                    console.error('挂载 Slide 截图 dock 出错:', err);
+                }
+            },
+            destroy() {
+                try {
+                    const component = self.slideScreenshotDockComponent || (this as any).__svelteComponent;
+                    if (component && typeof component.$destroy === 'function') {
+                        component.$destroy();
+                    }
+                    self.slideScreenshotDockComponent = null;
+                } catch (e) { /* ignore */ }
+                try {
+                    if (this.element) this.element.innerHTML = '';
+                } catch (e) { /* ignore */ }
+            },
+        });
+
     }
 
     async onLayoutReady(_settingdata) {
@@ -380,14 +507,22 @@ export class M_handwriting {
             addWhiteboardButton(e);
             const protyleEl = e.detail?.protyle?.element as HTMLElement | undefined;
             if (protyleEl) {
-                this.startTldrawLinkWatcher(protyleEl);
+                this.tldrawLinkIconController?.watchProtyle(protyleEl);
             }
         });
+
+        // 搜索预览创建的 Protyle 不会触发 switch-protyle 事件。
+        this.tldrawLinkIconController = new TldrawLinkIconController();
+        this.tldrawLinkIconController.watchSearchPreviews();
 
         // 设置文档树白板按钮观察器（根据设置决定是否启用）
         if (settingdata['tldraw-show-in-file-tree'] !== false) {
             this.fileTreeObserver = setupFileTreeObserver();
         }
+    }
+
+    updateSettings(_settingdata: any) {
+        syncTldrawAgentActions(this.plugin);
     }
 
     /**
@@ -415,89 +550,91 @@ export class M_handwriting {
         });
     }
 
-    private injectTldrawLinkIcons(container: HTMLElement) {
-        if (!container || !this.handlePluginUrl) return;
-        const nodes = container.querySelectorAll<HTMLElement>('[custom-tldraw-link]');
-        nodes.forEach((node) => {
-            this.injectTldrawIconForNode(node);
-        });
+    private bindSlideScreenshotDropHandlers() {
+        this.slideScreenshotDragOverHandler = (event: DragEvent) => {
+            if (!this.isSlideScreenshotDrop(event)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+        };
+        this.slideScreenshotDropHandler = (event: DragEvent) => {
+            if (!this.isSlideScreenshotDrop(event)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            void this.insertDraggedSlideScreenshot(event);
+        };
+        document.addEventListener('dragover', this.slideScreenshotDragOverHandler, true);
+        document.addEventListener('drop', this.slideScreenshotDropHandler, true);
     }
 
-    private injectTldrawIconForNode(node: HTMLElement) {
-        if (!node || !this.handlePluginUrl) return;
-        const linkAttr = node.getAttribute('custom-tldraw-link');
-        if (!linkAttr) return;
-
-        const attrEl = Array.from(node.children).find((child) => (child as HTMLElement).classList?.contains('protyle-attr')) as HTMLElement | undefined;
-        if (!attrEl) return;
-
-        if (attrEl.querySelector('.st-tldraw-link-icon')) return;
-
-        const icon = document.createElement('span');
-        icon.className = 'st-tldraw-link-icon block__icon fn__flex-center';
-        icon.setAttribute('aria-label', '打开白板');
-        icon.title = '打开白板';
-        //加opacity: 1
-        icon.style.opacity = '1';
-        icon.innerHTML = '<svg class="item__graphic"><use xlink:href="#iconSTWhiteboard">🔗</use></svg>';
-        // 把链接存到 icon 的属性上，供委托处理器使用
-        icon.setAttribute('data-tldraw-link', linkAttr);
-
-        attrEl.appendChild(icon);
-    }
-
-    private startTldrawLinkWatcher(protyleEl: HTMLElement) {
-        if (!protyleEl) return;
-        // 先停止上一个观察器
-        this.stopTldrawLinkWatcher();
-
-        // 先对现有内容做一次注入
-        this.injectTldrawLinkIcons(protyleEl);
-
-        // 监听新增节点或属性变化
-        this.tldrawLinkObserver = new MutationObserver((mutations) => {
-            for (const m of mutations) {
-                if (m.type === 'childList') {
-                    m.addedNodes.forEach((n) => {
-                        if (n instanceof HTMLElement) {
-                            if (n.hasAttribute('custom-tldraw-link')) {
-                                this.scheduleTldrawNodeInjection(n);
-                            }
-                            n.querySelectorAll<HTMLElement>('[custom-tldraw-link]').forEach((child) => {
-                                this.scheduleTldrawNodeInjection(child);
-                            });
-                        }
-                    });
-                } else if (m.type === 'attributes') {
-                    const target = m.target as HTMLElement;
-                    if (m.attributeName === 'custom-tldraw-link') {
-                        this.scheduleTldrawNodeInjection(target);
-                    }
-                }
-            }
-        });
-
-        this.tldrawLinkObserver.observe(protyleEl, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['custom-tldraw-link'],
-        });
-    }
-
-    private stopTldrawLinkWatcher() {
-        if (this.tldrawLinkObserver) {
-            this.tldrawLinkObserver.disconnect();
-            this.tldrawLinkObserver = undefined;
+    private unbindSlideScreenshotDropHandlers() {
+        if (this.slideScreenshotDragOverHandler) {
+            document.removeEventListener('dragover', this.slideScreenshotDragOverHandler, true);
+            this.slideScreenshotDragOverHandler = undefined;
         }
-        this.clearScheduledTldrawNodes();
-        // 注意：不要在这里移除 `delegatedIconClickHandler`，它应当在插件卸载时统一清理。
+        if (this.slideScreenshotDropHandler) {
+            document.removeEventListener('drop', this.slideScreenshotDropHandler, true);
+            this.slideScreenshotDropHandler = undefined;
+        }
+    }
+
+    private isSlideScreenshotDrop(event: DragEvent): boolean {
+        const target = event.target instanceof Element ? event.target : null;
+        const types = Array.from(event.dataTransfer?.types || []);
+        return types.includes(SLIDE_SCREENSHOT_DRAG_TYPE) && !!target?.closest('.protyle-wysiwyg');
+    }
+
+    private async insertDraggedSlideScreenshot(event: DragEvent) {
+        const id = event.dataTransfer?.getData(SLIDE_SCREENSHOT_DRAG_TYPE) || '';
+        const store = getActiveSlideScreenshotStore() || this.slideScreenshotStore;
+        const item = store.get(id);
+        if (!item) {
+            showMessage('未找到待插入的 Slide 截图', 3000, 'error');
+            return;
+        }
+
+        const target = event.target instanceof Element ? event.target : null;
+        const targetBlockId = target?.closest('[data-node-id]')?.getAttribute('data-node-id') || getCursorBlockId();
+        if (!targetBlockId) {
+            showMessage('未找到图片插入位置，截图暂存项已保留', 3000, 'error');
+            return;
+        }
+
+        try {
+            const assetPath = slideScreenshotUrlToAssetPath(item.imageUrl);
+            if (!assetPath) throw new Error('invalid stored slide screenshot asset URL');
+            const markdown = buildSlideScreenshotMarkdown({
+                assetPath,
+                name: item.name,
+                shapeId: item.shapeId,
+                rootId: item.rootId,
+                title: item.title,
+            });
+            await api.smartInsertBlock('markdown', markdown, targetBlockId);
+            await store.remove(item.id);
+            showMessage('Slide 截图已插入文档，暂存项已删除');
+        } catch (error) {
+            console.error('拖入 Slide 截图失败', error);
+            showMessage('插入 Slide 截图失败，暂存项已保留', 4000, 'error');
+        }
+    }
+
+    private async openSlideScreenshotTarget(item: SlideScreenshotRecord) {
+        const link = buildTldrawLink(item.rootId, item.rootId, item.shapeId);
+        if (!this.handlePluginUrl) {
+            showMessage('白板导航尚未初始化', 3000, 'error');
+            return;
+        }
+        await this.handlePluginUrl(link);
     }
 
     /**
      * 插件卸载时的清理工作
      */
     async onunload() {
+        this.unbindSlideScreenshotDropHandlers();
+        clearActiveSlideScreenshotStore(this.slideScreenshotStore);
         // 移除链接点击拦截器
         if (this.clickHandler) {
             document.removeEventListener('click', this.clickHandler, true);
@@ -507,8 +644,8 @@ export class M_handwriting {
             document.removeEventListener('click', this.delegatedIconClickHandler, true);
             this.delegatedIconClickHandler = undefined;
         }
-        // 停止观察器
-        this.stopTldrawLinkWatcher();
+        this.tldrawLinkIconController?.destroy();
+        this.tldrawLinkIconController = undefined;
         // 停止文档树观察器
         if (this.fileTreeObserver) {
             this.fileTreeObserver.disconnect();
@@ -520,7 +657,16 @@ export class M_handwriting {
                 this.dockComponent.$destroy();
                 this.dockComponent = null;
             }
+            if (this.slideScreenshotDockComponent && typeof this.slideScreenshotDockComponent.$destroy === 'function') {
+                this.slideScreenshotDockComponent.$destroy();
+                this.slideScreenshotDockComponent = null;
+            }
         } catch (e) { /* ignore */ }
+        // 移除自定义 h6 样式
+        if (this.h6StyleEl) {
+            this.h6StyleEl.remove();
+            this.h6StyleEl = null;
+        }
     }
 
     private decodeAmpEntities(value: string): string {
@@ -538,52 +684,4 @@ export class M_handwriting {
         return result;
     }
 
-    private scheduleTldrawNodeInjection(node: HTMLElement) {
-        if (!node) return;
-        if (!this.pendingTldrawNodes) {
-            this.pendingTldrawNodes = new Set();
-        }
-        this.pendingTldrawNodes.add(node);
-        if (this.mutationFlushHandle !== undefined) {
-            return;
-        }
-
-        const flush = () => {
-            if (this.pendingTldrawNodes) {
-                this.pendingTldrawNodes.forEach((pendingNode) => {
-                    if (pendingNode.isConnected) {
-                        this.injectTldrawIconForNode(pendingNode);
-                    }
-                });
-                this.pendingTldrawNodes.clear();
-                this.pendingTldrawNodes = undefined;
-            }
-            this.mutationFlushHandle = undefined;
-            this.mutationFlushHandleIsTimeout = undefined;
-        };
-
-        if (typeof requestAnimationFrame === 'function') {
-            this.mutationFlushHandle = requestAnimationFrame(flush);
-            this.mutationFlushHandleIsTimeout = false;
-        } else {
-            this.mutationFlushHandle = window.setTimeout(flush, 16);
-            this.mutationFlushHandleIsTimeout = true;
-        }
-    }
-
-    private clearScheduledTldrawNodes() {
-        if (this.mutationFlushHandle !== undefined) {
-            if (this.mutationFlushHandleIsTimeout) {
-                clearTimeout(this.mutationFlushHandle);
-            } else {
-                cancelAnimationFrame(this.mutationFlushHandle);
-            }
-        }
-        if (this.pendingTldrawNodes) {
-            this.pendingTldrawNodes.clear();
-            this.pendingTldrawNodes = undefined;
-        }
-        this.mutationFlushHandle = undefined;
-        this.mutationFlushHandleIsTimeout = undefined;
-    }
 }

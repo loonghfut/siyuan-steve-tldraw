@@ -2,38 +2,7 @@
  * 样式面板内联 CSS 样式
  */
 export const stylePanelStyles = `
-    .connector-width-input {
-        color: var(--color-text);
-        background: var(--b3-theme-surface);
-        border: 1px solid var(--color-border);
-        border-radius: 8px;
-        box-shadow: inset 0 1px 2px rgba(0,0,0,0.04);
-        height: 32px;
-        width: 77px;
-        text-align: right;
-        padding: 0 8px;
-        box-sizing: border-box;
-    }
-    .connector-width-input::placeholder {
-        color: var(--color-text-muted);
-        opacity: 1;
-    }
-    /* 移除 number input 的上下微调按钮 */
-    .connector-width-input::-webkit-outer-spin-button,
-    .connector-width-input::-webkit-inner-spin-button {
-        -webkit-appearance: none;
-        margin: 0;
-    }
-    /* Firefox */
-    .connector-width-input {
-        -moz-appearance: textfield;
-    }
-    @media (prefers-color-scheme: light) {
-        .connector-width-input::placeholder {
-            color: rgba(0,0,0,0.45);
-        }
-    }
-    /* Color input: remove native swatch background/padding */
+	/* Color input: remove native swatch background/padding */
     .connector-color-input {
         background: transparent;
         padding: 0;
@@ -81,5 +50,28 @@ export const stylePanelStyles = `
         line-height: 1;
         display: inline-block;
         transform: translateY(-1px);
+    }
+    /* Style panel text input: align with native tlui-button metrics (40px row, 12px inset) */
+    .tlui-style-panel__section > .tlui-input__wrapper {
+        position: relative;
+        height: 40px;
+        padding: 0 var(--tl-space-4);
+    }
+    /* Hover/focus feedback mirrors .tlui-button::after (inset 4px, radius-2, muted bg) */
+    .tlui-style-panel__section > .tlui-input__wrapper::after {
+        content: '';
+        position: absolute;
+        inset: 4px;
+        border-radius: var(--tl-radius-2);
+        background: var(--tl-color-muted-2);
+        opacity: 0;
+        pointer-events: none;
+    }
+    .tlui-style-panel__section > .tlui-input__wrapper:hover::after,
+    .tlui-style-panel__section > .tlui-input__wrapper:focus-within::after {
+        opacity: 1;
+    }
+    .tlui-style-panel__section .slide-name-input {
+        padding: 0;
     }
 `
