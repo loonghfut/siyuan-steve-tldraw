@@ -24,12 +24,10 @@ export const handwritingDefaults: Record<string, any> = {
     "tldraw-max-active-shapes": 40,
     // 全局禁止 JS 块执行脚本
     "js-shape-disable-execution": false,
-    // 双击画板空白处创建的形状：text | single-block
+    // 双击画板空白处创建的形状：text | single-block | card
     "enableDoubleClickCreateSingleBlock": "single-block",
     // 精确箭头模式
     "tldraw-exact-arrow-mode": true,
-    // 端口悬停触发延时（毫秒）
-    "tldraw-port-hover-delay": 300,
     // 导出 PNG 时的图片质量与倍率
     "tldraw-export-image-quality": 100,
     "tldraw-export-pixel-ratio": 2,
@@ -37,6 +35,8 @@ export const handwritingDefaults: Record<string, any> = {
     "tldraw-export-outline-only-threshold": 90,
     // 自定义卡片标题内容
     "tldraw-custom-card-title": "",
+    // 新建 Card 的思源载体块类型：heading | blockquote
+    "tldraw-card-default-block-type": "heading",
     // 新建普通卡片时是否询问标题
     "tldraw-prompt-card-title": false,
     // 文档树显示白板按钮
@@ -55,14 +55,14 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
                 {
                     type: "select",
                     title: "双击画板空白处创建",
-                    description: "选择双击画板空白处时创建文本或单块。旧版开关设置会自动兼容：开启为单块，关闭为文本。",
+                    description: "选择双击画板空白处时创建文本、单块或卡片。旧版开关设置会自动兼容：开启为单块，关闭为文本。",
                     key: "enableDoubleClickCreateSingleBlock",
                     value: ctx.settings["enableDoubleClickCreateSingleBlock"] === false
                         ? "text"
                         : ctx.settings["enableDoubleClickCreateSingleBlock"] === true
                             ? "single-block"
                             : ctx.settings["enableDoubleClickCreateSingleBlock"],
-                    options: { "text": "文本", "single-block": "单块" },
+                    options: { "text": "文本", "single-block": "单块", "card": "Card" },
                 },
                 { type: "checkbox", title: "显示 Card 形状边框", description: "启用后 Card 形状将显示边框", key: "showCardBorder", value: ctx.settings["showCardBorder"] },
                 { type: "checkbox", title: "启用画板网格背景", description: "默认开启网格", key: "isGridMode", value: ctx.settings["isGridMode"] },
@@ -75,6 +75,7 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
                 { type: "slider", title: "导出图片质量", description: "PNG/SVG 导出为位图时使用的质量参数，范围 10-100。对有损格式影响最明显。", key: "tldraw-export-image-quality", value: ctx.settings["tldraw-export-image-quality"], slider: { min: 10, max: 100, step: 5 } },
                 { type: "slider", title: "导出图片倍率", description: "控制导出位图的像素倍率。降低倍率可明显减小 PNG 体积。", key: "tldraw-export-pixel-ratio", value: ctx.settings["tldraw-export-pixel-ratio"], slider: { min: 0.5, max: 4, step: 0.25 } },
                 { type: "number", title: "导出轮廓模式阈值", description: "单次导出中 Card 与单块形状数量超过此值时，仅导出形状轮廓以提升性能。默认 90。", key: "tldraw-export-outline-only-threshold", value: ctx.settings["tldraw-export-outline-only-threshold"] },
+                { type: "select", title: "新建 Card 默认块类型", description: "选择通过 Card 工具创建空卡片时，在思源中生成标题块还是引述块。", key: "tldraw-card-default-block-type", value: ctx.settings["tldraw-card-default-block-type"], options: { "heading": "标题块", "blockquote": "引述块" } },
                 { type: "textinput", title: "自定义卡片标题内容", description: "在此输入自定义的卡片标题内容，支持变量 ${timestamp}", key: "tldraw-custom-card-title", value: ctx.settings["tldraw-custom-card-title"] },
                 { type: "checkbox", title: "编辑新卡片时询问标题", description: "启用后，仅在编辑没有绑定思源块 ID 的普通 Card 时询问标题；Agent 创建卡片不受此设置影响", key: "tldraw-prompt-card-title", value: ctx.settings["tldraw-prompt-card-title"] },
                 { type: "checkbox", title: "文档树显示白板按钮", description: "在文档树每个条目左侧显示白板图标按钮", key: "tldraw-show-in-file-tree", value: ctx.settings["tldraw-show-in-file-tree"] },
@@ -87,7 +88,6 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
                 { type: "checkbox", title: "同步删除(不建议启用)", description: "删除画板块时同步删除笔记块", key: "SyncDelete", value: ctx.settings["SyncDelete"] },
                 { type: "checkbox", title: "全局禁止 JS 块执行脚本", description: "启用后所有 JS 形状将不执行脚本代码（安全模式）", key: "js-shape-disable-execution", value: ctx.settings["js-shape-disable-execution"] },
                 { type: "number", title: "最大激活形状数", description: "限制同时激活的形状数量以节省资源", key: "tldraw-max-active-shapes", value: ctx.settings["tldraw-max-active-shapes"] },
-                { type: "slider", title: "端口悬停触发延时", description: "鼠标停在形状上后，端口显示前的等待时间（毫秒，0 表示立即显示）", key: "tldraw-port-hover-delay", value: ctx.settings["tldraw-port-hover-delay"], slider: { min: 0, max: 5000, step: 250 } },
                 {
                     type: "select", title: "Card 渲染模式", description: "选择非编辑状态如何渲染 Card：性能优先或一致性优先", key: "card-render-mode", value: ctx.settings["card-render-mode"], options: {
                         "static-dom": "性能优先：非编辑为 Protyle 元素（无实例）",

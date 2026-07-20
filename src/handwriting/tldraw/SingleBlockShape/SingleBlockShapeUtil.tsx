@@ -40,13 +40,15 @@ import { getDefaultColorTheme } from '../utils/color-theme'
 import { getCachedSvgExportSnapshot, getSvgExportGlobalStyles, isSvgExportOutlineOnly, serializeElementForSvgExport } from '../utils/export-dom-snapshot'
 import {
 	beginBranchAttachmentDrag,
+	beginBranchResize,
 	clearBranchInteractionHint,
 	createSiblingSingleInBranch,
+	endBranchResize,
 	getSingleBranchParent,
 	getBranchInteractionHintForShape,
 	setBranchInteractionHint,
 	syncBranchMoveForRootContent,
-	relayoutBranchesContainingShape,
+	requestBranchRelayout,
 	updateBranchAttachmentAfterDrag,
 	useBranchInteractionHint,
 } from '../BranchShape'
@@ -74,7 +76,7 @@ function setMeasuredSingleBlockSize(editor: Editor, shapeId: TLShapeId, size: { 
 		changed = true
 		return map.set(shapeId, size)
 	})
-	if (changed) relayoutBranchesContainingShape(editor, shapeId)
+	if (changed) requestBranchRelayout(editor, shapeId)
 }
 const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
 const STEVE_TOOLS_PLUGIN_URL_RE = /^(?:https:\/\/|siyuan:\/\/)plugins\/siyuan-steve-tools\//i
@@ -414,7 +416,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const [isEditingState, setIsEditingState] = useState(isEditing)
 		const [isInViewport, setIsInViewport] = useState(true)
 		const [canLoad, setCanLoad] = useState(true)
- 		const [isHovered, setIsHovered] = useState(false)
 		const [hasAttrIcon, setHasAttrIcon] = useState(false)
 		const [hasLoadError, setHasLoadError] = useState(false)
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false
@@ -1227,8 +1228,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 		return (
 			<HTMLContainer
-				onMouseEnter={() => setIsHovered(true)}
-				onMouseLeave={() => setIsHovered(false)}
 				id={shape.id}
 				style={{
 					display: 'flex',
@@ -1513,7 +1512,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				{/* 端口覆盖层 - 用于贝塞尔连接器 */}
 				{/* 在透明模式下不显示端点（PortsOverlay） */}
 				{!shape.props.transparentBackground && (
-					<PortsOverlay shapeId={shape.id} parentHovered={isHovered} />
+					<PortsOverlay shapeId={shape.id} />
 				)}
 			</HTMLContainer>
 		)
@@ -1526,6 +1525,18 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 	override onResize(shape: ISingleBlockShape, info: TLResizeInfo<ISingleBlockShape>) {
 		return resizeBox(shape, info)
+	}
+
+	override onResizeStart(shape: ISingleBlockShape) {
+		beginBranchResize(this.editor, shape.id)
+	}
+
+	override onResizeEnd(_initialShape: ISingleBlockShape, currentShape: ISingleBlockShape) {
+		endBranchResize(this.editor, currentShape.id)
+	}
+
+	override onResizeCancel(_initialShape: ISingleBlockShape, currentShape: ISingleBlockShape) {
+		endBranchResize(this.editor, currentShape.id)
 	}
 
 	override onTranslateStart(shape: ISingleBlockShape) {

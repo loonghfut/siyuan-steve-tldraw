@@ -25,7 +25,9 @@ import { getDefaultColorTheme } from '../utils/color-theme'
 import { inputDialogSync } from '@/libs/dialog'
 import {
 	beginBranchAttachmentDrag,
+	beginBranchResize,
 	clearBranchInteractionHint,
+	endBranchResize,
 	getBranchInteractionHintForShape,
 	setBranchInteractionHint,
 	syncBranchMoveForRootContent,
@@ -46,6 +48,28 @@ const INITIAL_NODE_LIMIT = 80;
 const INITIAL_TEXT_LIMIT = 8000;
 const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
 const STEVE_TOOLS_PLUGIN_URL_RE = /^(?:https:\/\/|siyuan:\/\/)plugins\/siyuan-steve-tools\//i
+type DefaultCardBlockType = 'heading' | 'blockquote'
+
+function getDefaultCardBlockType(): DefaultCardBlockType {
+	return settingdata['tldraw-card-default-block-type'] === 'blockquote' ? 'blockquote' : 'heading'
+}
+
+function buildDefaultCardBlockMarkdown(
+	blockType: DefaultCardBlockType,
+	title: string,
+	blockId: string,
+	link: string,
+) {
+	const firstLine = blockType === 'blockquote' ? `> ` : `###### ${title}`
+	return (
+		firstLine +
+		'\n' +
+		'{: id="' + blockId + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
+		'\n\n' +
+		'{: custom-st-tldraw-none="1" }' +
+		'\n'
+	)
+}
 
 function decodeLinkTarget(value: string) {
 	return value
@@ -268,7 +292,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const [isEditingState, setIsEditingState] = useState(isEditing);
 		const [isInViewport, setIsInViewport] = useState(true);
 		const [canLoad, setCanLoad] = useState(true); // gating heavy render by global manager
-		const [isHovered, setIsHovered] = useState(false);
 		const [hasMissingLinkedBlock, setHasMissingLinkedBlock] = useState(false);
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false;
 		const tldrawHeaderImage = settingdata['tldraw-header-image'] !== false;
@@ -952,25 +975,18 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						if (cancelled) return null;
 					} else if (!currentBlockId) {
 						const creationPromise = (async () => {
-							const customTitleTemplate = String(settingdata["tldraw-custom-card-title"] || "${timestamp}");
-							const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-							const initialTitle = customTitleTemplate
-								? customTitleTemplate.replace(/\$\{timestamp\}/g, () => timestamp)
-								: timestamp;
 							const idid = await api.generateSiyuanID() as string;
 							const link = buildTldrawLink(tldrawId, idid);
-							// 先创建一个可用的默认标题块，用户输入在创建完成后再更新标题。
-							const content =
-								'###### ' + initialTitle +
-								'\n' +
-								'{: id="' + idid + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
-								'\n\n' +
-								'{: custom-st-tldraw-none="1" }' +
-								'\n';
+							const defaultBlockType = getDefaultCardBlockType();
+							const initialTitle = defaultBlockType === 'heading'
+								? String(settingdata["tldraw-custom-card-title"] || "${timestamp}")
+									.replace(/\$\{timestamp\}/g, () => new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }))
+								: '';
+							const content = buildDefaultCardBlockMarkdown(defaultBlockType, initialTitle, idid, link)
 							const redata = await api.appendBlock("markdown", content, tldrawId!);
 							const newBlockId = redata[0].doOperations[0].id as string;
 
-							if (isEditingState && !shape.props.blockId && !containerRef.current?.getAttribute('blockid') && settingdata["tldraw-prompt-card-title"] && !userTitlePromptedRef.current) {
+							if (defaultBlockType === 'heading' && isEditingState && !shape.props.blockId && !containerRef.current?.getAttribute('blockid') && settingdata["tldraw-prompt-card-title"] && !userTitlePromptedRef.current) {
 								userTitlePromptedRef.current = true;
 								try {
 									const input = await inputDialogSync({
@@ -982,16 +998,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 									const userTitle = input?.replace(/[\r\n]+/g, ' ').trim() || '';
 									if (userTitle) {
 										// updateBlock 会整体替换块内容，因此必须重新附带 Card 的 IAL。
-										await api.updateBlock(
-											'markdown',
-											'###### ' + userTitle +
-											'\n' +
-											'{: id="' + idid + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
-											'\n\n' +
-											'{: custom-st-tldraw-none="1" }' +
-											'\n',
-											newBlockId,
-										);
+										await api.updateBlock('markdown', buildDefaultCardBlockMarkdown(defaultBlockType, userTitle, idid, link), newBlockId);
 									}
 								} catch (err) {
 									// 标题更新失败不应影响已创建块与 Card 的绑定。
@@ -1083,6 +1090,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							handleEmptyContent: () => {
 								enterMissingLinkedBlockState();
 							},
+							click: {
+								/** 点击末尾是否阻止插入新块 */
+								preventInsetEmptyBlock: true,
+							}
 						});
 					} catch (err) {
 						console.error('Protyle 构造失败', err);
@@ -1493,8 +1504,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 		return (
 			<HTMLContainer
-				onMouseEnter={() => setIsHovered(true)}
-				onMouseLeave={() => setIsHovered(false)}
 				style={{
 					display: 'flex',
 					flexDirection: 'column',
@@ -1572,77 +1581,77 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							<div
 								className="card-shape-collapsed-content"
 								style={{
-								width: '100%',
-								height: '100%',
-								display: 'flex',
-								flexDirection: 'column',
-								alignItems: 'flex-start',
-								justifyContent: 'flex-start',
-								gap: '12px',
-								padding: '12px',
-								boxSizing: 'border-box',
-								color: theme[shape.props.color].solid,
-								overflow: 'hidden',
-								opacity: 1,
-								transform: 'translateY(0)'
-							}}
-						>
-							{tldrawHeaderImage && (
-								<div
-									style={{
-										width: '100%',
-										height: '80%',
-										minHeight: '120px',
-										borderRadius: '12px',
-										overflow: 'hidden',
-										background: collapsedDocInfo?.titleImgBackground || collapsedDocInfo?.titleImgColor || headerGradientFallback,
-										display: 'flex',
-										alignItems: 'center',
-										justifyContent: 'center',
-									}}
-								>
-									{collapsedDocInfo?.titleImgHasUrl ? (
-										<img
-											src={collapsedDocInfo.titleImgSrc}
-											style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-											alt={collapsedDocInfo.title || '文档'}
-										/>
-									) : null}
+									width: '100%',
+									height: '100%',
+									display: 'flex',
+									flexDirection: 'column',
+									alignItems: 'flex-start',
+									justifyContent: 'flex-start',
+									gap: '12px',
+									padding: '12px',
+									boxSizing: 'border-box',
+									color: theme[shape.props.color].solid,
+									overflow: 'hidden',
+									opacity: 1,
+									transform: 'translateY(0)'
+								}}
+							>
+								{tldrawHeaderImage && (
+									<div
+										style={{
+											width: '100%',
+											height: '80%',
+											minHeight: '120px',
+											borderRadius: '12px',
+											overflow: 'hidden',
+											background: collapsedDocInfo?.titleImgBackground || collapsedDocInfo?.titleImgColor || headerGradientFallback,
+											display: 'flex',
+											alignItems: 'center',
+											justifyContent: 'center',
+										}}
+									>
+										{collapsedDocInfo?.titleImgHasUrl ? (
+											<img
+												src={collapsedDocInfo.titleImgSrc}
+												style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+												alt={collapsedDocInfo.title || '文档'}
+											/>
+										) : null}
+									</div>
+								)}
+								<div style={{
+									width: '100%',
+									display: 'flex',
+									alignItems: 'center',
+									gap: '8px',
+									fontSize: `${Math.min(shape.props.w / 8, 28)}px`,
+									fontWeight: 600,
+									wordBreak: 'break-all',
+								}}>
+									<span style={{ display: 'flex', alignItems: 'center' }}>
+										<svg width="20" height="20" style={{ marginRight: '6px' }}>
+											<use xlinkHref="#iconFile"></use>
+										</svg>
+										{collapsedDocInfo?.title || '加载中...'}
+									</span>
 								</div>
-							)}
-							<div style={{
-								width: '100%',
-								display: 'flex',
-								alignItems: 'center',
-								gap: '8px',
-								fontSize: `${Math.min(shape.props.w / 8, 28)}px`,
-								fontWeight: 600,
-								wordBreak: 'break-all',
-							}}>
-								<span style={{ display: 'flex', alignItems: 'center' }}>
-									<svg width="20" height="20" style={{ marginRight: '6px' }}>
-										<use xlinkHref="#iconFile"></use>
-									</svg>
-									{collapsedDocInfo?.title || '加载中...'}
-								</span>
 							</div>
-						</div>
 						) : (
 							<div
 								className="card-shape-collapsed-content"
 								style={{
-								width: '100%',
-								height: '100%',
-								display: 'flex',
-								alignItems: 'center',
-								justifyContent: collapsedTextAlign === 'right' ? 'flex-end' : collapsedTextAlign === 'center' ? 'center' : 'flex-start',
-								padding: '10px 14px',
-								boxSizing: 'border-box',
-								gap: collapsedTextAlign === 'center' ? '0px' : '10px',
-								position: 'relative',
-								opacity: 1,
-								transform: 'translateY(0)'
-							}}>
+									width: '100%',
+									height: '100%',
+									display: 'flex',
+									alignItems: 'center',
+									justifyContent: collapsedTextAlign === 'right' ? 'flex-end' : collapsedTextAlign === 'center' ? 'center' : 'flex-start',
+									padding: '10px 14px',
+									boxSizing: 'border-box',
+									gap: collapsedTextAlign === 'center' ? '0px' : '10px',
+									position: 'relative',
+									opacity: 1,
+									transform: 'translateY(0)'
+								}}>
 								{/* 折叠图标 — 点击展开 */}
 								<svg
 									className="card-shape-collapsed-toggle-icon"
@@ -1655,12 +1664,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 									strokeLinecap="round"
 									strokeLinejoin="round"
 									style={{
-									flexShrink: 0,
-									cursor: 'pointer',
-									...(collapsedTextAlign === 'center'
-										? { position: 'absolute', left: '14px', zIndex: 1 }
-										: {}),
-								}}
+										flexShrink: 0,
+										cursor: 'pointer',
+										...(collapsedTextAlign === 'center'
+											? { position: 'absolute', left: '14px', zIndex: 1 }
+											: {}),
+									}}
 									onClick={handleUncollapse}
 									onPointerDown={(e) => e.stopPropagation()}
 								>
@@ -1802,7 +1811,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					</div>
 				)}
 				{/* 端口覆盖层 - 用于贝塞尔连接器 */}
-				<PortsOverlay shapeId={shape.id} parentHovered={isHovered} />
+				<PortsOverlay shapeId={shape.id} />
 			</HTMLContainer >
 		)
 	}
@@ -1815,6 +1824,18 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 	// [8]
 	override onResize(shape: ICardShape, info: TLResizeInfo<ICardShape>) {
 		return resizeBox(shape, info)
+	}
+
+	override onResizeStart(shape: ICardShape) {
+		beginBranchResize(this.editor, shape.id)
+	}
+
+	override onResizeEnd(_initialShape: ICardShape, currentShape: ICardShape) {
+		endBranchResize(this.editor, currentShape.id)
+	}
+
+	override onResizeCancel(_initialShape: ICardShape, currentShape: ICardShape) {
+		endBranchResize(this.editor, currentShape.id)
 	}
 
 	override onTranslateStart(shape: ICardShape) {

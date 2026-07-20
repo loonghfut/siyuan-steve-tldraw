@@ -14,14 +14,14 @@ import {
 } from '@tldraw/tldraw'
 import { branchShapeMigrations } from './branch-shape-migrations'
 import { branchShapeProps } from './branch-shape-props'
-import { BranchLineStyle, IBranchShape } from './branch-shape-types'
+import { BranchLineStyle, IBranchShape, TREE_TABLE_CELL_PADDING } from './branch-shape-types'
 import { beginBranchAttachmentDrag, getAllBranchAttachedShapeIds, getBranchInteractionHintForShape, getBranchRenderInfo, layoutBranchChildren, runWithSuppressedRootContentMoveIds, updateBranchAttachmentAfterDrag } from './branch-layout'
 import { clearBranchInteractionHint, setBranchInteractionHint, useBranchInteractionHintForBranch } from './branch-interaction-state'
 import { getDefaultColorTheme } from '../utils/color-theme'
 
 const translatingBranchIds = new Set<string>()
 const syncingBranchMoveIds = new Set<string>()
-const CURVE_DASHARRAY = '6 5'
+const CURVE_DASHARRAY = '8 6'
 const DETACH_DASHARRAY = '6 5'
 const OUTER_FRAME_INSET = 2
 const OUTER_FRAME_STROKE_WIDTH = 2.2
@@ -42,7 +42,28 @@ type BranchPathInfo = {
 type BranchHitTarget =
 	| { type: 'geometry'; geometry: Geometry2d; hitWidth: number }
 	| { type: 'rect'; x: number; y: number; w: number; h: number; hitWidth: number; filled?: boolean }
+	| { type: 'line'; x1: number; y1: number; x2: number; y2: number; hitWidth: number }
 	| { type: 'circle'; x: number; y: number; r: number; filled?: boolean }
+
+type TreeTableBox = {
+	x: number
+	y: number
+	w: number
+	h: number
+}
+
+type TreeTableColumn = {
+	side: 'left' | 'right'
+	x: number
+	w: number
+	dividerX: number
+	rowDividers: number[]
+}
+
+type TreeTableLayout = {
+	outer: TreeTableBox
+	columns: TreeTableColumn[]
+}
 
 function getBranchLineStyle(shape: IBranchShape): BranchLineStyle {
 	return shape.props.lineStyle ?? 'curve-solid'
@@ -50,6 +71,80 @@ function getBranchLineStyle(shape: IBranchShape): BranchLineStyle {
 
 function isFloatingFrameStyle(lineStyle: BranchLineStyle) {
 	return lineStyle === 'frame-floating'
+}
+
+function isTreeTableStyle(lineStyle: BranchLineStyle) {
+	return lineStyle === 'tree-table'
+}
+
+function getTreeTableLayout(
+	rootBounds: TreeTableBox | null,
+	rootX: number,
+	rootY: number,
+	rootRadius: number,
+	children: BranchChildRenderInfo[]
+): TreeTableLayout {
+	const root = rootBounds || {
+		x: rootX - rootRadius,
+		y: rootY - rootRadius,
+		w: rootRadius * 2,
+		h: rootRadius * 2,
+	}
+	const rowsBySide = new Map<'left' | 'right', BranchChildRenderInfo[]>(
+		(['left', 'right'] as const).map((side) => [
+			side,
+			children.filter((child) => child.side === side).sort((a, b) => a.y - b.y),
+		])
+	)
+	const allBoxes = [root, ...children]
+	const outer = {
+		x: Math.min(...allBoxes.map((box) => box.x)) - TREE_TABLE_CELL_PADDING,
+		y: Math.min(...allBoxes.map((box) => box.y)) - TREE_TABLE_CELL_PADDING,
+		w: Math.max(...allBoxes.map((box) => box.x + box.w)) - Math.min(...allBoxes.map((box) => box.x)) + TREE_TABLE_CELL_PADDING * 2,
+		h: Math.max(...allBoxes.map((box) => box.y + box.h)) - Math.min(...allBoxes.map((box) => box.y)) + TREE_TABLE_CELL_PADDING * 2,
+	}
+	const columns: TreeTableColumn[] = []
+
+	for (const side of ['left', 'right'] as const) {
+		const rows = rowsBySide.get(side) || []
+		if (rows.length === 0) continue
+
+		const minX = Math.min(...rows.map((child) => child.x))
+		const maxX = Math.max(...rows.map((child) => child.x + child.w))
+		const dividerX = side === 'left' ? (maxX + root.x) / 2 : (root.x + root.w + minX) / 2
+		const x = side === 'left' ? outer.x : dividerX
+		const w = side === 'left' ? dividerX - outer.x : outer.x + outer.w - dividerX
+		columns.push({
+			side,
+			x,
+			w,
+			dividerX,
+			rowDividers: rows.slice(0, -1).map((row, index) => (row.y + row.h + rows[index + 1].y) / 2),
+		})
+
+	}
+
+	return {
+		outer,
+		columns,
+	}
+}
+
+function getTreeTableOutline(table: TreeTableLayout, lineWidth: number): TreeTableBox {
+	const inset = Math.min(lineWidth / 2, table.outer.w / 2, table.outer.h / 2)
+	return {
+		x: table.outer.x + inset,
+		y: table.outer.y + inset,
+		w: Math.max(table.outer.w - inset * 2, 0),
+		h: Math.max(table.outer.h - inset * 2, 0),
+	}
+}
+
+function getTreeTableRowDividerBounds(column: TreeTableColumn, outline: TreeTableBox) {
+	return {
+		x1: column.side === 'left' ? outline.x : column.x,
+		x2: column.side === 'left' ? column.x + column.w : outline.x + outline.w,
+	}
 }
 
 function createLinearBezier(start: VecLike, end: VecLike) {
@@ -61,6 +156,61 @@ function createLinearBezier(start: VecLike, end: VecLike) {
 	})
 }
 
+function createQuadraticBezier(start: VecLike, control: VecLike, end: VecLike) {
+	return new CubicBezier2d({
+		start: new Vec(start.x, start.y),
+		cp1: new Vec(
+			start.x + (control.x - start.x) * (2 / 3),
+			start.y + (control.y - start.y) * (2 / 3)
+		),
+		cp2: new Vec(
+			end.x + (control.x - end.x) * (2 / 3),
+			end.y + (control.y - end.y) * (2 / 3)
+		),
+		end: new Vec(end.x, end.y),
+	})
+}
+
+function getRoundedElbowPathInfo(sourceX: number, sourceY: number, targetX: number, targetY: number): BranchPathInfo {
+	const horizontalDistance = targetX - sourceX
+	const verticalDistance = targetY - sourceY
+
+	if (Math.abs(horizontalDistance) < 0.5 || Math.abs(verticalDistance) < 0.5) {
+		return {
+			path: `M ${sourceX} ${sourceY} L ${targetX} ${targetY}`,
+			geometry: [createLinearBezier({ x: sourceX, y: sourceY }, { x: targetX, y: targetY })],
+		}
+	}
+
+	const horizontalDirection = Math.sign(horizontalDistance)
+	const verticalDirection = Math.sign(verticalDistance)
+	const elbowX = sourceX + horizontalDistance / 2
+	const radius = Math.min(12, Math.abs(horizontalDistance) / 2, Math.abs(verticalDistance) / 2)
+	const firstSegmentEnd = { x: elbowX - horizontalDirection * radius, y: sourceY }
+	const firstCornerEnd = { x: elbowX, y: sourceY + verticalDirection * radius }
+	const verticalSegmentEnd = { x: elbowX, y: targetY - verticalDirection * radius }
+	const secondCornerEnd = { x: elbowX + horizontalDirection * radius, y: targetY }
+	const target = { x: targetX, y: targetY }
+
+	return {
+		path: [
+			`M ${sourceX} ${sourceY}`,
+			`L ${firstSegmentEnd.x} ${firstSegmentEnd.y}`,
+			`Q ${elbowX} ${sourceY} ${firstCornerEnd.x} ${firstCornerEnd.y}`,
+			`L ${verticalSegmentEnd.x} ${verticalSegmentEnd.y}`,
+			`Q ${elbowX} ${targetY} ${secondCornerEnd.x} ${secondCornerEnd.y}`,
+			`L ${target.x} ${target.y}`,
+		].join(' '),
+		geometry: [
+			createLinearBezier({ x: sourceX, y: sourceY }, firstSegmentEnd),
+			createQuadraticBezier(firstSegmentEnd, { x: elbowX, y: sourceY }, firstCornerEnd),
+			createLinearBezier(firstCornerEnd, verticalSegmentEnd),
+			createQuadraticBezier(verticalSegmentEnd, { x: elbowX, y: targetY }, secondCornerEnd),
+			createLinearBezier(secondCornerEnd, target),
+		],
+	}
+}
+
 function getBranchPathInfo(
 	rootX: number,
 	rootY: number,
@@ -69,7 +219,9 @@ function getBranchPathInfo(
 ): BranchPathInfo {
 	const sourceX = child.sourceX ?? rootX
 	const sourceY = child.sourceY ?? rootY
-	const elbowX = sourceX + (child.side === 'left' ? -24 : 24)
+	const horizontalDistance = child.targetX - sourceX
+	const horizontalDirection = Math.sign(horizontalDistance) || (child.side === 'left' ? -1 : 1)
+	const curveControlDistance = Math.min(72, Math.abs(horizontalDistance) * 0.38)
 
 	switch (lineStyle) {
 		case 'frame-floating':
@@ -85,25 +237,21 @@ function getBranchPathInfo(
 				],
 			}
 		case 'elbow-solid':
-			return {
-				path: `M ${sourceX} ${sourceY} L ${elbowX} ${sourceY} L ${elbowX} ${child.targetY} L ${child.targetX} ${child.targetY}`,
-				geometry: [
-					createLinearBezier({ x: sourceX, y: sourceY }, { x: elbowX, y: sourceY }),
-					createLinearBezier({ x: elbowX, y: sourceY }, { x: elbowX, y: child.targetY }),
-					createLinearBezier({ x: elbowX, y: child.targetY }, { x: child.targetX, y: child.targetY }),
-				],
-			}
+			return getRoundedElbowPathInfo(sourceX, sourceY, child.targetX, child.targetY)
+		case 'tree-table':
+			return { path: '', geometry: [] }
 		case 'curve-dashed':
 		case 'curve-solid': {
-			const stemX = sourceX + (child.side === 'left' ? -24 : 24)
+			const stemX = sourceX + horizontalDirection * curveControlDistance
+			const targetControlX = child.targetX - horizontalDirection * curveControlDistance
 			return {
-				path: `M ${sourceX} ${sourceY} C ${stemX} ${sourceY}, ${child.midX} ${child.targetY}, ${child.targetX} ${child.targetY}`,
+				path: `M ${sourceX} ${sourceY} C ${stemX} ${sourceY}, ${targetControlX} ${child.targetY}, ${child.targetX} ${child.targetY}`,
 				strokeDasharray: lineStyle === 'curve-dashed' ? CURVE_DASHARRAY : undefined,
 				geometry: [
 					new CubicBezier2d({
 						start: new Vec(sourceX, sourceY),
 						cp1: new Vec(stemX, sourceY),
-						cp2: new Vec(child.midX, child.targetY),
+						cp2: new Vec(targetControlX, child.targetY),
 						end: new Vec(child.targetX, child.targetY),
 					}),
 				],
@@ -262,6 +410,12 @@ function hitTestBranchTargetLineSegment(
 				distanceToBranchTarget(target, A, filters) <= distance ||
 				distanceToBranchTarget(target, B, filters) <= distance
 			)
+		case 'line':
+			return (
+				lineSegmentsIntersect(A, B, { x: target.x1, y: target.y1 }, { x: target.x2, y: target.y2 }) ||
+				distanceToLineSegment(A, { x: target.x1, y: target.y1 }, { x: target.x2, y: target.y2 }) <= distance + target.hitWidth ||
+				distanceToLineSegment(B, { x: target.x1, y: target.y1 }, { x: target.x2, y: target.y2 }) <= distance + target.hitWidth
+			)
 		case 'circle':
 			return distanceToLineSegment(target, A, B) <= target.r + BRANCH_HIT_SLOP + distance
 	}
@@ -275,6 +429,8 @@ function distanceToBranchTarget(target: BranchHitTarget, point: VecLike, filters
 			if (target.filled && distanceToRect(point, target.x, target.y, target.w, target.h) === 0) return 0
 			return Math.max(0, distanceToRectStroke(point, target.x, target.y, target.w, target.h) - target.hitWidth)
 		}
+		case 'line':
+			return Math.max(0, distanceToLineSegment(point, { x: target.x1, y: target.y1 }, { x: target.x2, y: target.y2 }) - target.hitWidth)
 		case 'circle': {
 			const distanceFromCenter = Math.hypot(point.x - target.x, point.y - target.y)
 			if (target.filled && distanceFromCenter <= target.r) return 0
@@ -382,7 +538,7 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 			lineStyle: 'curve-solid',
 			snapDistance: 160,
 			showBackground: false,
-			version: 6,
+			version: 7,
 		}
 	}
 
@@ -393,8 +549,9 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 		const hitTargets: BranchHitTarget[] = []
 		const lineWidth = Math.max(shape.props.lineWidth || 3, 1)
 		const isFloatingStyle = isFloatingFrameStyle(lineStyle)
+		const isTreeTable = isTreeTableStyle(lineStyle)
 		const isAutoFrameEnhanced = info.autoFrame.enabled
-		const showBackground = shape.props.showBackground === true
+		const showBackground = shape.props.showBackground === true && !isTreeTable
 		const isEmpty = !info.rootShapeId && info.children.length === 0
 
 		if (isAutoFrameEnhanced && !isFloatingStyle) {
@@ -437,6 +594,50 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 				h: Math.max(shape.props.h - OUTER_FRAME_INSET * 2, 1),
 				hitWidth: getVisibleStrokeHitWidth(OUTER_FRAME_STROKE_WIDTH),
 			})
+		}
+
+		if (isTreeTable) {
+			const tableRootRadius = isEmpty ? EMPTY_BRANCH_RADIUS : info.rootRadius
+			const table = getTreeTableLayout(info.rootBounds, info.rootX, info.rootY, tableRootRadius, info.children)
+			const tableOutline = getTreeTableOutline(table, lineWidth)
+			children.push(
+				new Rectangle2d({
+					x: tableOutline.x,
+					y: tableOutline.y,
+					width: tableOutline.w,
+					height: tableOutline.h,
+					isFilled: false,
+				})
+			)
+			hitTargets.push({
+				type: 'rect',
+				x: tableOutline.x,
+				y: tableOutline.y,
+				w: tableOutline.w,
+				h: tableOutline.h,
+				hitWidth: getVisibleStrokeHitWidth(lineWidth),
+			})
+			for (const column of table.columns) {
+				hitTargets.push({
+					type: 'line',
+					x1: column.dividerX,
+					y1: tableOutline.y,
+					x2: column.dividerX,
+					y2: tableOutline.y + tableOutline.h,
+					hitWidth: getVisibleStrokeHitWidth(lineWidth),
+				})
+				const rowDividerBounds = getTreeTableRowDividerBounds(column, tableOutline)
+				for (const y of column.rowDividers) {
+					hitTargets.push({
+						type: 'line',
+						x1: rowDividerBounds.x1,
+						y1: y,
+						x2: rowDividerBounds.x2,
+						y2: y,
+						hitWidth: getVisibleStrokeHitWidth(lineWidth),
+					})
+				}
+			}
 		}
 
 		if (info.rootBounds) {
@@ -562,6 +763,10 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 		const lineWidth = Math.max(shape.props.lineWidth || 3, 1)
 		const lineStyle = getBranchLineStyle(shape)
 		const isFloatingStyle = isFloatingFrameStyle(lineStyle)
+		const isTreeTable = isTreeTableStyle(lineStyle)
+		const treeTable = isTreeTable
+			? getTreeTableLayout(info.rootBounds, info.rootX, info.rootY, isEmpty ? EMPTY_BRANCH_RADIUS : info.rootRadius, info.children)
+			: null
 		const hasRootContent = !!info.rootShapeId && !!info.rootBounds
 		const interactionHint = useBranchInteractionHintForBranch(shape.id as string)
 		const isAttachTarget = interactionHint?.mode === 'attach' && interactionHint.branchId === shape.id
@@ -571,14 +776,17 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 		const isMovingBranch = interactionHint?.mode === 'move-branch' && interactionHint.branchId === shape.id
 		const activeSide = isAttachTarget ? interactionHint.side : null
 		const accentColor = isDetachTarget ? '#ef4444' : isAttachTarget ? '#22c55e' : '#3b82f6'
-		const rootHaloRadius = info.rootRadius + (isAttachTarget ? (isAbsorbingShape ? 11 : 10) : isMovingBranch ? 7 : isDetachTarget ? 8 : 0)
 		const showHint = isAttachTarget || isDetachTarget || isMovingBranch
+		const treeTableOutline = treeTable ? getTreeTableOutline(treeTable, lineWidth) : null
+		const treeTableStroke = showHint ? accentColor : color
+		const rootHaloRadius = info.rootRadius + (isAttachTarget ? (isAbsorbingShape ? 11 : 10) : isMovingBranch ? 7 : isDetachTarget ? 8 : 0)
 		const isAutoFrameEnhanced = info.autoFrame.enabled
-		const showBackground = shape.props.showBackground === true
+		const showBackground = shape.props.showBackground === true && !isTreeTable
 		const backgroundInset = isAutoFrameEnhanced ? 2 : 1
 		const backgroundOpacity = isAutoFrameEnhanced ? 0.12 : 0.08
 		const backgroundRx = isAutoFrameEnhanced ? 12 : 8
-		const showAutoOuterFrame = isAutoFrameEnhanced && !isFloatingStyle
+		const showAutoOuterFrame = isAutoFrameEnhanced && !isFloatingStyle && !isTreeTable
+		const isNestedTreeTable = isTreeTable && info.isNestedInTreeTable
 		const floatingFrameInset = OUTER_FRAME_INSET
 		const floatingFrameStrokeWidth = OUTER_FRAME_STROKE_WIDTH
 		const floatingFrameOpacity = OUTER_FRAME_OPACITY
@@ -586,7 +794,6 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 		const floatingFrameRx = OUTER_FRAME_RX
 		const floatingRootOuterRadius = info.rootRadius + 5
 		const floatingRootInnerRadius = Math.max(info.rootRadius - 1, 4)
-
 		return (
 			<SVGContainer className="BranchShape">
 				<rect
@@ -625,6 +832,55 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 						opacity={backgroundOpacity}
 						pointerEvents="none"
 					/>
+				)}
+				{treeTable && treeTableOutline && (
+					<g pointerEvents="none">
+						{!isNestedTreeTable && (
+							<rect
+								x={treeTableOutline.x}
+								y={treeTableOutline.y}
+								width={treeTableOutline.w}
+								height={treeTableOutline.h}
+								rx={4}
+								ry={4}
+								fill="none"
+								stroke={treeTableStroke}
+								strokeWidth={showHint ? lineWidth + 1.5 : lineWidth}
+								strokeDasharray={isDetachTarget ? DETACH_DASHARRAY : undefined}
+								opacity={0.86}
+							/>
+						)}
+						{treeTable.columns.map((column) => (
+							<g key={column.side}>
+								<line
+									x1={column.dividerX}
+									y1={treeTableOutline.y}
+									x2={column.dividerX}
+									y2={treeTableOutline.y + treeTableOutline.h}
+									stroke={treeTableStroke}
+									strokeWidth={showHint ? lineWidth + 1.5 : lineWidth}
+									strokeDasharray={isDetachTarget ? DETACH_DASHARRAY : undefined}
+									opacity={0.82}
+								/>
+								{(() => {
+									const rowDividerBounds = getTreeTableRowDividerBounds(column, treeTableOutline)
+									return column.rowDividers.map((y, index) => (
+										<line
+											key={index}
+											x1={rowDividerBounds.x1}
+											y1={y}
+											x2={rowDividerBounds.x2}
+											y2={y}
+											stroke={treeTableStroke}
+											strokeWidth={showHint ? lineWidth + 1.5 : lineWidth}
+											strokeDasharray={isDetachTarget ? DETACH_DASHARRAY : undefined}
+											opacity={0.9}
+										/>
+									))
+								})()}
+							</g>
+						))}
+					</g>
 				)}
 				{isFloatingStyle && (
 					<rect
@@ -717,7 +973,7 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 					</g>
 				)}
 				{hasRootContent ? (
-					info.rootBounds ? (
+					isTreeTable ? null : info.rootBounds ? (
 						<rect
 							x={info.rootBounds.x - 3}
 							y={info.rootBounds.y - 3}
@@ -779,7 +1035,7 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 						opacity={hasChildren || showHint ? 1 : 0.9}
 					/>
 				)}
-				{hasChildren && !isFloatingStyle && (
+				{hasChildren && !isFloatingStyle && !isTreeTable && (
 					<g fill="none" stroke={color} strokeWidth={lineWidth} strokeLinecap="round" strokeLinejoin="round">
 						{info.children.map((child) => {
 							const pathInfo = getBranchPathInfo(info.rootX, info.rootY, child, lineStyle)
@@ -825,7 +1081,7 @@ export class BranchShapeUtil extends ShapeUtil<IBranchShape> {
 				) : (
 					<circle cx={info.rootX} cy={info.rootY} r={info.rootRadius} />
 				)}
-				{lineStyle !== 'frame-floating' && info.children.map((child) => {
+				{lineStyle !== 'frame-floating' && lineStyle !== 'tree-table' && info.children.map((child) => {
 					const pathInfo = getBranchPathInfo(info.rootX, info.rootY, child, lineStyle)
 					return (
 						<path
