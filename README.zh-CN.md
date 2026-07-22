@@ -10,7 +10,6 @@ STEVETOOLS—TLDRAW
 ## 请不要把此插件和STtools插件共用，可能会有未知BUG
 若仅需 STtools 的白板功能，建议卸载 STtools 并改用本插件的白板；若仍需 STtools 的其它功能，则可继续使用 STtools，无需安装本插件。
 #### 此插件数据和STtools中的白板模块数据相通，但不要同时使用这两个插件，可从此插件转用STtools插件
-#### 但之后不能从STtools转入此插件（可能存在版本冲突）
 
 #### [使用方式](https://ld246.com/article/1767024223066)（[更多使用细节](https://ld246.com/search?q=STtools%20%E6%8F%92%E4%BB%B6%EF%BC%9A%E7%99%BD%E6%9D%BF)）
 
