@@ -30,6 +30,7 @@ import type { ICardShape } from '../../../../CardShape/card-shape-types';
 import { invalidateCache } from '../../../../block-html-cache';
 import { createMindMapNode } from '../../../../MindMapShape/mind-map-shape-types';
 import { DEFAULT_SCRIPT } from '../../../../JsShape/static';
+import { getJsShapeRuntimeStatus, reportJsShapeRuntimeStatus, waitForJsShapeRuntimeStatus, type JsShapeRuntimeStatus } from '../../../../JsShape/runtime-status';
 import { buildTldrawLink } from '../../../../utils/link-builder';
 import { convertConnectorsToArrow, convertConnectorsToBezier } from '../../../../utils/connector-convert';
 import { insertDocOutlineMindmapForAgent, type AgentDocOutlineBoardOptions } from '../documents/doc-to-board';
@@ -600,6 +601,7 @@ export async function runAgentShapeCommand(
         const semanticPatch = omitAgentContentPatchFields(patch);
         const changedFields: string[] = [];
         let contentWrite: Record<string, unknown> | undefined;
+		let runtimeDiagnostic: JsShapeRuntimeStatus | undefined;
 
         if (contentMarkdown !== undefined) {
             if (contentMode !== 'replace') {
@@ -627,9 +629,18 @@ export async function runAgentShapeCommand(
             const updateResult = applySemanticShapePatch(shape, semanticPatch);
             if (updateResult.errors.length) errors.push(...updateResult.errors.map((error) => `${shapeId}: ${error}`));
             if (updateResult.changedFields.length && updateResult.update) {
+				if (shape.type === 'js-shape' && updateResult.changedFields.includes('script')) {
+					reportJsShapeRuntimeStatus(String(shape.id), { state: 'running' });
+				}
                 editor.updateShape(updateResult.update as any);
                 updatedShapeIds.push(String(shape.id));
                 changedFields.push(...updateResult.changedFields);
+				if (shape.type === 'js-shape' && updateResult.changedFields.includes('script')) {
+					runtimeDiagnostic = await waitForJsShapeRuntimeStatus(String(shape.id), 500);
+					if (runtimeDiagnostic?.state === 'error' || runtimeDiagnostic?.state === 'disabled') {
+						errors.push(`${shapeId}: ${runtimeDiagnostic.message || `script ${runtimeDiagnostic.state}`}`);
+					}
+				}
             }
         }
 
@@ -652,6 +663,7 @@ export async function runAgentShapeCommand(
             changedFields: uniqueStrings(changedFields),
         };
         if (contentWrite) item.contentWrite = contentWrite;
+		if (runtimeDiagnostic) item.runtime = runtimeDiagnostic;
         items.push(item);
     }
 
@@ -765,6 +777,26 @@ async function executeAgentShapeCommandCreate(
         for (let index = 0; index < rawNodes.length; index++) {
             await validateBoardNodeCreate(rawNodes[index], new Set(), `nodes[${index}]`);
         }
+		const requestedJsShape = rawNodes.some((node) => node.kind === 'js-shape');
+		const failedSelectedJsShapeIds = requestedJsShape ? getSelectedFailedJsShapeIds(editor) : [];
+		if (failedSelectedJsShapeIds.length) {
+			return {
+				ok: false,
+				intent: request.intent,
+				whiteboardId: runtime.id,
+				target: request.target,
+				items: [{
+					correction: {
+						action: 'tldraw_shape_command',
+						intent: 'updateShape',
+						target: failedSelectedJsShapeIds[0],
+						shapeIds: failedSelectedJsShapeIds,
+						instruction: 'A selected JS shape has a runtime error. Do not create a duplicate. Correct the complete script and call updateShape on this original shape ID with patch:{script:"..."}.',
+					},
+				}],
+				errors: [`Selected JS shape ${failedSelectedJsShapeIds[0]} has an unresolved runtime error; update that original shape instead of creating another JS shape.`],
+			};
+		}
 
         const createdIds: string[] = [];
         const created: Record<string, string[]> = {};
@@ -796,9 +828,13 @@ async function executeAgentShapeCommandCreate(
         if (request.select !== false && createdIds.length) editor.setSelectedShapes(createdIds as TLShapeId[]);
         if (request.zoom !== false && createdIds.length) focusAgentShapesById(editor, createdIds);
         const saved = await persistShapeCommandIfNeeded(runtime, state, request.save);
+		const runtimeDiagnostics = await collectJsShapeRuntimeDiagnostics(editor, createdIds);
+		const runtimeErrors = runtimeDiagnostics
+			.filter((item) => item.runtime?.state === 'error' || item.runtime?.state === 'disabled')
+			.map((item) => `${item.shapeId}: ${item.runtime?.message || `script ${item.runtime?.state}`}`);
 
         return {
-            ok: true,
+            ok: runtimeErrors.length === 0,
             intent: request.intent,
             whiteboardId: runtime.id,
             target: request.target,
@@ -808,13 +844,31 @@ async function executeAgentShapeCommandCreate(
                 createdShapeIds: createdIds,
                 externalCreatedBlockIds: uniqueStrings(state.externalCreatedBlockIds),
                 counts: state.counts,
+				runtimeDiagnostics,
             }],
-            errors: [],
+			errors: runtimeErrors,
             saved,
         };
     } catch (error) {
         return { ok: false, intent: request.intent, whiteboardId: runtime.id, target: request.target, updatedShapeIds: state.committedShapeIds, errors: [stringifyAgentError(error)], saved: state.saved };
     }
+}
+
+/** Gives the mounted JS ShapeUtil a short window to report execution success or a safe error message. */
+async function collectJsShapeRuntimeDiagnostics(editor: Editor, shapeIds: string[]) {
+    const jsShapeIds = uniqueStrings(shapeIds).filter((shapeId) => editor.getShape(shapeId as TLShapeId)?.type === 'js-shape');
+    return Promise.all(jsShapeIds.map(async (shapeId) => ({
+        shapeId,
+        runtime: await waitForJsShapeRuntimeStatus(shapeId, 500),
+    })));
+}
+
+/** Prevents Agent retry loops from turning a broken selected JS shape into duplicate shapes. */
+function getSelectedFailedJsShapeIds(editor: Editor): string[] {
+	return editor.getSelectedShapeIds()
+		.filter((shapeId) => editor.getShape(shapeId)?.type === 'js-shape')
+		.filter((shapeId) => getJsShapeRuntimeStatus(String(shapeId))?.state === 'error')
+		.map(String);
 }
 
 async function executeAgentShapeCommandConnect(
@@ -1117,6 +1171,7 @@ function describeEditableShape(shape: TLShape): AgentEditableFieldSpec[] {
             commonColor,
             booleanField('interactive', props.interactive, 'Allow rendered DOM to receive pointer events.'),
             booleanField('restrictDom', props.restrictDom !== false, 'Restrict script DOM access to the shape container.'),
+			writeOnlyStringField('script', 'Replace the JavaScript source. The current source is never returned to Agent.'),
         ];
     }
 
@@ -1178,6 +1233,30 @@ function applySemanticShapePatch(
             hasUpdate = true;
             continue;
         }
+
+		if (key === 'script') {
+			if (shape.type !== 'js-shape') {
+				errors.push('script is only supported for js-shape');
+				continue;
+			}
+			const next = stringPatchValue(value, key, errors)?.trim();
+			if (!next) {
+				errors.push('script cannot be empty');
+				continue;
+			}
+			try {
+				validateAgentJsShapeScript(next, 'script');
+			} catch (error) {
+				errors.push(stringifyAgentError(error));
+				continue;
+			}
+			if (currentProps.script !== next) {
+				props.script = next;
+				changedFields.push(key);
+				hasUpdate = true;
+			}
+			continue;
+		}
 
         if (
             key === 'w' ||
@@ -1351,6 +1430,11 @@ function enumField(name: string, current: unknown, enumValues: string[], descrip
 
 function stringField(name: string, current: unknown, description: string): AgentEditableFieldSpec {
     return { name, kind: 'string', current: typeof current === 'string' ? current : '', writable: true, description };
+}
+
+/** Declares a writable field without leaking executable source back into the Agent context. */
+function writeOnlyStringField(name: string, description: string): AgentEditableFieldSpec {
+    return { name, kind: 'string', current: '[write-only]', writable: true, description };
 }
 
 function numberPatchValue(value: unknown, key: string, errors: string[], min: number, max: number, fallback: number): number | undefined {
@@ -1557,7 +1641,7 @@ async function validateBoardNodeCreate(
 ) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
     const node = value as AgentBoardNodeCreate;
-    assertBoardEditKeys(node as any, ['as', 'kind', 'x', 'y', 'w', 'h', 'color', 'blockId', 'contentMarkdown', 'text', 'title', 'name', 'geo', 'direction', 'theme', 'isMain', 'isCollapsed', 'showMask'], label);
+    assertBoardEditKeys(node as any, ['as', 'kind', 'x', 'y', 'w', 'h', 'color', 'blockId', 'contentMarkdown', 'text', 'title', 'name', 'geo', 'direction', 'theme', 'isMain', 'isCollapsed', 'showMask', 'script', 'data', 'interactive', 'restrictDom'], label);
     const kind = String(node.kind || '');
     if (!AGENT_BOARD_EDIT_NODE_KINDS.has(kind)) {
         throw new Error(`${label}.kind must be card, single-block, text, frame, note, geo, slide, mind-map, or js-shape`);
@@ -1578,6 +1662,38 @@ async function validateBoardNodeCreate(
             throw new Error(`${label}: single-block cannot set blockId together with contentMarkdown/text/title`);
         }
         await validateAgentLinkedBlockId(blockId, 'single-block');
+    }
+	if (kind === 'js-shape') {
+        const script = stringValue(node.script);
+        if (!script) throw new Error(`${label}.script is required for js-shape`);
+		validateAgentJsShapeScript(script, `${label}.script`);
+		if (node.interactive !== undefined && typeof node.interactive !== 'boolean') {
+			throw new Error(`${label}.interactive must be boolean`);
+		}
+		if (node.restrictDom !== undefined && typeof node.restrictDom !== 'boolean') {
+			throw new Error(`${label}.restrictDom must be boolean`);
+		}
+		if (node.data !== undefined) {
+			if (typeof node.data !== 'string') throw new Error(`${label}.data must be a JSON string`);
+			try {
+				JSON.parse(node.data);
+			} catch {
+				throw new Error(`${label}.data must contain valid JSON`);
+			}
+		}
+	} else if (node.script !== undefined || node.data !== undefined || node.interactive !== undefined || node.restrictDom !== undefined) {
+		throw new Error(`${label}.script, data, interactive, and restrictDom are only supported for js-shape`);
+    }
+}
+
+/** Validates syntax without evaluating Agent-provided code or performing its side effects. */
+function validateAgentJsShapeScript(script: string, label: string) {
+    if (script.length > 50000) throw new Error(`${label} exceeds the 50000 character limit`);
+    if (/^```/.test(script)) throw new Error(`${label} must be JavaScript only; omit Markdown code fences`);
+    try {
+        new Function('api', 'env', '__doc', `'use strict'\nconst document=__doc;\n${script}`);
+    } catch (error) {
+        throw new Error(`${label} has a syntax error: ${stringifyAgentError(error)}`);
     }
 }
 
@@ -1719,6 +1835,10 @@ async function createBoardEditNode(
         zoom: false,
         direction: normalizeAgentMindMapDirection(node.direction),
         theme: normalizeAgentMindMapTheme(node.theme),
+        script: stringValue(node.script),
+        data: stringValue(node.data),
+        interactive: node.interactive,
+        restrictDom: node.restrictDom,
     };
     const size = getAgentCreateShapeSize(options.kind, options);
     const position = resolveAgentCreatePosition(editor, options.kind, {
@@ -4025,6 +4145,11 @@ function summarizeAgentShape(
     includeBindings = false,
     blockContent?: AgentLinkedBlockContent,
 ): AgentShapeSummary {
+    const props = summarizeShapeProps((shape as any).props, editor, blockContent);
+    if (shape.type === 'js-shape') {
+		const runtime = getJsShapeRuntimeStatus(String(shape.id));
+		if (runtime) props.runtime = runtime;
+	}
     const summary: AgentShapeSummary = {
         id: String(shape.id),
         type: String(shape.type),
@@ -4034,7 +4159,7 @@ function summarizeAgentShape(
         rotation: Number((shape as any).rotation || 0),
         parentId: String((shape as any).parentId || ''),
         index: String((shape as any).index || ''),
-        props: summarizeShapeProps((shape as any).props, editor, blockContent),
+        props,
     };
     if (includeBindings) {
         summary.bindings = [
@@ -4273,7 +4398,22 @@ function buildAgentBasicShape(id: TLShapeId, options: AgentBasicShapeCreateArgs,
     if (options.kind === 'mind-map') {
         return { id, type: 'mind-map', x, y, props: { w, h, color, rootNode: createMindMapNode(text || '涓績涓婚'), horizontalGap: 50, verticalGap: 20, nodeWidth: 120, nodeHeight: 36, fontSize: 14, lineWidth: 2, direction: options.direction || 'right', theme: options.theme || 'default', blockId: options.blockId, version: 1, refreshNonce: Date.now() } };
     }
-    return { id, type: 'js-shape', x, y, props: { w, h, color, script: DEFAULT_SCRIPT, autoRun: false, interactive: false, restrictDom: true, data: JSON.stringify({ createdBy: 'siyuan-agent', note: clampAgentText(text, 500) }) } };
+    return {
+        id,
+        type: 'js-shape',
+        x,
+        y,
+        props: {
+            w,
+            h,
+            color,
+            script: options.script || DEFAULT_SCRIPT,
+            autoRun: false,
+            interactive: options.interactive === true,
+            restrictDom: options.restrictDom !== false,
+            data: options.data || JSON.stringify({ createdBy: 'siyuan-agent', note: clampAgentText(text, 500) }),
+        },
+    };
 }
 
 function resolveAgentConnectorEndpoints(editor: Editor, options: AgentConnectorCreateArgs) {

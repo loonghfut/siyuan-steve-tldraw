@@ -112,32 +112,76 @@ function getBestCollapsedTextSize(shape: ICardShape, measureRoot: HTMLElement): 
     return best
 }
 
+function getVisibleContentHeight(element: HTMLElement) {
+    const top = element.getBoundingClientRect().top
+    let bottom = top
+    const textWalker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
+    let textNode: Text | null
+
+    while ((textNode = textWalker.nextNode() as Text | null)) {
+        if (!textNode.data.trim()) continue
+
+        const range = document.createRange()
+        range.selectNodeContents(textNode)
+        for (const rect of Array.from(range.getClientRects())) {
+            if (rect.height > 0) bottom = Math.max(bottom, rect.bottom)
+        }
+    }
+
+    // Text ranges do not cover non-text content such as images and embeds.
+    for (const child of Array.from(element.querySelectorAll<HTMLElement>(
+        'img, video, audio, iframe, canvas, svg, [data-type="NodeBlockQueryEmbed"]'
+    ))) {
+        if (getComputedStyle(child).display === 'none') continue
+        const rect = child.getBoundingClientRect()
+        if (rect.height > 0) bottom = Math.max(bottom, rect.bottom)
+    }
+
+    // Keep the regular box measurement as a fallback for content which has no
+    // text range or supported media element (for example, a custom widget).
+    if (bottom === top) return Math.ceil(element.scrollHeight)
+
+    const paddingBottom = Number.parseFloat(getComputedStyle(element).paddingBottom) || 0
+    return Math.ceil(bottom - top + paddingBottom)
+}
+
 function getShrunkCardHeight(shape: ICardShape): number | null {
     const host = getShapeHostElement(shape.id as string)
     const container = host?.querySelector<HTMLElement>('[blockid]') || null
     const source = container?.querySelector<HTMLElement>('.protyle-wysiwyg') || null
-    if (!container || !source || source.childElementCount === 0 || container.clientWidth <= 0) return null
+    if (!container || !source || source.childElementCount === 0 || source.offsetWidth <= 0) return null
+
+    // Preserve the source's tldraw parent selector while measuring. In particular,
+    // it resets Siyuan's `.render-node` min-height; measuring the clone directly
+    // under `body` otherwise adds a blank line to short cards.
+    const measureRoot = document.createElement('div')
+    measureRoot.className = 'tl-html-container'
+    measureRoot.style.position = 'fixed'
+    measureRoot.style.left = '-10000px'
+    measureRoot.style.top = '0'
+    measureRoot.style.visibility = 'hidden'
+    measureRoot.style.pointerEvents = 'none'
+    measureRoot.style.width = `${source.offsetWidth}px`
+    measureRoot.style.contain = 'layout style'
 
     const clone = source.cloneNode(true) as HTMLElement
-    clone.style.position = 'fixed'
-    clone.style.left = '-10000px'
-    clone.style.top = '0'
-    clone.style.visibility = 'hidden'
-    clone.style.pointerEvents = 'none'
-    clone.style.width = `${container.clientWidth}px`
+    clone.style.width = '100%'
     clone.style.height = 'auto'
     clone.style.minHeight = '0'
     clone.style.maxHeight = 'none'
     clone.style.overflow = 'visible'
     clone.style.boxSizing = 'border-box'
-    document.body.appendChild(clone)
+    measureRoot.appendChild(clone)
+    document.body.appendChild(measureRoot)
 
     try {
-        const contentHeight = Math.ceil(clone.getBoundingClientRect().height)
-        const cardChromeHeight = Math.max(0, shape.props.h - container.clientHeight)
+        const contentHeight = getVisibleContentHeight(clone)
+        // Account for the card border and the content container's padding using
+        // the actual source element, rather than assuming the container fills h.
+        const cardChromeHeight = Math.max(0, shape.props.h - source.offsetHeight)
         return Math.max(CARD_AUTO_SHRINK_MIN_HEIGHT, contentHeight + cardChromeHeight)
     } finally {
-        clone.remove()
+        measureRoot.remove()
     }
 }
 
@@ -334,6 +378,7 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
                     <TldrawUiButton
                         type="normal"
                         className={`tlui-toggle-button ${collapsedState === true ? 'tlui-toggle-button--active' : collapsedState === 'mixed' ? 'tlui-toggle-button--mixed' : ''}`}
+                        aria-pressed={collapsedState === true}
                         onClick={() => {
                             const nextCollapsed = collapsedState === 'mixed' ? true : !collapsedState
                             editor.run(() => {
@@ -344,12 +389,6 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
                         }}
                         title={collapsedState === true ? '展开选中的卡片' : '折叠选中的卡片'}
                         aria-label="切换卡片折叠状态"
-                        style={{
-                            fontWeight: collapsedState === true ? 700 : undefined,
-                            background: collapsedState === true ? 'var(--tl-color-muted-2)' : undefined,
-                            color: collapsedState === true ? 'var(--b3-theme-on-surface, var(--color-text))' : undefined,
-                            opacity: collapsedState === 'mixed' ? 0.85 : undefined,
-                        }}
                     >
                         <TldrawUiIcon label="" icon={collapsedState === true ? 'card-expand' : 'card-collapse'} />
                     </TldrawUiButton>
@@ -387,7 +426,7 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
                             })
                         }}
                     />
-                    <div className="tlui-toggle-button-row" style={{ marginTop: '4px' }}>
+                    <div className="tlui-toggle-button-row">
                         <TldrawUiButton
                             type="normal"
                             className="tlui-toggle-button"
@@ -402,8 +441,7 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
 
                 <div className="tlui-style-panel__section">
                     {/* 折叠后文字对齐方式 */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                        <div style={{ display: 'flex', gap: '0px' }}>
+                    <div className="tlui-custom-button-row">
                             {([
                                 { value: 'left', label: '靠左', icon: 'text-align-left-custom' },
                                 { value: 'center', label: '居中', icon: 'text-align-center-custom' },
@@ -411,8 +449,9 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
                             ] as const).map(({ value, label, icon }) => (
                                 <TldrawUiButton
                                     key={value}
-                                    type={collapsedTextAlignValue === value ? 'primary' : 'normal'}
-                                    style={{ flex: '1 1 0', minWidth: '0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                                    type="normal"
+                                    className={collapsedTextAlignValue === value ? 'tlui-toggle-button--active' : collapsedTextAlignValue === 'mixed' ? 'tlui-toggle-button--mixed' : undefined}
+                                    aria-pressed={collapsedTextAlignValue === value}
                                     onClick={() => {
                                         if (!selectedCardShapes.length) return
                                         editor.run(() => {
@@ -430,7 +469,6 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
                                     <TldrawUiIcon label="" icon={icon} />
                                 </TldrawUiButton>
                             ))}
-                        </div>
                     </div>
                 </div>
             </>}
@@ -471,11 +509,9 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
 
             {selectedMainCard && (
                 <div className="tlui-style-panel__section">
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                        <div style={{ display: 'flex', gap: '0px' }}>
+                    <div className="tlui-custom-button-row">
                             <TldrawUiButton
                                 type="normal"
-                                style={{ flex: '1 1 0', minWidth: '0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                                 disabled={insertingChildDocs}
                                 onClick={() => { void handleInsertAllChildDocs() }}
                                 title="插入全部子文档"
@@ -484,14 +520,12 @@ export const CardStyleSection: React.FC<CardStyleSectionProps> = ({
                             </TldrawUiButton>
                             <TldrawUiButton
                                 type="normal"
-                                style={{ flex: '1 1 0', minWidth: '0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                                 disabled={insertingOutline}
                                 onClick={() => { void handleInsertAllOutline() }}
                                 title="插入全部大纲块"
                             >
                                 <TldrawUiIcon label="" icon={insertingOutline ? 'loading-spinner' : 'outline-blocks'} />
                             </TldrawUiButton>
-                        </div>
                     </div>
                 </div>
             )}
