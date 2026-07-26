@@ -7,29 +7,21 @@
  */
 
 import { fetchPost, fetchSyncPost, IOperation, IWebSocketData, Protyle } from "siyuan";
-import { ISelectOption } from "@/calendar/interface";
 import { settingdata } from "..";
 import { AVManager } from "./db_pro";
 import {
-    markCalendarCellWrite,
-    type CalendarWriteReason,
-} from "@/calendar/calendar-self-write";
+    notifyAttributeViewCellBatchUpdated,
+    notifyAttributeViewCellQueued,
+    type AVCellWriteOptions,
+} from "./attribute-view-cell-lifecycle";
 // 创建 AVManager 实例 - 可以根据需要进行配置
 const avManager = new AVManager();
 
-/**
- * AV 单元格写入选项。仅在调用方主动声明 source==='calendar' 时影响行为：
- * - markSelfWrite (默认 true): 入队即把 (avID, itemID, keyID) 标记为日历自写，
- *   transactionListener 看到 ws/fetch 回声会跳过 refreshKanban。
- * - suppressPostRefresh (默认 true): 本批结尾的 refreshAttributeView 跳过——
- *   若一批里全部为自写，省掉一次全量 refetch；只要混入一条非自写仍会刷新。
- * 不传 options 时与历史行为完全一致。
- */
-export interface AVCellWriteOptions {
-    source?: 'calendar' | 'other';
-    reason?: CalendarWriteReason;
-    markSelfWrite?: boolean;
-    suppressPostRefresh?: boolean;
+export type { AVCellWriteOptions } from "./attribute-view-cell-lifecycle";
+
+interface ISelectOption {
+    color?: string;
+    content: string;
 }
 
 // 请求队列，使用批量处理优化性能
@@ -319,6 +311,15 @@ export async function updateBlock(dataType: DataType, data: string, id: BlockId)
     return request(url, payload);
 }
 
+export async function batchUpdateTaskListItemMarker(items: Array<{ id: BlockId; marker: string }>): Promise<IResdoOperations[]> {
+    const url = '/api/block/batchUpdateTaskListItemMarker';
+    const result = await request(url, { items });
+    if (!Array.isArray(result)) {
+        throw new Error(`更新任务列表项标记失败: ${String(result)}`);
+    }
+    return result;
+}
+
 
 export async function deleteBlock(id: BlockId): Promise<IResdoOperations[]> {
     let data = {
@@ -485,23 +486,35 @@ export async function getAttributeViewItemIDsByBoundIDs(avID: string, blockIDs: 
     return request(url, data);
 }
 
-export async function renderAttributeView(avid: BlockId, viewID?: string) {
-    let data: any;
-    if (viewID === undefined) {
-        data = {
-            id: avid, // avID,
-            // viewID: '20241003141312-30yk3cr',//测试可以不用这个参数 //TODO：多视图的情况下需要
-            pageSize: 99999,
-            page: 1
-        }
-    } else {
-        data = {
-            id: avid, // avID,
-            viewID: viewID,
-            pageSize: 99999,
-            page: 1
-        }
-    }
+export interface RenderAttributeViewOptions {
+    page?: number;
+    pageSize?: number;
+    query?: string;
+    groupPaging?: Record<string, unknown>;
+    ignoreRows?: boolean;
+}
+
+/**
+ * Render an Attribute View.
+ *
+ * `ignoreRows` is useful for metadata-only reads (for example, enumerating
+ * view IDs). SiYuan then skips row filter/sort/calculation work instead of
+ * building a full view only for callers to discard its rows.
+ */
+export async function renderAttributeView(
+    avid: BlockId,
+    viewID?: string,
+    options: RenderAttributeViewOptions = {},
+) {
+    const data: Record<string, unknown> = {
+        id: avid,
+        pageSize: options.pageSize ?? 99999,
+        page: options.page ?? 1,
+    };
+    if (viewID !== undefined) data.viewID = viewID;
+    if (options.query !== undefined) data.query = options.query;
+    if (options.groupPaging !== undefined) data.groupPaging = options.groupPaging;
+    if (options.ignoreRows !== undefined) data.ignoreRows = options.ignoreRows;
 
     const url = '/api/av/renderAttributeView';
     return request(url, data);
@@ -1023,16 +1036,9 @@ export async function updateAttrViewCell_pro(
             reject
         });
 
-        // 日历自写：入队时立刻登记标记。原因：队列有 150-2000ms 延迟，
-        // ws-main 广播可能在 await batchUpdateCells 返回前到达，提前标记保证
-        // transactionListener 命中。
-        if (options?.source === 'calendar' && options.markSelfWrite !== false) {
-            try {
-                markCalendarCellWrite(avID, itemID, keyID, options.reason);
-            } catch (e) {
-                console.warn('[CalendarSelfWrite] markCalendarCellWrite 失败', e);
-            }
-        }
+        // Notify feature observers synchronously. This happens before the
+        // delayed batch request so self-write markers are ready for ws echoes.
+        notifyAttributeViewCellQueued({ avID, itemID, keyID, options });
 
         // console.debug(`📝 [队列] 添加单元格更新请求，队列当前长度: ${cellUpdateQueue.length}, avID: ${avID}`);
 
@@ -1143,12 +1149,7 @@ async function processQueue() {
 
                 // console.debug(`✅ [批量更新单元格] 成功更新 ${batchUpdates.length} 个单元格，avID: ${avID}`);
                 // 批量更新完成后的后续处理
-                // 仅当本批"全部"为日历自写且未禁用 suppressPostRefresh 时，跳过 refreshKanban。
-                // 混入任何非自写更新仍触发刷新，保证外部调用方行为不变。
-                const allCalendarSelf = updates.every(u =>
-                    u.options?.source === 'calendar' && u.options.suppressPostRefresh !== false
-                );
-                await handlePostBatchUpdateActions(avID, { skipRefresh: allCalendarSelf });
+                await handlePostBatchUpdateActions(avID, updates);
             } else {
                 // 如果没有有效更新，拒绝所有Promise
                 updates.forEach(update => update.reject(new Error('Invalid keyName for update')));
@@ -1174,14 +1175,18 @@ async function processQueue() {
 }
 
 // 处理批量更新完成后的后续操作
-async function handlePostBatchUpdateActions(avID: string, opts?: { skipRefresh?: boolean }) {
+async function handlePostBatchUpdateActions(
+    avID: string,
+    updates: Array<{ avID: string; itemID: string; keyID: string; options?: AVCellWriteOptions }>,
+) {
     try {
-        if (opts?.skipRefresh) {
-            console.debug(`[CalendarSelfWrite] skip post-batch refresh for av ${avID}`);
-            return;
-        }
-        // 1. 触发视图刷新
-        await refreshAttributeView(avID);
+        await notifyAttributeViewCellBatchUpdated({
+            avID,
+            updates,
+            // A feature that owns a local optimistic update can opt out. Any
+            // regular write in the batch still asks observers to refresh.
+            shouldRefresh: updates.some(update => update.options?.suppressPostRefresh !== true),
+        });
 
         //有BUG会漏事件和重复事件
         // // 2. 判断是否为滴答清单事件并处理
@@ -1189,16 +1194,6 @@ async function handlePostBatchUpdateActions(avID: string, opts?: { skipRefresh?:
 
     } catch (error) {
         console.warn(`⚠️ [后续处理] 批量更新后续处理出错，avID: ${avID}`, error);
-    }
-}
-
-// 刷新属性视图
-async function refreshAttributeView(avID: string) {
-    try {
-        refreshKanban();
-        // console.debug(`🔄 [视图刷新] 成功刷新视图，avID: ${avID}`);
-    } catch (error) {
-        console.warn(`⚠️ [视图刷新] 刷新视图失败，avID: ${avID}`, error);
     }
 }
 
@@ -1410,10 +1405,6 @@ async function getDateTimestamps(dateStr: string): Promise<{ start: number, end:
         };
     }
 }
-
-import { refreshKanban } from "@/calendar/kanban";
-
-
 
 // **************************************** Status Bar ****************************************
 export async function showStatusMessage(message: string, timeout: number = 3000, id?: string) {
