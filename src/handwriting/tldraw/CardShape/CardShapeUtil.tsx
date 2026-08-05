@@ -5,6 +5,7 @@ import {
 	ShapeUtil,
 	SvgExportContext,
 	TLResizeInfo,
+	useValue,
 	resizeBox,
 } from '@tldraw/tldraw'
 import { cardShapeMigrations } from './card-shape-migrations'
@@ -17,7 +18,10 @@ import { buildTldrawLink } from '../utils/link-builder';
 import { enqueueProtyleLoad, ProtyleLoadHandle } from '../protyle-load-queue'
 import { shapeLoadManager } from '../shape-load-manager'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
-import { renderAllContent } from '../utils/render/content-renderer'
+import { renderAllContentIdle } from '../utils/render/content-renderer'
+import { cancelIdleRender } from '../utils/idle-scheduler'
+import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
+import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
 import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
 import { exportCardShapeToSvg } from './CardShapeExport'
 import { getCardCollapsedHeight } from './card-collapse'
@@ -211,8 +215,9 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 	static override migrations = cardShapeMigrations
 
 	// [3]
-	override canCull(_shape: ICardShape) {
-		return false
+	override canCull(shape: ICardShape) {
+		// Keep the active editor mounted; all other cards can use tldraw's native culling.
+		return this.editor.getEditingShapeId() !== shape.id
 	}
 	override isAspectRatioLocked(_shape: ICardShape) {
 		return false
@@ -282,16 +287,16 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// const bounds = this.editor.getShapeGeometry(shape).bounds
 		const editor = this.editor
 		const theme = getDefaultColorTheme({ isDarkMode: this.editor.user.getIsDarkMode() })
-		const isEditing = this.editor.getEditingShapeId() === shape.id;
+		const isEditing = useValue('card is editing', () => editor.getEditingShapeId() === shape.id, [editor, shape.id])
 		const branchInteractionHint = useBranchInteractionHint()
 		const isRootAttachTarget =
 			branchInteractionHint?.mode === 'attach' &&
 			branchInteractionHint.slot === 'root' &&
 			(branchInteractionHint.targetShapeId === shape.id ||
 				(!branchInteractionHint.targetShapeId && branchInteractionHint.draggingShapeId === shape.id))
-		const [isEditingState, setIsEditingState] = useState(isEditing);
-		const [isInViewport, setIsInViewport] = useState(true);
-		const [canLoad, setCanLoad] = useState(true); // gating heavy render by global manager
+		const isEditingState = isEditing
+		const [isInViewport, setIsInViewport] = useState(false);
+		const [canLoad, setCanLoad] = useState(false); // gating heavy render by global manager
 		const [hasMissingLinkedBlock, setHasMissingLinkedBlock] = useState(false);
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false;
 		const tldrawHeaderImage = settingdata['tldraw-header-image'] !== false;
@@ -305,6 +310,20 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			titleImgHasUrl?: boolean;
 		} | null>(null);
 		const isCollapsed = shape.props.isCollapsed || false;
+		const efficientZoom = useValue('card efficient zoom', () => editor.getEfficientZoomLevel(), [editor])
+		const visibleCardAndSingleBlockCount = useValue(
+			'card and single-block low-detail count',
+			() => getVisibleCardAndSingleBlockCount(editor),
+			[editor],
+		)
+		const lowDetailThreshold = getShapeLowDetailThreshold()
+		const lowDetailCountThreshold = getShapeLowDetailCountThreshold()
+		const hasEnoughShapesForLowDetail = lowDetailCountThreshold <= 0 || visibleCardAndSingleBlockCount >= lowDetailCountThreshold
+		const isSmallCard = !isEditingState && hasEnoughShapesForLowDetail && lowDetailThreshold > 0 && Math.min(shape.props.w, shape.props.h) * efficientZoom < lowDetailThreshold
+		// Shapes outside the full-preview budget keep their persisted text summary.
+		// This makes viewport culling visually consistent with low-zoom rendering.
+		const shouldUseLightweightPreview = !isEditingState && !isCollapsed && (isSmallCard || !canLoad)
+		const lowDetailFontSize = getShapeLowDetailFontSize(Math.min(shape.props.w, shape.props.h), efficientZoom)
 		const isMainCard = Boolean(shape.props.isMain);
 		const collapsedTextSize = shape.props.collapsedTextSize || 21; // 折叠文字大小，默认21px
 		const collapsedTextAlign = shape.props.collapsedTextAlign || 'center'; // 折叠文字对齐，默认居中
@@ -327,6 +346,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			shape.props.renderMode === 'inherit' || !shape.props.renderMode
 				? globalRenderMode
 				: (shape.props.renderMode as Exclude<CardRenderMode, 'inherit'>);
+		// While editing, viewport admission must not cancel the queued Protyle mount.
+		const renderAdmission = isEditingState || !isViewportCullingEnabled || (isInViewport && canLoad)
+			? 'allowed'
+			: 'blocked'
 		const cardInnerEdgeShadow = 'inset 0 0 0 5px var(--b3-body-background, var(--b3-theme-background, #fff))'
 		const cardOuterShadow = isRootAttachTarget
 			? '0 0 0 4px rgba(34, 197, 94, 0.42), 0 0 20px rgba(34, 197, 94, 0.32)'
@@ -522,6 +545,20 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			event.preventDefault()
 			event.stopPropagation()
 		}
+		const previewTextRef = useRef(shape.props.previewText || '')
+		previewTextRef.current = shape.props.previewText || ''
+		const persistPreviewText = useCallback((previewText: string) => {
+			if (!previewText || previewText === previewTextRef.current) return
+			previewTextRef.current = previewText
+			editor.updateShape({
+				id: shape.id,
+				type: shape.type,
+				props: { previewText },
+			})
+		}, [editor, shape.id, shape.type])
+		const persistLightweightPreviewText = useCallback((html: string) => {
+			persistPreviewText(getLightweightPreviewTextFromHtml(html))
+		}, [persistPreviewText])
 		const enterMissingLinkedBlockState = useCallback(() => {
 			destroyRuntimeResources()
 			setHasMissingLinkedBlock(true)
@@ -554,10 +591,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			editor.deleteShape(shape.id)
 		}, [editor, shape.id])
 
-
-		useEffect(() => {
-			setIsEditingState(isEditing);
-		}, [isEditing]);
 
 		// 编辑时临时置顶，退出编辑后恢复原层次
 		useEffect(() => {
@@ -904,6 +937,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// Protyle 生命周期管理主 Effect
 		// 注意：对于 live-protyle 模式，编辑状态切换不应触发重建
 		useEffect(() => {
+			const renderTaskId = `render-card-content-${shape.id}`
 			// 检测是否为手动刷新（通过 refreshNonce 变更触发）
 			const manualRefreshTriggered = refreshNonceRef.current !== shape.props.refreshNonce;
 			const shouldForceReloadLiveProtyle =
@@ -916,8 +950,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				destroyRuntimeResources();
 				return;
 			}
+			if (isSmallCard) {
+				destroyRuntimeResources();
+				return;
+			}
 
-			const shouldRender = !isViewportCullingEnabled || isEditingState || (isInViewport && canLoad);
+			const shouldRender = renderAdmission === 'allowed';
 			if (!shouldRender) {
 				destroyRuntimeResources();
 				return;
@@ -1148,6 +1186,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				if (!forceRefresh) {
 					const cachedHtml = getCachedPreview(targetBlockId, fontSize);
 					if (cachedHtml) {
+						persistLightweightPreviewText(cachedHtml)
 						// 使用缓存的预览
 						if (staticPreviewRef.current?.parentElement === containerRef.current) {
 							removeStaticPreviewLinkHandlers()
@@ -1170,7 +1209,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							installStaticPreviewLinkHandlers(clone);
 							containerRef.current.appendChild(clone);
 							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
-							await renderAllContent(clone);
+							await renderAllContentIdle(clone, 10, renderTaskId, true);
 							if (cancelled) return;
 							return;
 						}
@@ -1189,6 +1228,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				}
 
 				if (cancelled || !domContent) return;
+				persistLightweightPreviewText(domContent)
 
 				// 对于 isMain 形状，获取文档信息（标题和题头图）
 				let docInfo: api.IResGetDocInfo | null = null;
@@ -1361,7 +1401,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						remainder.forEach((n) => frag.appendChild(n));
 						previewWrapper.insertBefore(frag, placeholder);
 						try { convertProtyleHtmlToDom(previewWrapper); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
-						await renderAllContent(previewWrapper);
+						await renderAllContentIdle(previewWrapper, 10, renderTaskId, true);
 						if (placeholder.parentElement === previewWrapper) {
 							previewWrapper.removeChild(placeholder);
 						}
@@ -1392,7 +1432,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				containerRef.current.appendChild(previewWrapper);
 				// 先把 protyle-html 转为普通 DOM，再运行后续渲染
 				try { convertProtyleHtmlToDom(previewWrapper); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
-				await renderAllContent(previewWrapper);
+				await renderAllContentIdle(previewWrapper, 10, renderTaskId, true);
 
 				if (cancelled) return;
 
@@ -1477,6 +1517,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							installStaticPreviewLinkHandlers(protyleHostRef.current)
 						}
 						try { protyleRef.current?.disable(); } catch { }
+						persistPreviewText(getLightweightPreviewTextFromElement(protyleHostRef.current))
 						// 如果刚从编辑状态退出，刷新内容以反映最新编辑
 						if (wasEditing) {
 							try { protyleRef.current?.reload(false); } catch { }
@@ -1488,13 +1529,14 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			// 组件卸载清理（仅在真正卸载时销毁，编辑状态切换不触发）
 			return () => {
 				cancelled = true;
+				cancelIdleRender(renderTaskId);
 				// 对于 live-protyle 模式，不在编辑切换时销毁资源
 				// 仅当组件真正卸载或渲染条件不满足时才销毁
 				if (isCollapsed || !shouldRender) {
 					destroyRuntimeResources();
 				}
 			};
-		}, [destroyRuntimeResources, isEditingState, isInViewport, isViewportCullingEnabled, shape.id, blockId, shape.props.refreshNonce, isCollapsed, effectiveRenderMode, canLoad, fontSize]);
+		}, [destroyRuntimeResources, isEditingState, renderAdmission, shape.id, blockId, shape.props.refreshNonce, isCollapsed, effectiveRenderMode, fontSize, isSmallCard, persistLightweightPreviewText, persistPreviewText]);
 
 		const handlePointerEvent = (e: React.PointerEvent) => {
 			if (isEditingState) {
@@ -1703,7 +1745,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							</div>
 						)
 					)}
-					{shape.props.isNewlyCreated && !shape.props.blockId && !isEditingState && (
+					{shape.props.isNewlyCreated && !shape.props.blockId && !isEditingState && !shouldUseLightweightPreview && (
 						<div style={{
 							width: '100%',
 							height: '100%',
@@ -1720,22 +1762,31 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							双击编辑以创建笔记块
 						</div>
 					)}
-					{/* 预览被限制（canLoad=false 且非编辑 && 未折叠）显示占位 */}
-					{!isEditingState && !isCollapsed && !canLoad && (
+					{/* 低缩放和限流状态共用同一套轻量预览。 */}
+					{shouldUseLightweightPreview && (
 						<div style={{
 							width: '100%',
 							height: '100%',
 							display: 'flex',
 							alignItems: 'center',
 							justifyContent: 'center',
-							fontSize: `${Math.min(shape.props.w / 6, shape.props.h / 2)}px`,
-							padding: '8px',
-							wordBreak: 'break-all',
+							padding: '2px 4px',
+							boxSizing: 'border-box',
+							fontSize: `${lowDetailFontSize}px`,
+							fontWeight: 500,
 							color: theme[shape.props.color].solid,
 							textAlign: 'center',
-							opacity: 0.4,
 						}}>
-							双击加载内容
+							<span style={{
+								display: '-webkit-box',
+								WebkitBoxOrient: 'vertical',
+								WebkitLineClamp: 2,
+								overflow: 'hidden',
+								lineHeight: 1.1,
+								wordBreak: 'break-word',
+							}}>
+								{shape.props.previewText || (shape.props.blockId ? '卡片' : '双击编辑')}
+							</span>
 						</div>
 					)}
 				</div>

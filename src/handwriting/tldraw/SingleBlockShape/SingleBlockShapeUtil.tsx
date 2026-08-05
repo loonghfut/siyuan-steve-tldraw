@@ -19,6 +19,7 @@ import {
 	lerp,
 	VecModel,
 	Editor,
+	useValue,
 } from '@tldraw/tldraw'
 import { openAttributePanel, openTab, Protyle, showMessage, TProtyleAction } from 'siyuan'
 import * as api from '@/api/api'
@@ -36,6 +37,8 @@ import { getShapeHostElement } from '../utils/getShapeHostElement'
 import { getCachedHtml, setCachedHtml, cacheFromProtyleHost, invalidateCache, requestBlockDOM, getBlockContent, renderSimpleBlockHtml } from '../block-html-cache'
 import { renderAllContentIdle } from '../utils/render/content-renderer'
 import { cancelIdleRender } from '../utils/idle-scheduler'
+import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
+import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
 import { getDefaultColorTheme } from '../utils/color-theme'
 import { getCachedSvgExportSnapshot, getSvgExportGlobalStyles, isSvgExportOutlineOnly, serializeElementForSvgExport } from '../utils/export-dom-snapshot'
 import {
@@ -406,19 +409,32 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const editor = this.editor
 		// 保存 editor 引用供 useSingleBlockSize hook 使用
 		const theme = getDefaultColorTheme({ isDarkMode: editor.user.getIsDarkMode() })
-		const isEditing = editor.getEditingShapeId() === shape.id
+		const isEditing = useValue('single-block is editing', () => editor.getEditingShapeId() === shape.id, [editor, shape.id])
 		const branchInteractionHint = useBranchInteractionHint()
 		const isRootAttachTarget =
 			branchInteractionHint?.mode === 'attach' &&
 			branchInteractionHint.slot === 'root' &&
 			(branchInteractionHint.targetShapeId === shape.id ||
 				(!branchInteractionHint.targetShapeId && branchInteractionHint.draggingShapeId === shape.id))
-		const [isEditingState, setIsEditingState] = useState(isEditing)
-		const [isInViewport, setIsInViewport] = useState(true)
-		const [canLoad, setCanLoad] = useState(true)
+		const isEditingState = isEditing
+		// Stay blocked until ShapeLoadManager computes this shape's visibility.
+		// Effects in the initial commit still see these values after registration.
+		const [isInViewport, setIsInViewport] = useState(false)
+		const [canLoad, setCanLoad] = useState(false)
 		const [hasAttrIcon, setHasAttrIcon] = useState(false)
 		const [hasLoadError, setHasLoadError] = useState(false)
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false
+		const efficientZoom = useValue('single-block efficient zoom', () => editor.getEfficientZoomLevel(), [editor])
+		const visibleCardAndSingleBlockCount = useValue(
+			'card and single-block low-detail count',
+			() => getVisibleCardAndSingleBlockCount(editor),
+			[editor],
+		)
+		const lowDetailThreshold = getShapeLowDetailThreshold()
+		const lowDetailCountThreshold = getShapeLowDetailCountThreshold()
+		const hasEnoughShapesForLowDetail = lowDetailCountThreshold <= 0 || visibleCardAndSingleBlockCount >= lowDetailCountThreshold
+		const isSmallSingleBlock = !isEditingState && hasEnoughShapesForLowDetail && lowDetailThreshold > 0 && Math.min(shape.props.w, shape.props.h) * efficientZoom < lowDetailThreshold
+		const lowDetailFontSize = getShapeLowDetailFontSize(Math.min(shape.props.w, shape.props.h), efficientZoom)
 		const containerRef = useRef<HTMLDivElement>(null)
 		// 保存进入编辑前的相机状态，用于退出编辑后恢复视角
 		const prevCameraRef = useRef<any | null>(null)
@@ -433,6 +449,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		// 标记内容是否已渲染（公式、图表等）
 		const [, setIsContentRendered] = useState(false)
 		const [isLoadingContent, setIsLoadingContent] = useState(false)
+		// When the load manager withholds a full DOM preview, retain a compact
+		// summary instead of presenting an action-oriented loading placeholder.
+		const shouldUseLightweightPreview = !isEditingState && (isSmallSingleBlock || !canLoad)
 		const detachKeyHandler = useRef<() => void>()
 		// 全局由 shapeLoadManager 计算可见性，无需本地定时轮询
 		const loadHandleRef = useRef<ProtyleLoadHandle | null>(null)
@@ -453,6 +472,20 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			event.preventDefault()
 			event.stopPropagation()
 		}
+		const previewTextRef = useRef(shape.props.previewText || '')
+		previewTextRef.current = shape.props.previewText || ''
+		const persistPreviewText = useCallback((previewText: string) => {
+			if (!previewText || previewText === previewTextRef.current) return
+			previewTextRef.current = previewText
+			editor.updateShape({
+				id: shape.id,
+				type: shape.type,
+				props: { previewText },
+			})
+		}, [editor, shape.id, shape.type])
+		const persistLightweightPreviewText = useCallback((html: string) => {
+			persistPreviewText(getLightweightPreviewTextFromHtml(html))
+		}, [persistPreviewText])
 
 
 		const destroyRuntimeResources = useCallback(() => {
@@ -513,9 +546,13 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 		// 使用独立的尺寸测量 hook（自动处理尺寸更新）
 	// 如果有加载错误，跳过测量以避免异常增长
-	useSingleBlockSize(editor, shape, containerRef, protyleHostRef, isEditingState, isLoadingContent || hasLoadError)
+	useSingleBlockSize(editor, shape, containerRef, protyleHostRef, isEditingState, shouldUseLightweightPreview || hasLoadError)
 		// 检测是否包含属性视图图标（数据库图标）
 		useEffect(() => {
+			if (isSmallSingleBlock) {
+				setHasAttrIcon(false)
+				return
+			}
 			let container = containerRef.current
 			// 如果没有容器则无需检查
 			if (!container) return
@@ -557,7 +594,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					// ignore
 				}
 			}
-		}, [isEditingState, staticHtml, containerRef.current, protyleHostRef.current])
+		}, [isEditingState, staticHtml, isSmallSingleBlock, containerRef.current, protyleHostRef.current])
 
 		// 编辑模式切换时聚焦到形状，并在退出编辑后恢复之前的视角
 		useEffect(() => {
@@ -603,11 +640,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			return () => clearTimeout(timer)
 		}, [isEditing, shape.id])
 
-		// 同步编辑状态
-		useEffect(() => {
-			setIsEditingState(isEditing)
-		}, [isEditing])
-
 		useEffect(() => {
 			shapeLoadManager.attachEditor(editor as any)
 			const unregister = shapeLoadManager.register(
@@ -627,7 +659,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		// 加载静态内容（非编辑态）
 		useEffect(() => {
 			// 编辑态不需要加载静态内容
-			if (isEditingState) return
+			if (isEditingState || isSmallSingleBlock) return
 			
 			const blockId = shape.props.blockId
 			if (!blockId) return
@@ -645,6 +677,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			if (!forceRefresh) {
 				const cached = getCachedHtml(blockId, fontSize)
 				if (cached) {
+					persistLightweightPreviewText(cached)
 					setStaticHtml(cached)
 					return
 				}
@@ -662,6 +695,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			requestBlockDOM(blockId, fontSize).then(async (html) => {
 				if (cancelled) return
 				if (html) {
+					persistLightweightPreviewText(html)
 					setStaticHtml(html)
 					setHasLoadError(false)
 					return
@@ -672,6 +706,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				if (content) {
 					const fallbackHtml = await renderSimpleBlockHtml(content.content || content.markdown, fontSize)
 					setCachedHtml(blockId, fallbackHtml, fontSize)
+					persistLightweightPreviewText(fallbackHtml)
 					setStaticHtml(fallbackHtml)
 					setHasLoadError(false)
 				} else {
@@ -690,12 +725,12 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			})
 			
 			return () => { cancelled = true }
-		}, [isEditingState, shape.props.blockId, shape.props.fontSize, shape.props.refreshNonce, isInViewport, canLoad, isViewportCullingEnabled])
+		}, [isEditingState, isSmallSingleBlock, shape.props.blockId, shape.props.fontSize, shape.props.refreshNonce, isInViewport, canLoad, isViewportCullingEnabled, persistLightweightPreviewText])
 
 		// ===== 静态内容渲染：在 staticHtml 挂载后执行 renderAllContentIdle =====
 		// 使用空闲调度，避免在拖动画布时阻塞主线程
 		useEffect(() => {
-			if (!staticHtml || isEditingState || !staticContentRef.current) return
+			if (!staticHtml || isEditingState || shouldUseLightweightPreview || !staticContentRef.current) return
 			
 			// 重置渲染状态
 			setIsContentRendered(false)
@@ -721,7 +756,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				cancelAnimationFrame(rafId)
 				cancelIdleRender(renderTaskId)
 			}
-		}, [staticHtml, isEditingState, shape.id])
+		}, [staticHtml, isEditingState, shouldUseLightweightPreview, shape.id])
 
 		// ===== 编辑态专用：创建和管理 Protyle 实例 =====
 		useEffect(() => {
@@ -1091,12 +1126,13 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				if (protyleRef.current && protyleHostRef.current && shape.props.blockId) {
 					const html = cacheFromProtyleHost(shape.props.blockId, protyleHostRef.current, shape.props.fontSize || 16)
 					if (html) {
+						persistPreviewText(getLightweightPreviewTextFromElement(protyleHostRef.current))
 						setStaticHtml(html)
 					}
 				}
 				destroyRuntimeResources()
 			}
-		}, [destroyRuntimeResources, isEditingState, shape.id, shape.props.blockId, shape.props.refreshNonce])
+		}, [destroyRuntimeResources, isEditingState, shape.id, shape.props.blockId, shape.props.refreshNonce, persistPreviewText])
 
 		useEffect(() => {
 			if (protyleRef.current?.protyle?.wysiwyg?.element) {
@@ -1255,8 +1291,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				onPointerMove={handlePointerEvent}
 				onPointerUp={handlePointerEvent}
 			>
-				{/* 数据库属性栏 - 总是渲染，由 DbAttributeBar 组件决定是否显示内容 */}
-				<div
+				{/* 小尺寸时不挂载属性栏及其交互 DOM。 */}
+				{!isSmallSingleBlock && <div
 					style={{
 						position: 'absolute',
 						top: '-16px',
@@ -1311,7 +1347,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 							</svg>
 						</div>
 					)}
-				</div>
+				</div>}
 				<div
 					ref={containerRef}
 					className="st-single-block-shape__content"
@@ -1331,7 +1367,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					}}
 				>
 					{/* 非编辑态：显示静态 HTML 内容 */}
-					<style>
+					{!isSmallSingleBlock && <style>
 						{`
 							.st-single-block-shape__content,
 							.st-single-block-shape__content * {
@@ -1368,8 +1404,37 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 								cursor: pointer;
 							}
 						`}
-					</style>
-					{!isEditingState && staticHtml && (
+					</style>}
+					{shouldUseLightweightPreview && (
+						<div
+							style={{
+								width: '100%',
+								height: '100%',
+								background: shape.props.transparentBackground ? theme[shape.props.color].semi : 'transparent',
+								pointerEvents: 'none',
+								padding: '2px 4px',
+								boxSizing: 'border-box',
+								color: theme[shape.props.color].solid,
+								fontSize: `${lowDetailFontSize}px`,
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'center',
+								textAlign: 'center',
+							}}
+						>
+							<span style={{
+								display: '-webkit-box',
+								WebkitBoxOrient: 'vertical',
+								WebkitLineClamp: 2,
+								overflow: 'hidden',
+								lineHeight: 1.1,
+								wordBreak: 'break-word',
+							}}>
+								{shape.props.previewText || (shape.props.blockId ? '单块' : '双击编辑')}
+							</span>
+						</div>
+					)}
+					{!isEditingState && !shouldUseLightweightPreview && staticHtml && (
 						<div
 							className="single-block-static-content"
 							ref={staticContentRef}
@@ -1387,7 +1452,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						/>
 					)}
 					{/* 非编辑态：加载中提示 */}
-					{!isEditingState && !staticHtml && isLoadingContent && (
+					{!isEditingState && !isSmallSingleBlock && !staticHtml && isLoadingContent && (
 						<div style={{
 							width: '100%',
 							height: '100%',
@@ -1403,25 +1468,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 							加载中...
 						</div>
 					)}
-					{/* 非编辑态：等待加载提示 */}
-					{!isEditingState && !staticHtml && !isLoadingContent && !canLoad && (
-						<div style={{
-							width: '100%',
-							height: '100%',
-							display: 'flex',
-							alignItems: 'center',
-							justifyContent: 'center',
-							fontSize: `${Math.min(shape.props.fontSize, 18)}px`,
-							color: theme[shape.props.color].solid,
-							opacity: 0.7,
-							textAlign: 'center',
-							padding: '4px'
-						}}>
-							双击加载内容
-						</div>
-					)}
 					{/* 非编辑态：新块占位符 */}
-					{!isEditingState && !staticHtml && !isLoadingContent && !hasLoadError && canLoad && shape.props.isNewlyCreated && (
+					{!isEditingState && !isSmallSingleBlock && !staticHtml && !isLoadingContent && !hasLoadError && canLoad && shape.props.isNewlyCreated && (
 						<div style={{
 							width: '100%',
 							height: '100%',
@@ -1438,7 +1486,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						</div>
 					)}
 				</div>
-				{!isEditingState && hasLoadError && (
+				{!isEditingState && !isSmallSingleBlock && hasLoadError && (
 					<div
 						onPointerDown={stopMissingStateEvent}
 						onClick={stopMissingStateEvent}
@@ -1511,7 +1559,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				)}
 				{/* 端口覆盖层 - 用于贝塞尔连接器 */}
 				{/* 在透明模式下不显示端点（PortsOverlay） */}
-				{!shape.props.transparentBackground && (
+				{!isSmallSingleBlock && !shape.props.transparentBackground && (
 					<PortsOverlay shapeId={shape.id} />
 				)}
 			</HTMLContainer>
