@@ -459,22 +459,14 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			cardContentVirtualizerRef.current?.destroy()
 			cardContentVirtualizerRef.current = null
 		}, [])
-		// tldraw 已经在 shape store 中发出尺寸更新；只用它刷新静态预览窗口，
-		// 不额外监听 DOM scroll，避免把画布滚动事件引入每张 Card。
+		// tldraw will re-render this component when this shape's props change.
+		// React to the two props the virtualizer cares about directly instead of
+		// registering one store listener per Card. Store listeners remain active for
+		// culled components, so the old approach made every document update fan out
+		// to every Card on a large board.
 		useEffect(() => {
-			const unsubscribe = editor.store.listen((entry) => {
-				const updated = entry.changes.updated[shape.id]
-				if (!updated) return
-				const [from, to] = updated
-				if (from.typeName !== 'shape' || to.typeName !== 'shape') return
-				const previous = from as ICardShape
-				const current = to as ICardShape
-				if (previous.props.w !== current.props.w || previous.props.h !== current.props.h) {
-					cardContentVirtualizerRef.current?.refresh()
-				}
-			}, { scope: 'document', source: 'all' })
-			return unsubscribe
-		}, [editor, shape.id])
+			cardContentVirtualizerRef.current?.refresh()
+		}, [shape.props.w, shape.props.h])
 		const openStaticLinkTarget = useCallback((target: { blockId: string | null; href: string }) => {
 			if (target.blockId) {
 				if (!window.siyuan?.ws?.app) return

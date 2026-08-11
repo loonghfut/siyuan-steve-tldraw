@@ -1,4 +1,4 @@
-import { Editor, EditorAtom, TLShape, TLShapeId } from '@tldraw/tldraw'
+import { computed, Editor, EditorAtom, TLShape, TLShapeId } from '@tldraw/tldraw'
 import { IBranchShape, BranchChildShape, TREE_TABLE_CELL_PADDING } from './branch-shape-types'
 import { BranchInteractionHint, setBranchInteractionHint } from './branch-interaction-state'
 
@@ -97,6 +97,32 @@ type BranchDragPreviewOptions = {
 }
 
 const BranchShapeIds = new EditorAtom('branch layout shape ids', (editor) => editor.store.query.index('shape', 'type'))
+
+type BranchRenderContext = {
+	branches: IBranchShape[]
+	rootParentsByShapeId: Map<string, IBranchShape>
+	nestedTreeTableBranchIds: Set<string>
+}
+
+// Rendering a branch requires information about the other branches on the
+// page. Keep that page-wide work in one reactive derivation per Editor instead
+// of rebuilding the same indexes for its geometry, component, and indicator.
+const BranchRenderContexts = new EditorAtom('branch render contexts', (editor) =>
+	computed('branch render contexts', (): BranchRenderContext => {
+		const branches = getCurrentBranches(editor)
+		const rootParentsByShapeId = buildBranchRootParentIndex(branches)
+		const nestedTreeTableBranchIds = new Set<string>()
+
+		for (const branch of branches) {
+			if (branch.props.lineStyle !== 'tree-table') continue
+			for (const childId of getAllBranchChildIds(branch)) {
+				nestedTreeTableBranchIds.add(childId)
+			}
+		}
+
+		return { branches, rootParentsByShapeId, nestedTreeTableBranchIds }
+	}),
+)
 const activeBranchDragContexts = new WeakMap<Editor, BranchDragPreviewOptions>()
 
 function usesManualFrameStyle(branch: IBranchShape) {
@@ -1645,14 +1671,9 @@ export function detachBranchRootShape(editor: Editor, branchId: TLShapeId) {
 }
 
 export function getBranchRenderInfo(editor: Editor, branch: IBranchShape) {
-	const branches = getCurrentBranches(editor)
-	const rootParentsByShapeId = buildBranchRootParentIndex(branches)
-	const isNestedInTreeTable = branches.some(
-		(candidate) =>
-			candidate.id !== branch.id &&
-			candidate.props.lineStyle === 'tree-table' &&
-			[...(candidate.props.leftChildIds || []), ...candidate.props.rightChildIds].includes(branch.id as string)
-	)
+	const context = BranchRenderContexts.get(editor).get()
+	const { branches, rootParentsByShapeId } = context
+	const isNestedInTreeTable = context.nestedTreeTableBranchIds.has(branch.id as string)
 	const autoFrame = getBranchAutoFrameState(editor, branch, branches, rootParentsByShapeId)
 	const rootContent = getBranchRootContent(editor, branch, branches, rootParentsByShapeId)
 	const toBranchLocal = (pagePoint: { x: number; y: number }) => editor.getPointInShapeSpace(branch, pagePoint)

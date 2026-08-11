@@ -14,7 +14,8 @@ API:
 Configuration:
   maxActive from settingdata['tldraw-max-active-shapes'] or default 40
 Internals:
-  Recomputes every 500ms (or 1000ms when interacting) or on demand.
+  Recomputes from store changes, coalesced on a short timer. This avoids an
+  always-on requestAnimationFrame loop while a whiteboard is idle.
   Each shape uses its own editor's viewport for visibility calculation.
 */
 
@@ -45,24 +46,40 @@ class ShapeLoadManager {
   // Permission snapshots survive one synchronous unregister/register effect
   // cycle, preventing a brief fallback to "blocked" during a re-registration.
   private snapshots: Map<TLShapeId, { lastAllowed: boolean; lastComputed: ComputedMeta }> = new Map()
-  private editors: Set<Editor> = new Set()
-  private rafId: number | null = null
+  private editorUnsubscribers = new Map<Editor, () => void>()
+  private recomputeTimer: ReturnType<typeof setTimeout> | null = null
   private immediateRecomputeQueued = false
   private lastRecomputeAt = 0
-  private PRELOAD_MARGIN_WORLD = 1600
+  private readonly PRELOAD_MARGIN_WORLD = 1600
+  // Keep the established admission cadence while making it event-driven.
+  // The difference is that an idle whiteboard no longer wakes every frame.
+  private readonly IDLE_RECOMPUTE_INTERVAL_MS = 500
+  private readonly INTERACTING_RECOMPUTE_INTERVAL_MS = 1000
 
   attachEditor(editor: Editor) {
-    this.editors.add(editor)
-    this.ensureLoop()
+    if (this.editorUnsubscribers.has(editor)) return
+
+    // Camera / instance records are session-scoped, while shape changes are
+    // document-scoped. Listening to both through `all` keeps admission current
+    // without polling every animation frame.
+    const unsubscribe = editor.store.listen(
+      () => this.queueRecompute(),
+      { scope: 'all', source: 'all' }
+    )
+    this.editorUnsubscribers.set(editor, unsubscribe)
   }
 
   register(shapeId: TLShapeId, editor: Editor, metaProvider: () => ShapeLoadMeta, onPermissionChange: (allowed: boolean, meta: ComputedMeta) => void) {
     const existing = this.shapes.get(shapeId)
     if (existing) {
+      const previousEditor = existing.editor
       existing.editor = editor
       existing.metaProvider = metaProvider
       existing.onChange = onPermissionChange
-      return () => this.unregister(shapeId)
+      this.attachEditor(editor)
+      if (previousEditor !== editor) this.detachEditorIfUnused(previousEditor)
+      this.queueRecompute()
+      return () => this.unregister(shapeId, editor)
     }
     const snapshot = this.snapshots.get(shapeId)
     const entry: RegisteredShape = {
@@ -77,19 +94,22 @@ class ShapeLoadManager {
     // A remounted component starts with its own local state. Always deliver the
     // cached permission, otherwise a no-op recompute would leave it blocked.
     onPermissionChange(entry.lastAllowed, entry.lastComputed)
-    this.ensureLoop()
+    this.attachEditor(editor)
     if (!this.immediateRecomputeQueued) {
       this.immediateRecomputeQueued = true
       queueMicrotask(() => {
         this.immediateRecomputeQueued = false
-        if (this.shapes.size > 0) this.recompute()
+        this.queueRecompute(true)
       })
     }
-    return () => this.unregister(shapeId)
+    return () => this.unregister(shapeId, editor)
   }
 
-  unregister(shapeId: TLShapeId) {
+  unregister(shapeId: TLShapeId, editor: Editor) {
     const existing = this.shapes.get(shapeId)
+    // A duplicate id from another Editor must not unregister the currently
+    // registered shape. This also makes cleanup robust during tab teardown.
+    if (existing && existing.editor !== editor) return
     if (existing) {
       this.snapshots.set(shapeId, { lastAllowed: existing.lastAllowed, lastComputed: existing.lastComputed })
     }
@@ -99,46 +119,61 @@ class ShapeLoadManager {
     queueMicrotask(() => {
       if (!this.shapes.has(shapeId)) this.snapshots.delete(shapeId)
     })
-    if (this.shapes.size === 0) this.stopLoop()
+    this.detachEditorIfUnused(editor)
+    if (this.shapes.size === 0) this.stop()
   }
 
   isAllowed(shapeId: TLShapeId) {
     return this.shapes.get(shapeId)?.lastAllowed ?? false
   }
 
-  private ensureLoop() {
-    if (this.rafId !== null) return
-    const tick = () => {
-      this.rafId = window.requestAnimationFrame(() => {
-        try {
-          this.maybeRecompute()
-        } finally {
-          tick()
-        }
-      })
+  private detachEditorIfUnused(editor: Editor) {
+    for (const shape of this.shapes.values()) {
+      if (shape.editor === editor) return
     }
-    tick()
+    const unsubscribe = this.editorUnsubscribers.get(editor)
+    if (!unsubscribe) return
+    unsubscribe()
+    this.editorUnsubscribers.delete(editor)
   }
 
-  private stopLoop() {
-    if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId)
-      this.rafId = null
+  private stop() {
+    if (this.recomputeTimer !== null) {
+      clearTimeout(this.recomputeTimer)
+      this.recomputeTimer = null
     }
+    for (const unsubscribe of this.editorUnsubscribers.values()) unsubscribe()
+    this.editorUnsubscribers.clear()
   }
 
   forceRecompute() {
+    if (this.recomputeTimer !== null) {
+      clearTimeout(this.recomputeTimer)
+      this.recomputeTimer = null
+    }
     this.recompute()
   }
 
-  private maybeRecompute() {
+  private queueRecompute(immediate = false) {
+    if (this.shapes.size === 0) return
+
     const now = performance.now()
-    const since = now - this.lastRecomputeAt
-    // 交互时使用更长的间隔，减少计算开销
-    const interval = isInteracting() ? 1000 : 500
-    if (since >= interval) {
-      this.recompute()
+    const interval = isInteracting()
+      ? this.INTERACTING_RECOMPUTE_INTERVAL_MS
+      : this.IDLE_RECOMPUTE_INTERVAL_MS
+    const delay = immediate ? 0 : Math.max(0, this.lastRecomputeAt + interval - now)
+
+    if (this.recomputeTimer !== null) {
+      // Existing work already represents the latest editor state. An initial
+      // registration is the one case that should preempt the normal cadence.
+      if (!immediate) return
+      clearTimeout(this.recomputeTimer)
     }
+
+    this.recomputeTimer = setTimeout(() => {
+      this.recomputeTimer = null
+      if (this.shapes.size > 0) this.recompute()
+    }, delay)
   }
 
   private recompute() {

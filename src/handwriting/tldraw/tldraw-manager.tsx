@@ -318,42 +318,71 @@ export class TldrawManager {
         }
     }
 
-    private async saveData() {
-        try {
-            const snapshot = getSnapshot(this.store);
-            const jsonData = JSON.stringify(snapshot);
+    private _saveInFlight: Promise<void> | null = null;
+    private _saveVersion = 0;
+    private _autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+    private _pendingSave = false;
+    private readonly AUTOSAVE_DEBOUNCE_MS = 1500;
 
-            // 保存到思源笔记的存储中
-            const result = await WhiteboardFileManager.saveWhiteboardFile(this.id, jsonData);
-            if (result.success) {
-                console.debug('画布数据已保存');
-            } else {
-                console.error('保存画布数据失败:', result.error);
+    /**
+     * Persist the most recent document snapshot without allowing concurrent
+     * snapshot serialization or file writes. Changes that arrive during a
+     * write cause exactly one additional pass with the latest store state.
+     */
+    private saveData(): Promise<void> {
+        this.cancelPendingAutosave();
+        this._saveVersion += 1;
+
+        if (this._saveInFlight) return this._saveInFlight;
+
+        const persistLatest = async () => {
+            let savedVersion = 0;
+            do {
+                savedVersion = this._saveVersion;
+                try {
+                    const snapshot = getSnapshot(this.store);
+                    const jsonData = JSON.stringify(snapshot);
+                    const result = await WhiteboardFileManager.saveWhiteboardFile(this.id, jsonData);
+                    if (result.success) {
+                        console.debug('画布数据已保存');
+                    } else {
+                        console.error('保存画布数据失败:', result.error);
+                    }
+                } catch (error) {
+                    console.error('保存画布数据失败', error);
+                }
+            } while (savedVersion !== this._saveVersion);
+        };
+
+        const task = persistLatest();
+        const wrappedTask = task.finally(() => {
+            if (this._saveInFlight === wrappedTask) {
+                this._saveInFlight = null;
             }
-        } catch (error) {
-            console.error('保存画布数据失败', error);
-        }
+        });
+        this._saveInFlight = wrappedTask;
+        return wrappedTask;
     }
 
-    // 性能优化：使用更激进的节流策略
-    private _throttledSave: (() => void) | null = null;
-    private _pendingSave = false;
-    private getThrottledSave() {
-        if (!this._throttledSave) {
-            // 使用更激进的节流：500ms内最多保存一次
-            this._throttledSave = throttle(() => {
-                if (this._pendingSave) {
-                    this._pendingSave = false;
-                    this.saveData();
-                }
-            }, 500);
+    private cancelPendingAutosave() {
+        this._pendingSave = false;
+        if (this._autosaveTimer !== null) {
+            clearTimeout(this._autosaveTimer);
+            this._autosaveTimer = null;
         }
-        return this._throttledSave;
     }
 
     private triggerSave() {
         this._pendingSave = true;
-        this.getThrottledSave()();
+        if (this._autosaveTimer !== null) {
+            clearTimeout(this._autosaveTimer);
+        }
+        this._autosaveTimer = setTimeout(() => {
+            this._autosaveTimer = null;
+            if (!this._pendingSave) return;
+            this._pendingSave = false;
+            void this.saveData();
+        }, this.AUTOSAVE_DEBOUNCE_MS);
     }
 
 
@@ -1084,14 +1113,9 @@ export class TldrawManager {
     private setupAutosave() {
         if (!this.store) return;
 
-        // 使用节流函数确保不会过于频繁地保存
-        // 性能优化：使用更激进的节流策略，避免频繁保存
-        const throttledSave = throttle(() => {
-            this.triggerSave();
-        }, 2000); // 2秒节流，减少等待时间
-
-        // 监听存储变化，只监听用户操作
-        this._autosaveUnsub = this.store.listen(throttledSave, {
+        // Coalesce bursts of user edits before snapshotting the whole store.
+        // Direct saves and destroy() still flush the latest snapshot immediately.
+        this._autosaveUnsub = this.store.listen(() => this.triggerSave(), {
             scope: 'document',
             source: 'user' // 只监听用户操作，减少不必要的保存
         });
@@ -1340,6 +1364,9 @@ export class TldrawManager {
         if (this._destroyed || this._destroying) return;
         this._destroying = true;
         this.clearAgentActivityIndicator();
+        // A delayed autosave must not revive a whiteboard after it is closed or
+        // after a caller deliberately requested skipSave.
+        this.cancelPendingAutosave();
 
         // 销毁前保存当前状态（数据文件已被删除时必须跳过，否则会被重新写回）
         if (!options?.skipSave) {
