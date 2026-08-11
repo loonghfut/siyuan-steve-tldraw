@@ -7,7 +7,7 @@
  * - 使用思源原生渲染方法，保证一致性
  */
 import { Protyle, ProtyleMethod } from 'siyuan'
-import { scheduleIdleRender, isInteracting } from '../idle-scheduler'
+import { IdleRenderCancelledError, isIdleRenderCancelledError, isInteracting, scheduleIdleRender } from '../idle-scheduler'
 import { getBlockDOMsWithEmbed } from '@/api/api'
 
 // 用于生成唯一的渲染任务 ID
@@ -20,8 +20,15 @@ const CDN = undefined // 使用思源默认 CDN
  * 渲染容器内的所有内容
  * @param container 容器元素
  */
-export async function renderAllContent(container: HTMLElement): Promise<void> {
+export async function renderAllContent(container: HTMLElement, signal?: AbortSignal): Promise<void> {
+	const throwIfAborted = () => {
+		if (signal?.aborted) throw new IdleRenderCancelledError()
+	}
+
 	try {
+		throwIfAborted()
+		// 已被 React 替换的预览不应继续触发网络/DOM 渲染。
+		if (signal && !container.isConnected) return
 		// 处理嵌入块
 		const embedNodes = Array.from(
 			container.querySelectorAll('[data-type="NodeBlockQueryEmbed"]')
@@ -36,6 +43,7 @@ export async function renderAllContent(container: HTMLElement): Promise<void> {
 			if (uniqueIds.length > 0) {
 				try {
 					const embedDomMap = await getBlockDOMsWithEmbed(uniqueIds);
+					throwIfAborted()
 					if (embedDomMap) {
 						const buildFragmentFromHtml = (html: string) => {
 							const temp = document.createElement('div');
@@ -73,25 +81,40 @@ export async function renderAllContent(container: HTMLElement): Promise<void> {
 		ProtyleMethod.plantumlRender(container, CDN)
 		// ProtyleMethod.htmlRender(container)
 		ProtyleMethod.highlightRender(container)
-		
-		// 渲染数据库视图：从 container 中提取带有 data-av-id 的元素
-		const avElements = container.querySelectorAll('[data-av-id]')
-		avElements.forEach(avElement => {
-			const blockID = avElement.getAttribute('data-node-id')
-			if (blockID) {
-				const Tprotyle = new Protyle(window.siyuan.ws.app, document.createElement('div'), { 
-					blockId: blockID, 
-					rootId: blockID 
+
+		// avRender is asynchronous and records a render token on each database view.
+		// Rendering the whole container once avoids concurrent calls invalidating each
+		// other's token; the temporary Protyle must remain alive until it settles.
+		const attributeViews = Array.from(
+			container.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-av-id]')
+		)
+		const blockId = attributeViews.find((view) => Boolean(view.dataset.nodeId))?.dataset.nodeId
+		const needsAttributeViewRender = attributeViews.some(
+			(view) => view.getAttribute('data-render') !== 'true'
+		)
+		if (blockId && needsAttributeViewRender && window.siyuan?.ws?.app) {
+			let temporaryProtyle: Protyle | null = null
+			try {
+				temporaryProtyle = new Protyle(window.siyuan.ws.app, document.createElement('div'), {
+					blockId,
+					rootId: blockId,
 				})
-				const protyle = Tprotyle.protyle;
-				ProtyleMethod.avRender(container, protyle)
-				// 销毁临时 Protyle 实例
-				Tprotyle.destroy();
+				await ProtyleMethod.avRender(container, temporaryProtyle.protyle)
+				throwIfAborted()
+			} finally {
+				try {
+					temporaryProtyle?.destroy()
+				} catch (err) {
+					console.warn('销毁数据库临时 Protyle 失败:', err)
+				}
 			}
-		})
-	
+		}
+
 	} catch (err) {
-		console.warn('内容渲染失败:', err)
+		if (!isIdleRenderCancelledError(err)) {
+			console.warn('内容渲染失败:', err)
+		}
+		throw err
 	}
 }
 
@@ -110,16 +133,21 @@ export async function renderAllContentIdle(
 ): Promise<void> {
 	const effectiveTaskId = taskId || `render-${++renderTaskIdCounter}`
 
-	// 如果不在交互中，直接同步渲染（更快的响应）
+	// 非交互、且调用方未明确要求延后时立即完成，保持普通内容的响应速度。
 	if (!forceIdle && !isInteracting()) {
 		await renderAllContent(container)
 		return
 	}
 
-	// 在交互中，使用空闲调度
-	await scheduleIdleRender(effectiveTaskId, async () => {
-		await renderAllContent(container)
-	}, priority)
+	try {
+		await scheduleIdleRender(effectiveTaskId, async (signal) => {
+			await renderAllContent(container, signal)
+		}, priority)
+	} catch (error) {
+		// 组件 cleanup 主动取消是预期控制流；调用方不应因此把预览标成失败。
+		if (isIdleRenderCancelledError(error)) return
+		throw error
+	}
 }
 
 /**

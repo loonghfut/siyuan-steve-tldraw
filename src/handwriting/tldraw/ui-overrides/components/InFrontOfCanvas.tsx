@@ -34,7 +34,13 @@ import {
     deleteEmptyCenterBranchForShape,
     getEmptyCenterBranchForShape,
 } from '../../CardShape/create-card-center-branch'
-import { createSingleBlockForBranch, getBranchRootParent } from '../../BranchShape'
+import {
+    createSingleBlockForBranch,
+    getAllBranchChildIds,
+    getBranchRootParent,
+    toggleBranchCollapsed,
+    toggleBranchSubtreeCollapsed,
+} from '../../BranchShape'
 import type { ISingleBlockShape } from '../../SingleBlockShape/single-block-shape-types'
 import { ConnectorExtensionMenu } from '../../BezierConnectorShape/ConnectorExtensionMenu'
 
@@ -104,6 +110,9 @@ export const InFrontOfCanvas: React.FC = () => {
         selectedShape.type === 'card' &&
         Boolean((selectedShape as ICardShape).props?.isCollapsed)
     const isBranchSelection = isValidSelection && selectedShape.type === 'branch'
+    const selectedBranch = isBranchSelection ? selectedShape : null
+    const hasSelectedBranchChildren = selectedBranch && getAllBranchChildIds(selectedBranch).length > 0
+    const canAddSingleBlockToSelectedBranch = isBranchSelection && selectedBranch?.props.isCollapsed !== true
     const isJsShapeSelection = isValidSelection && selectedShape.type === 'js-shape'
     const selectedJsShape = isJsShapeSelection ? (selectedShape as IJsShape) : null
     const selectedCardShapes = useValue(
@@ -116,6 +125,7 @@ export const InFrontOfCanvas: React.FC = () => {
         () => (isCardOrBlock && selectedShape ? getBranchRootParent(editor, selectedShape.id) : null),
         [editor, selectedShape?.id, isCardOrBlock]
     )
+    const canAddSingleBlockToRootBranch = rootParentBranch?.props.isCollapsed !== true
     const emptyCenterBranch = useValue(
         'selected empty center branch',
         () => {
@@ -226,7 +236,7 @@ export const InFrontOfCanvas: React.FC = () => {
         transition: 'all 0.2s ease',
     }
 
-    const HoverButton = ({ onClick, title, children, style, active, pending }: any) => {
+    const HoverButton = ({ onClick, onContextMenu, title, children, style, active, pending }: any) => {
         const [hover, setHover] = React.useState(false)
         
         const getBackground = () => {
@@ -253,6 +263,7 @@ export const InFrontOfCanvas: React.FC = () => {
                 onMouseEnter={() => setHover(true)}
                 onMouseLeave={() => setHover(false)}
                 onClick={onClick}
+                onContextMenu={onContextMenu}
                 title={title}
             >
                 {children}
@@ -277,6 +288,8 @@ export const InFrontOfCanvas: React.FC = () => {
         DetachCenterBranch: () => <TldrawUiIcon label="" icon="branch-detach" />,
         BranchAddLeft: () => <TldrawUiIcon label="" icon="branch-add-left" />,
         BranchAddRight: () => <TldrawUiIcon label="" icon="branch-add-right" />,
+        BranchExpand: () => <TldrawUiIcon label="" icon="plus" small />,
+        BranchCollapse: () => <TldrawUiIcon label="" icon="minus" small />,
     }
 
     return (
@@ -335,30 +348,49 @@ export const InFrontOfCanvas: React.FC = () => {
                 >
                     {isBranchSelection && (
                         <>
-                            <HoverButton
-                                style={buttonStyle}
-                                onClick={() => {
-                                    const newShapeId = createSingleBlockForBranch(editor, selectionInfo.id, 'left')
-                                    if (!newShapeId) {
-                                        showMessage('左侧添加单块失败', 3000, 'error')
-                                    }
-                                }}
-                                title="左侧添加单块"
-                            >
-                                <Icons.BranchAddLeft />
-                            </HoverButton>
-                            <HoverButton
-                                style={buttonStyle}
-                                onClick={() => {
-                                    const newShapeId = createSingleBlockForBranch(editor, selectionInfo.id, 'right')
-                                    if (!newShapeId) {
-                                        showMessage('右侧添加单块失败', 3000, 'error')
-                                    }
-                                }}
-                                title="右侧添加单块"
-                            >
-                                <Icons.BranchAddRight />
-                            </HoverButton>
+                            {hasSelectedBranchChildren && (
+                                <HoverButton
+                                    style={buttonStyle}
+                                    active={selectedBranch.props.isCollapsed === true}
+                                    onClick={() => toggleBranchCollapsed(editor, selectionInfo.id)}
+                                    onContextMenu={(event) => {
+                                        event.preventDefault()
+                                        event.stopPropagation()
+                                        toggleBranchSubtreeCollapsed(editor, selectionInfo.id)
+                                    }}
+                                    title={`${selectedBranch.props.isCollapsed ? '展开分支' : '收缩分支'}（右键：${selectedBranch.props.isCollapsed ? '展开所有子项' : '折叠所有子项'}）`}
+                                >
+                                    {selectedBranch.props.isCollapsed ? <Icons.BranchExpand /> : <Icons.BranchCollapse />}
+                                </HoverButton>
+                            )}
+                            {canAddSingleBlockToSelectedBranch && (
+                                <>
+                                    <HoverButton
+                                        style={buttonStyle}
+                                        onClick={() => {
+                                            const newShapeId = createSingleBlockForBranch(editor, selectionInfo.id, 'left')
+                                            if (!newShapeId) {
+                                                showMessage('左侧添加单块失败', 3000, 'error')
+                                            }
+                                        }}
+                                        title="左侧添加单块"
+                                    >
+                                        <Icons.BranchAddLeft />
+                                    </HoverButton>
+                                    <HoverButton
+                                        style={buttonStyle}
+                                        onClick={() => {
+                                            const newShapeId = createSingleBlockForBranch(editor, selectionInfo.id, 'right')
+                                            if (!newShapeId) {
+                                                showMessage('右侧添加单块失败', 3000, 'error')
+                                            }
+                                        }}
+                                        title="右侧添加单块"
+                                    >
+                                        <Icons.BranchAddRight />
+                                    </HoverButton>
+                                </>
+                            )}
                         </>
                     )}
                     {isCardOrBlock && (
@@ -402,30 +434,49 @@ export const InFrontOfCanvas: React.FC = () => {
                             )}
                             {rootParentBranch && (
                                 <>
-                                    <HoverButton
-                                        style={buttonStyle}
-                                        onClick={() => {
-                                            const newShapeId = createSingleBlockForBranch(editor, rootParentBranch.id, 'left')
-                                            if (!newShapeId) {
-                                                showMessage('宸︿晶娣诲姞鍗曞潡澶辫触', 3000, 'error')
-                                            }
-                                        }}
-                                        title="宸︿晶娣诲姞鍗曞潡"
-                                    >
-                                        <Icons.BranchAddLeft />
-                                    </HoverButton>
-                                    <HoverButton
-                                        style={buttonStyle}
-                                        onClick={() => {
-                                            const newShapeId = createSingleBlockForBranch(editor, rootParentBranch.id, 'right')
-                                            if (!newShapeId) {
-                                                showMessage('鍙充晶娣诲姞鍗曞潡澶辫触', 3000, 'error')
-                                            }
-                                        }}
-                                        title="鍙充晶娣诲姞鍗曞潡"
-                                    >
-                                        <Icons.BranchAddRight />
-                                    </HoverButton>
+                                    {getAllBranchChildIds(rootParentBranch).length > 0 && (
+                                        <HoverButton
+                                            style={buttonStyle}
+                                            active={rootParentBranch.props.isCollapsed === true}
+                                            onClick={() => toggleBranchCollapsed(editor, rootParentBranch.id)}
+                                            onContextMenu={(event) => {
+                                                event.preventDefault()
+                                                event.stopPropagation()
+                                                toggleBranchSubtreeCollapsed(editor, rootParentBranch.id)
+                                            }}
+                                            title={`${rootParentBranch.props.isCollapsed ? '展开分支' : '收缩分支'}（右键：${rootParentBranch.props.isCollapsed ? '展开所有子项' : '折叠所有子项'}）`}
+                                        >
+                                            {rootParentBranch.props.isCollapsed ? <Icons.BranchExpand /> : <Icons.BranchCollapse />}
+                                        </HoverButton>
+                                    )}
+                                    {canAddSingleBlockToRootBranch && (
+                                        <HoverButton
+                                            style={buttonStyle}
+                                            onClick={() => {
+                                                const newShapeId = createSingleBlockForBranch(editor, rootParentBranch.id, 'left')
+                                                if (!newShapeId) {
+                                                    showMessage('宸︿晶娣诲姞鍗曞潡澶辫触', 3000, 'error')
+                                                }
+                                            }}
+                                            title="宸︿晶娣诲姞鍗曞潡"
+                                        >
+                                            <Icons.BranchAddLeft />
+                                        </HoverButton>
+                                    )}
+                                    {canAddSingleBlockToRootBranch && (
+                                        <HoverButton
+                                            style={buttonStyle}
+                                            onClick={() => {
+                                                const newShapeId = createSingleBlockForBranch(editor, rootParentBranch.id, 'right')
+                                                if (!newShapeId) {
+                                                    showMessage('鍙充晶娣诲姞鍗曞潡澶辫触', 3000, 'error')
+                                                }
+                                            }}
+                                            title="鍙充晶娣诲姞鍗曞潡"
+                                        >
+                                            <Icons.BranchAddRight />
+                                        </HoverButton>
+                                    )}
                                 </>
                             )}
                             {rootParentBranch && (

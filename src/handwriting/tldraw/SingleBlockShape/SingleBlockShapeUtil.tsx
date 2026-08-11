@@ -36,7 +36,7 @@ import { createArrowBetweenShapes } from '../utils/addConnectedSingleBlock'
 import { getShapeHostElement } from '../utils/getShapeHostElement'
 import { getCachedHtml, setCachedHtml, cacheFromProtyleHost, invalidateCache, requestBlockDOM, getBlockContent, renderSimpleBlockHtml } from '../block-html-cache'
 import { renderAllContentIdle } from '../utils/render/content-renderer'
-import { cancelIdleRender } from '../utils/idle-scheduler'
+import { cancelIdleRender, isIdleRenderCancelledError } from '../utils/idle-scheduler'
 import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
 import { getDefaultColorTheme } from '../utils/color-theme'
@@ -169,6 +169,7 @@ function useSingleBlockSize(
 	const prevEditingRef = useRef(isEditingState)
 	// 记录上次测量的高度，用于锁定期间保持稳定
 	const lastHeightRef = useRef<number | null>(null)
+	const measurementFrameRef = useRef<number | null>(null)
 
 	// 检测编辑态切换，临时锁定高度
 	useEffect(() => {
@@ -238,11 +239,35 @@ function useSingleBlockSize(
 		shouldSkipMeasurement,
 	])
 
-	// 在每次渲染后立即测量尺寸
+	const scheduleShapeSizeUpdate = useCallback(() => {
+		if (shouldSkipMeasurement || measurementFrameRef.current !== null) return
+		measurementFrameRef.current = requestAnimationFrame(() => {
+			measurementFrameRef.current = null
+			updateShapeSize()
+		})
+	}, [shouldSkipMeasurement, updateShapeSize])
+
+	// 仅在测量输入变化时同步一次；后续 DOM 变化由观察器合帧处理。
 	useLayoutEffect(() => {
 		if (shouldSkipMeasurement) return
 		updateShapeSize()
-	})
+	}, [shouldSkipMeasurement, updateShapeSize])
+
+	useEffect(() => {
+		if (shouldSkipMeasurement && measurementFrameRef.current !== null) {
+			cancelAnimationFrame(measurementFrameRef.current)
+			measurementFrameRef.current = null
+		}
+	}, [shouldSkipMeasurement])
+
+	useEffect(() => {
+		return () => {
+			if (measurementFrameRef.current !== null) {
+				cancelAnimationFrame(measurementFrameRef.current)
+				measurementFrameRef.current = null
+			}
+		}
+	}, [])
 
 	// 使用 ResizeObserver 监听 DOM 尺寸变化
 	useLayoutEffect(() => {
@@ -257,14 +282,14 @@ function useSingleBlockSize(
 		if (!target) return
 
 		const observer = new ResizeObserver(() => {
-			updateShapeSize()
+			scheduleShapeSizeUpdate()
 		})
 		observer.observe(target)
 
 		return () => {
 			observer.disconnect()
 		}
-	}, [updateShapeSize, isEditingState, shouldSkipMeasurement])
+	}, [isEditingState, scheduleShapeSizeUpdate, shouldSkipMeasurement])
 
 	// 使用 MutationObserver 监听 DOM 内容变化
 	useLayoutEffect(() => {
@@ -279,14 +304,14 @@ function useSingleBlockSize(
 		if (!target) return
 
 		const observer = new MutationObserver(() => {
-			updateShapeSize()
+			scheduleShapeSizeUpdate()
 		})
 		observer.observe(target, { subtree: true, childList: true, attributes: true, characterData: true })
 
 		return () => {
 			observer.disconnect()
 		}
-	}, [updateShapeSize, isEditingState, shouldSkipMeasurement])
+	}, [isEditingState, scheduleShapeSizeUpdate, shouldSkipMeasurement])
 
 	// 监听图片加载完成后重新测量
 	useEffect(() => {
@@ -302,7 +327,7 @@ function useSingleBlockSize(
 
 		const handlers: Array<() => void> = []
 		target.querySelectorAll('img').forEach((img) => {
-			const handler = () => updateShapeSize()
+			const handler = () => scheduleShapeSizeUpdate()
 			img.addEventListener('load', handler)
 			handlers.push(() => img.removeEventListener('load', handler))
 		})
@@ -310,7 +335,7 @@ function useSingleBlockSize(
 		return () => {
 			handlers.forEach((off) => off())
 		}
-	}, [updateShapeSize, isEditingState, shouldSkipMeasurement])
+	}, [isEditingState, scheduleShapeSizeUpdate, shouldSkipMeasurement])
 
 	return { updateShapeSize }
 }
@@ -333,7 +358,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 	}
 
 	override canCull(_shape: ISingleBlockShape): boolean {
-		return false
+		// Keep the active editor mounted; all other cards can use tldraw's native culling.
+		return this.editor.getEditingShapeId() !== _shape.id
+
 	}
 
 	override canResize(): boolean {
@@ -417,6 +444,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			(branchInteractionHint.targetShapeId === shape.id ||
 				(!branchInteractionHint.targetShapeId && branchInteractionHint.draggingShapeId === shape.id))
 		const isEditingState = isEditing
+		// 始终指向最新编辑态，供 shapeLoadManager 的 metaProvider 读取（避免把 isEditingState 放进 effect 依赖导致重注册）
+		const isEditingStateRef = useRef(isEditingState);
+		isEditingStateRef.current = isEditingState;
 		// Stay blocked until ShapeLoadManager computes this shape's visibility.
 		// Effects in the initial commit still see these values after registration.
 		const [isInViewport, setIsInViewport] = useState(false)
@@ -545,8 +575,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		}, [editor, shape.id])
 
 		// 使用独立的尺寸测量 hook（自动处理尺寸更新）
-	// 如果有加载错误，跳过测量以避免异常增长
-	useSingleBlockSize(editor, shape, containerRef, protyleHostRef, isEditingState, shouldUseLightweightPreview || hasLoadError)
+		// 如果有加载错误，跳过测量以避免异常增长
+		useSingleBlockSize(editor, shape, containerRef, protyleHostRef, isEditingState, shouldUseLightweightPreview || hasLoadError)
 		// 检测是否包含属性视图图标（数据库图标）
 		useEffect(() => {
 			if (isSmallSingleBlock) {
@@ -640,39 +670,42 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			return () => clearTimeout(timer)
 		}, [isEditing, shape.id])
 
+		// register with global shape load manager (drives visibility + load admission)
+		// 注意：依赖只放 shape.id，编辑态切换通过 isEditingStateRef 读取，避免每次编辑翻转都 unregister/register，
+		// 否则 shapeLoadManager 的悲观重置会让入场状态短暂回落到 blocked，导致退出编辑时闪一下。
 		useEffect(() => {
 			shapeLoadManager.attachEditor(editor as any)
 			const unregister = shapeLoadManager.register(
 				shape.id,
 				editor as any,
-				() => ({ editing: isEditingState }),
+				() => ({ editing: isEditingStateRef.current }),
 				(allowed, meta) => {
 					setCanLoad(allowed)
 					setIsInViewport(meta.inViewport)
 				}
 			)
 			return unregister
-		}, [isEditingState, shape.id])
+		}, [shape.id])
 
 		// ===== 核心优化：只在编辑态创建 Protyle，非编辑态使用静态 HTML =====
-		
+
 		// 加载静态内容（非编辑态）
 		useEffect(() => {
 			// 编辑态不需要加载静态内容
 			if (isEditingState || isSmallSingleBlock) return
-			
+
 			const blockId = shape.props.blockId
 			if (!blockId) return
 			const fontSize = shape.props.fontSize || 16
-			
+
 			// 检查视口可见性
 			const shouldLoad = !isViewportCullingEnabled || (isInViewport && canLoad)
 			if (!shouldLoad) return
-			
+
 			// refreshNonce 变化时强制刷新缓存
 			const forceRefresh = refreshNonceRef.current !== shape.props.refreshNonce
 			refreshNonceRef.current = shape.props.refreshNonce
-			
+
 			// 尝试从缓存获取（除非需要强制刷新）
 			if (!forceRefresh) {
 				const cached = getCachedHtml(blockId, fontSize)
@@ -685,12 +718,12 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				// 刷新时使缓存失效
 				invalidateCache(blockId)
 			}
-			
+
 			// 从 API 获取块的 DOM HTML（会自动批量合并请求）
 			let cancelled = false
 			setIsLoadingContent(true)
 			setHasLoadError(false)
-			
+
 			// 使用批量请求函数获取 DOM
 			requestBlockDOM(blockId, fontSize).then(async (html) => {
 				if (cancelled) return
@@ -723,7 +756,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			}).finally(() => {
 				if (!cancelled) setIsLoadingContent(false)
 			})
-			
+
 			return () => { cancelled = true }
 		}, [isEditingState, isSmallSingleBlock, shape.props.blockId, shape.props.fontSize, shape.props.refreshNonce, isInViewport, canLoad, isViewportCullingEnabled, persistLightweightPreviewText])
 
@@ -731,26 +764,28 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		// 使用空闲调度，避免在拖动画布时阻塞主线程
 		useEffect(() => {
 			if (!staticHtml || isEditingState || shouldUseLightweightPreview || !staticContentRef.current) return
-			
+
 			// 重置渲染状态
 			setIsContentRendered(false)
-			
+
 			// 生成唯一的渲染任务 ID
 			const renderTaskId = `render-static-${shape.id}`
 			let cancelled = false
-			
+
 			// 使用 requestAnimationFrame 确保 DOM 已更新
 			const rafId = requestAnimationFrame(() => {
 				if (staticContentRef.current) {
 					// 使用空闲调度渲染，在交互时会暂停
 					renderAllContentIdle(staticContentRef.current, 10, renderTaskId).then(() => {
 						if (!cancelled) setIsContentRendered(true)
-					}).catch(() => {
-						// 忽略渲染错误
+					}).catch((error) => {
+						if (!isIdleRenderCancelledError(error)) {
+							console.warn('单块静态内容渲染失败:', error)
+						}
 					})
 				}
 			})
-			
+
 			return () => {
 				cancelled = true
 				cancelAnimationFrame(rafId)
@@ -785,7 +820,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						// ignore
 					}
 				}
-				
+
 				const editorElement = container.closest('.tldraw__editor')
 				const tldrawId = editorElement?.getAttribute('data-tldraw-id')
 				const title = editorElement?.getAttribute('data-tldraw-title')
@@ -1021,7 +1056,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						event.preventDefault()
 						event.stopImmediatePropagation()
 						event.stopPropagation()
-						; (event as any).returnValue = false
+							; (event as any).returnValue = false
 					} catch (e) {
 						// ignore
 					}
@@ -1088,7 +1123,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						event.preventDefault()
 						event.stopImmediatePropagation()
 						event.stopPropagation()
-						; (event as any).returnValue = false
+							; (event as any).returnValue = false
 					} catch (e) { }
 				}
 
@@ -1111,7 +1146,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 				// 挂载 Protyle
 				await mountProtyle(blockId)
-				
+
 				// 注册键盘处理
 				registerKeyHandler()
 			}
@@ -1601,8 +1636,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		clearBranchInteractionHint(currentShape.id as string)
 		if (updateBranchAttachmentAfterDrag(this.editor, currentShape)) return
 
-        // 如果当前 shape 标记为不允许绑定，则跳过创建绑定
-        if (currentShape.props.allowBinding === false) return
+		// 如果当前 shape 标记为不允许绑定，则跳过创建绑定
+		if (currentShape.props.allowBinding === false) return
 		const pageAnchor = this.editor
 			.getShapePageTransform(currentShape)
 			.applyToPoint(this.editor.getShapeGeometry(currentShape).bounds.center)

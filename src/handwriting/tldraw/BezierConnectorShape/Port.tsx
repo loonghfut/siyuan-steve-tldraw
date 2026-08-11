@@ -90,11 +90,16 @@ export const Port = memo(function Port({ shapeId, portId, isSelected = false }: 
 
 	const { port, hitSize, dotSize, defaultDotColor } = portData
 	const isInput = port.terminal === 'end'
+	// Standard shapes use the bottom port as their sole connection-creation
+	// entry point. The other logical ports remain available for automatic binding
+	// and hit testing, but are intentionally not rendered in the overlay.
+	const isStandardPort = portId === 'input' || portId === 'output' || portId === 'top' || portId === 'bottom'
+	const canStartConnection = !isStandardPort || portId === 'bottom'
 
 	const left = typeof port.x === 'number' ? `${port.x}px` : undefined
 	const top = typeof port.y === 'number' ? `${port.y}px` : undefined
 
-	const scale = isHinting ? 1.4 : 1
+	const scale = isHinting ? 1.15 : 1
 	let extraOffsetX = 0
 	let extraOffsetY = 0
 	if (settingdata["showCardBorder"]) {
@@ -113,12 +118,13 @@ export const Port = memo(function Port({ shapeId, portId, isSelected = false }: 
 				left,
 				top,
 				transform: `translate(-50%, -50%) translateX(${extraOffsetX}px) translateY(${extraOffsetY}px) scale(${displayScale})`,
-				pointerEvents: isInteractive ? 'all' : 'none',
+				pointerEvents: isInteractive && canStartConnection ? 'all' : 'none',
 				backgroundColor: isHinting || isEligible ? undefined : defaultDotColor,
 				'--port-hit-size': `${hitSize}px`,
 				'--port-dot-size': `${dotSize}px`,
 			} as React.CSSProperties}
 			onPointerDown={() => {
+				if (!canStartConnection) return
 				// 注意：不要 stopPropagation / markEventAsHandled——
 				// tldraw 需要收到这次 pointerdown 才会更新 inputs.isDragging，
 				// 否则 PointingPort.onPointerMove 永远不会进入拖拽创建连接的分支
@@ -176,9 +182,15 @@ export function PortsOverlay({ shapeId }: { shapeId: TLShapeId }) {
 
 	return (
 		<div className="bezier-connector-ports-overlay">
-			{Object.keys(ports).map((portId) => (
+			{Object.keys(ports)
+				.filter((portId) => {
+					// 标准形状只显示 bottom 入口；思维导图使用带节点前缀的端口 ID，保持原有显示。
+					const isStandardPort = portId === 'input' || portId === 'output' || portId === 'top' || portId === 'bottom'
+					return !isStandardPort || portId === 'bottom'
+				})
+				.map((portId) => (
 				<Port key={portId} shapeId={shapeId} portId={portId} isSelected={isSelected} />
-			))}
+				))}
 		</div>
 	)
 }

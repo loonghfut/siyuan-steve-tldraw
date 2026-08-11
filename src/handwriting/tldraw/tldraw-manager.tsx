@@ -40,6 +40,7 @@ import { MindMapShapeTool } from './MindMapShape/MindMapShapeTool';
 import { BranchShapeUtil } from './BranchShape/BranchShapeUtil';
 import { BranchShapeTool } from './BranchShape/BranchShapeTool';
 import { keepBranchLayoutsUpdated } from './BranchShape/keep-branch-layouts-updated';
+import { getBranchShapeVisibility } from './BranchShape/branch-collapse';
 import { setupDoubleClickHandler, type DoubleClickCreationType } from './utils/setupDoubleClickHandler';
 import { ConfiguredEmbedShapeUtil } from './utils/custom-embeds';
 import { tldrawkey } from '@/../my/key';
@@ -55,6 +56,7 @@ import type { AgentDocOutlineBoardOptions } from './agent/tools/internal/documen
 import type { AgentPlanApplyOptions } from './agent/tools/internal/planning/plan-runner';
 import { InteractionHintOverlayUtil } from './ui-overrides/overlay-utils/InteractionHintOverlayUtil';
 import { syncTldrawThemeFromSiyuan } from './utils/siyuan-theme';
+import { ZoomInvariantFrameShapeUtil } from './FrameShape/ZoomInvariantFrameShapeUtil';
 const assetUrls = createAssetUrlsWithCustomIcons();
 
 
@@ -65,9 +67,14 @@ const assetUrls = createAssetUrlsWithCustomIcons();
 const configuredArrowShapeUtil = ArrowShapeUtil.configure({
     shouldBeExact: (_editor, isPrecise) => settingdata['tldraw-exact-arrow-mode'] && isPrecise,
 })
-// 从默认形状工具中过滤掉原始的ArrowShapeUtil，避免重复定义
-const filteredDefaultShapeUtils = defaultShapeUtils.filter(util => util.type !== 'arrow' && util.type !== 'embed')
-const customShapeUtils = [...filteredDefaultShapeUtils, configuredArrowShapeUtil, ConfiguredEmbedShapeUtil, CardShapeUtil, SingleBlockShapeUtil, SlideShapeUtil, JsShapeUtil, MindMapShapeUtil, BranchShapeUtil, BezierConnectorShapeUtil]
+// 启用原生 Frame 的颜色样式：颜色同时用于背景、边框和标题。
+// configure 会将 color 注册为样式属性，因此默认样式面板会自动显示颜色选择器。
+const configuredFrameShapeUtil = ZoomInvariantFrameShapeUtil.configure({ showColors: true })
+// 从默认形状工具中过滤掉已配置的工具，避免重复定义。
+const filteredDefaultShapeUtils = defaultShapeUtils.filter(
+    util => util.type !== 'arrow' && util.type !== 'embed' && util.type !== 'frame'
+)
+const customShapeUtils = [...filteredDefaultShapeUtils, configuredArrowShapeUtil, configuredFrameShapeUtil, ConfiguredEmbedShapeUtil, CardShapeUtil, SingleBlockShapeUtil, SlideShapeUtil, JsShapeUtil, MindMapShapeUtil, BranchShapeUtil, BezierConnectorShapeUtil]
 const customBindingUtils = [...defaultBindingUtils, SingleBlockBindingUtil, BezierConnectorBindingUtil]
 const customTools = [CardShapeTool, SingleBlockShapeTool, SlideShapeTool, JsShapeTool, MindMapShapeTool, BranchShapeTool]
 const customOverlayUtils: readonly TLOverlayUtilConstructor[] = [InteractionHintOverlayUtil]
@@ -389,6 +396,7 @@ export class TldrawManager {
                     bindingUtils={customBindingUtils}
                     tools={customTools}
                     overlayUtils={customOverlayUtils}
+                    getShapeVisibility={getBranchShapeVisibility}
                     overrides={uiOverrides}
                     options={this.options}
                     components={components}
@@ -1034,6 +1042,11 @@ export class TldrawManager {
         container.addEventListener('pointerup', handlePointerUp, { passive: true });
         container.addEventListener('pointercancel', handlePointerUp, { passive: true });
         container.addEventListener('wheel', handleWheel, { passive: true });
+        // A drag may finish outside the editor container. Without this fallback,
+        // the idle scheduler can remain paused and static card rendering never runs.
+        window.addEventListener('pointerup', handlePointerUp, true);
+        window.addEventListener('pointercancel', handlePointerUp, true);
+        window.addEventListener('blur', handlePointerUp);
         
         // 使用 store 监听器来检测形状变化（拖动、调整大小等）
         // 性能优化：增加节流间隔，减少CPU占用
@@ -1054,6 +1067,9 @@ export class TldrawManager {
             container.removeEventListener('pointerup', handlePointerUp);
             container.removeEventListener('pointercancel', handlePointerUp);
             container.removeEventListener('wheel', handleWheel);
+            window.removeEventListener('pointerup', handlePointerUp, true);
+            window.removeEventListener('pointercancel', handlePointerUp, true);
+            window.removeEventListener('blur', handlePointerUp);
             unsubscribe();
             setInteracting(false);
         };
