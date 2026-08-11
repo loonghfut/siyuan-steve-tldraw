@@ -481,7 +481,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const [isLoadingContent, setIsLoadingContent] = useState(false)
 		// When the load manager withholds a full DOM preview, retain a compact
 		// summary instead of presenting an action-oriented loading placeholder.
-		const shouldUseLightweightPreview = !isEditingState && (isSmallSingleBlock || !canLoad)
+		const shouldUseLightweightPreview = !isEditingState &&
+			(isSmallSingleBlock || (isViewportCullingEnabled && !canLoad))
 		const detachKeyHandler = useRef<() => void>()
 		// 全局由 shapeLoadManager 计算可见性，无需本地定时轮询
 		const loadHandleRef = useRef<ProtyleLoadHandle | null>(null)

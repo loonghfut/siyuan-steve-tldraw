@@ -1544,12 +1544,54 @@ export interface IResGetDoc {
     type: string;
 }
 
-export async function getDoc(id: string): Promise<IResGetDoc> {
+export interface GetDocOptions {
+    /**
+     * Limit the number of blocks returned by SiYuan. The kernel otherwise
+     * defaults this to 102400, which is unsuitable for lightweight previews.
+     */
+    size?: number;
+    /** 0: current block/document, matching the historic getDoc behaviour. */
+    mode?: number;
+    /** Lets callers abandon stale viewport-driven document requests. */
+    signal?: AbortSignal;
+}
+
+interface AbortableRequestOptions {
+    signal?: AbortSignal;
+}
+
+async function requestAbortable<T>(url: string, data: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+    if (!signal) {
+        return request(url, data) as Promise<T>;
+    }
+
+    // Siyuan's fetchSyncPost does not expose a signal. Keep its normal path
+    // untouched, and use the equivalent browser request only for callers that
+    // must abandon stale viewport work.
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+        signal,
+    });
+    if (!response.ok) {
+        throw new Error(`请求失败: ${response.status} ${response.statusText}`);
+    }
+
+    const payload = await response.json() as IWebSocketData;
+    if (payload.code !== 0) {
+        throw new Error(payload.msg || '请求失败');
+    }
+    return payload.data as T;
+}
+
+export async function getDoc(id: string, options: GetDocOptions = {}): Promise<IResGetDoc> {
     const data = {
-        id: id
+        id,
+        ...(Number.isFinite(options.size) ? { size: Math.max(1, Math.floor(options.size!)) } : {}),
+        ...(Number.isFinite(options.mode) ? { mode: Math.floor(options.mode!) } : {}),
     };
-    const url = '/api/filetree/getDoc';
-    return request(url, data);
+    return requestAbortable<IResGetDoc>('/api/filetree/getDoc', data, options.signal);
 }
 
 export interface IResGetDocInfo {
@@ -1569,12 +1611,12 @@ export interface IResGetDocInfo {
  * @param id 文档块 ID
  * @returns 文档信息对象
  */
-export async function getDocInfo(id: string): Promise<IResGetDocInfo> {
+export async function getDocInfo(id: string, options: AbortableRequestOptions = {}): Promise<IResGetDocInfo> {
     const data = {
         id: id
     };
     const url = '/api/block/getDocInfo';
-    return request(url, data);
+    return requestAbortable<IResGetDocInfo>(url, data, options.signal);
 }
 
 /**

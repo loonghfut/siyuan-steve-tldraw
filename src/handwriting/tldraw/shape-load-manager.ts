@@ -29,6 +29,7 @@ interface ShapeLoadMeta {
 
 interface ComputedMeta {
   inViewport: boolean
+  inPreloadZone: boolean
   distance: number
 }
 
@@ -50,7 +51,10 @@ class ShapeLoadManager {
   private recomputeTimer: ReturnType<typeof setTimeout> | null = null
   private immediateRecomputeQueued = false
   private lastRecomputeAt = 0
-  private readonly PRELOAD_MARGIN_WORLD = 1600
+  // Keep the preload ring proportional to the visible page bounds instead of
+  // a fixed world-unit distance. Fixed world units become an enormous screen
+  // area when zoomed in and starve actually visible cards of the load budget.
+  private readonly PRELOAD_VIEWPORT_FRACTION = 0.35
   // Keep the established admission cadence while making it event-driven.
   // The difference is that an idle whiteboard no longer wakes every frame.
   private readonly IDLE_RECOMPUTE_INTERVAL_MS = 500
@@ -88,7 +92,7 @@ class ShapeLoadManager {
       metaProvider,
       onChange: onPermissionChange,
       lastAllowed: snapshot ? snapshot.lastAllowed : false,
-      lastComputed: snapshot ? snapshot.lastComputed : { inViewport: false, distance: Infinity },
+      lastComputed: snapshot ? snapshot.lastComputed : { inViewport: false, inPreloadZone: false, distance: Infinity },
     }
     this.shapes.set(shapeId, entry)
     // A remounted component starts with its own local state. Always deliver the
@@ -154,6 +158,15 @@ class ShapeLoadManager {
     this.recompute()
   }
 
+  /**
+   * Camera updates are intentionally coalesced while the user pans. Call this
+   * when the interaction settles so newly visible shapes do not wait for the
+   * normal idle/interacting recompute interval.
+   */
+  notifyViewportSettled() {
+    this.queueRecompute(true)
+  }
+
   private queueRecompute(immediate = false) {
     if (this.shapes.size === 0) return
 
@@ -189,24 +202,28 @@ class ShapeLoadManager {
       // compute visibility & distance using the shape's own editor
       let distance = Infinity
       let inViewport = false
+      let inPreloadZone = false
       try {
         const vp = s.editor?.getViewportPageBounds()
         const b = s.editor?.getShapePageBounds(s.id)
         if (vp && b) {
+          inViewport = vp.minX < b.maxX && vp.maxX > b.minX && vp.minY < b.maxY && vp.maxY > b.minY
+          const marginX = vp.width * this.PRELOAD_VIEWPORT_FRACTION
+          const marginY = vp.height * this.PRELOAD_VIEWPORT_FRACTION
           const expanded = {
-            minX: vp.minX - this.PRELOAD_MARGIN_WORLD,
-            minY: vp.minY - this.PRELOAD_MARGIN_WORLD,
-            maxX: vp.maxX + this.PRELOAD_MARGIN_WORLD,
-            maxY: vp.maxY + this.PRELOAD_MARGIN_WORLD,
+            minX: vp.minX - marginX,
+            minY: vp.minY - marginY,
+            maxX: vp.maxX + marginX,
+            maxY: vp.maxY + marginY,
           }
-          inViewport = expanded.minX < b.maxX && expanded.maxX > b.minX && expanded.minY < b.maxY && expanded.maxY > b.minY
+          inPreloadZone = expanded.minX < b.maxX && expanded.maxX > b.minX && expanded.minY < b.maxY && expanded.maxY > b.minY
           const cx = vp.midX, cy = vp.midY
           const sx = (b.minX + b.maxX) / 2, sy = (b.minY + b.maxY) / 2
           distance = Math.hypot(cx - sx, cy - sy)
         }
       } catch { /* ignore */ }
 
-      const cmeta: ComputedMeta = { inViewport, distance }
+      const cmeta: ComputedMeta = { inViewport, inPreloadZone, distance }
       if (provided.editing) {
         sortable.push({ id: s.id, score: -Infinity, editing: true, meta: cmeta })
       } else {
@@ -225,7 +242,6 @@ class ShapeLoadManager {
     
     // 分离视口内和视口外的形状
     const inViewportItems = sortable.filter(item => !item.editing && item.meta.inViewport)
-    const outOfViewportItems = sortable.filter(item => !item.editing && !item.meta.inViewport)
     
     // 第一步：编辑中的形状始终允许（不计入配额）
     for (const item of sortable) {
@@ -242,39 +258,25 @@ class ShapeLoadManager {
       }
     }
     
-    // 第三步：如果配额有剩余，保留视口外已加载的形状（防止频繁卸载/加载）
-    for (const item of outOfViewportItems) {
-      if (allowedCount >= maxActive) break
-      
-      const shape = this.shapes.get(item.id as TLShapeId)
-      const wasAllowed = shape?.lastAllowed ?? false
-      if (wasAllowed) {
-        allowedSet.add(item.id)
-        allowedCount++
-      }
-    }
-    
-    // 第四步：如果配额还有剩余，按优先级加载视口外的新形状
-    for (const item of outOfViewportItems) {
-      if (allowedCount >= maxActive) break
-      if (allowedSet.has(item.id)) continue
-      
-      allowedSet.add(item.id)
-      allowedCount++
-    }
+    // Shapes in the preload ring are tracked through `inPreloadZone`, but do
+    // not receive full-content admission. Their persisted previewText remains
+    // visible without allowing off-screen document fetches to consume slots.
 
     const computedById = new Map(sortable.map((item) => [item.id, item.meta]))
 
     // Notify changes
     for (const s of this.shapes.values()) {
       const newAllowed = allowedSet.has(s.id)
-      const computed = computedById.get(s.id) || { inViewport: false, distance: Infinity }
+      const computed = computedById.get(s.id) || { inViewport: false, inPreloadZone: false, distance: Infinity }
       // Refresh ordering when the viewport center moved meaningfully, while
       // avoiding callbacks on every 500ms recompute during tiny camera motion.
       const distanceChanged = Number.isFinite(computed.distance) && Number.isFinite(s.lastComputed.distance)
         ? Math.abs(computed.distance - s.lastComputed.distance) >= 128
         : computed.distance !== s.lastComputed.distance
-      const changed = newAllowed !== s.lastAllowed || computed.inViewport !== s.lastComputed.inViewport || distanceChanged
+      const changed = newAllowed !== s.lastAllowed ||
+        computed.inViewport !== s.lastComputed.inViewport ||
+        computed.inPreloadZone !== s.lastComputed.inPreloadZone ||
+        distanceChanged
       s.lastAllowed = newAllowed
       s.lastComputed = computed
       if (changed) {

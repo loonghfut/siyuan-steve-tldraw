@@ -17,6 +17,55 @@ let renderTaskIdCounter = 0
 const CDN = undefined // 使用思源默认 CDN
 
 /**
+ * Resolve query embeds before any optional rich-content rendering. A query
+ * result replaces the source node, so it must run while that source DOM is
+ * still mounted and must not be swallowed when its Card is cancelled.
+ */
+export async function renderBlockQueryEmbeds(container: HTMLElement, signal?: AbortSignal): Promise<void> {
+	const throwIfAborted = () => {
+		if (signal?.aborted) throw new IdleRenderCancelledError()
+	}
+
+	throwIfAborted()
+	if (signal && !container.isConnected) return
+
+	const embedNodes = Array.from(container.querySelectorAll('[data-type="NodeBlockQueryEmbed"]'))
+	if (embedNodes.length === 0) return
+
+	const idsToResolve = embedNodes
+		.map((node) => node.getAttribute('data-node-id')?.trim() || '')
+		.filter(Boolean)
+	const uniqueIds = Array.from(new Set(idsToResolve))
+	if (uniqueIds.length === 0) return
+
+	try {
+		const embedDomMap = await getBlockDOMsWithEmbed(uniqueIds)
+		throwIfAborted()
+		if (!embedDomMap) return
+
+		const buildFragmentFromHtml = (html: string) => {
+			const temp = document.createElement('div')
+			temp.innerHTML = html
+			const fragment = document.createDocumentFragment()
+			while (temp.firstChild) fragment.appendChild(temp.firstChild)
+			return fragment
+		}
+
+		for (const node of embedNodes) {
+			if (!node.isConnected) continue
+			const targetId = node.getAttribute('data-node-id')?.trim()
+			if (!targetId) continue
+			const replacementHtml = embedDomMap[targetId]
+			if (!replacementHtml) continue
+			node.replaceWith(buildFragmentFromHtml(replacementHtml))
+		}
+	} catch (err) {
+		if (isIdleRenderCancelledError(err)) throw err
+		console.error('获取嵌入 DOM 内容失败:', err)
+	}
+}
+
+/**
  * 渲染容器内的所有内容
  * @param container 容器元素
  */
@@ -29,46 +78,8 @@ export async function renderAllContent(container: HTMLElement, signal?: AbortSig
 		throwIfAborted()
 		// 已被 React 替换的预览不应继续触发网络/DOM 渲染。
 		if (signal && !container.isConnected) return
-		// 处理嵌入块
-		const embedNodes = Array.from(
-			container.querySelectorAll('[data-type="NodeBlockQueryEmbed"]')
-		);
-
-		if (embedNodes.length > 0) {
-			const idsToResolve = embedNodes
-				.map((node) => node.getAttribute('data-node-id')?.trim() || '')
-				.filter(Boolean);
-			const uniqueIds = Array.from(new Set(idsToResolve));
-
-			if (uniqueIds.length > 0) {
-				try {
-					const embedDomMap = await getBlockDOMsWithEmbed(uniqueIds);
-					throwIfAborted()
-					if (embedDomMap) {
-						const buildFragmentFromHtml = (html: string) => {
-							const temp = document.createElement('div');
-							temp.innerHTML = html;
-							const fragment = document.createDocumentFragment();
-							while (temp.firstChild) {
-								fragment.appendChild(temp.firstChild);
-							}
-							return fragment;
-						};
-
-						embedNodes.forEach((node) => {
-							const targetId = node.getAttribute('data-node-id')?.trim();
-							if (!targetId) return;
-							const replacementHtml = embedDomMap[targetId];
-							if (!replacementHtml) return;
-							const fragment = buildFragmentFromHtml(replacementHtml);
-							node.replaceWith(fragment);
-						});
-					}
-				} catch (err) {
-					console.error('获取嵌入 DOM 内容失败:', err);
-				}
-			}
-		}
+		await renderBlockQueryEmbeds(container, signal)
+		throwIfAborted()
 
 		// 使用思源的渲染方法
 		ProtyleMethod.mathRender(container, CDN, false)

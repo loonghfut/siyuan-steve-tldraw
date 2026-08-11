@@ -19,7 +19,7 @@ import { ContentLoadHandle, enqueueProtyleLoad, ProtyleLoadHandle } from '../pro
 import { shapeLoadManager } from '../shape-load-manager'
 import { enqueueStaticPreviewLoad } from '../static-preview-load-queue'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
-import { renderAllContentIdle } from '../utils/render/content-renderer'
+import { renderAllContentIdle, renderBlockQueryEmbeds } from '../utils/render/content-renderer'
 import { cancelIdleRender, isIdleRenderCancelledError } from '../utils/idle-scheduler'
 import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
@@ -46,8 +46,13 @@ const pendingCreationPromises = new Map<string, Promise<string>>();
 const draggingBranchCardIds = new Set<string>()
 
 // 静态预览 DOM 缓存：避免重复请求
-const staticPreviewCache = new Map<string, { html: string; fontSize: number }>();
+const staticPreviewCache = new Map<string, { html: string; fontSize: number; blockLimit: number }>();
 const MAX_CACHE_SIZE = 50;
+// Static Cards are previews, not editors. Keep enough blocks for the visible
+// area and overscan, but never inherit SiYuan getDoc's 102400-block default.
+// Entering edit mode still mounts the complete Protyle document.
+const MIN_STATIC_PREVIEW_BLOCKS = 40
+const MAX_STATIC_PREVIEW_BLOCKS = 160
 
 // Card 的静态预览会按思源顶层块进行窗口化；只有当前可显示的块会留在 DOM 中。
 const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
@@ -57,6 +62,9 @@ const NON_VIRTUALIZABLE_MEDIA_SELECTOR = [
 	'[data-type="NodeAudio"]',
 	'[data-type="NodeIFrame"]',
 	'[data-type="NodeWidget"]',
+	// Query embeds are asynchronously replaced with their result DOM. Recreating
+	// them from outerHTML during card windowing can race that replacement.
+	'[data-type="NodeBlockQueryEmbed"]',
 	'video',
 	'audio',
 	'iframe',
@@ -67,11 +75,21 @@ function containsNonVirtualizableMedia(element: HTMLElement) {
 	return element.matches(NON_VIRTUALIZABLE_MEDIA_SELECTOR) || Boolean(element.querySelector(NON_VIRTUALIZABLE_MEDIA_SELECTOR))
 }
 
+function containsBlockQueryEmbed(root: ParentNode): boolean {
+	return Boolean(root.querySelector('[data-type="NodeBlockQueryEmbed"]'))
+}
+
 function configureStaticPreviewMedia(root: HTMLElement) {
 	// 卡片预览不播放视频；仅加载元数据可避免多个可见 Card 同时触发媒体解码。
 	root.querySelectorAll<HTMLVideoElement>('video').forEach((video) => {
 		if (!video.hasAttribute('preload')) video.preload = 'metadata'
 	})
+}
+
+function getStaticPreviewBlockLimit(height: number, fontSize: number): number {
+	const estimatedRowHeight = Math.max(28, fontSize * 1.7)
+	const visibleRows = Math.max(1, Math.ceil(Math.max(1, height) / estimatedRowHeight))
+	return Math.min(MAX_STATIC_PREVIEW_BLOCKS, Math.max(MIN_STATIC_PREVIEW_BLOCKS, visibleRows * 4))
 }
 
 function getDefaultCardBlockType(): DefaultCardBlockType {
@@ -174,17 +192,17 @@ function findStaticLinkTarget(target: EventTarget | null, root: HTMLElement | nu
 	return null
 }
 
-function cacheStaticPreview(blockId: string, html: string, fontSize: number) {
+function cacheStaticPreview(blockId: string, html: string, fontSize: number, blockLimit: number) {
 	if (staticPreviewCache.size >= MAX_CACHE_SIZE) {
 		const firstKey = staticPreviewCache.keys().next().value;
 		if (firstKey) staticPreviewCache.delete(firstKey);
 	}
-	staticPreviewCache.set(blockId, { html, fontSize });
+	staticPreviewCache.set(blockId, { html, fontSize, blockLimit });
 }
 
-function getCachedPreview(blockId: string, fontSize: number): string | null {
+function getCachedPreview(blockId: string, fontSize: number, blockLimit: number): string | null {
 	const cached = staticPreviewCache.get(blockId);
-	if (cached && cached.fontSize === fontSize) return cached.html;
+	if (cached && cached.fontSize === fontSize && cached.blockLimit === blockLimit) return cached.html;
 	return null;
 }
 
@@ -345,7 +363,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const exitEditGraceUntilRef = useRef(0)
 		// 退出编辑的宽限期内不降级为轻量预览，避免相机动画过程中尺寸/缩放抖动引发的闪动
 		const inExitGrace = Date.now() < exitEditGraceUntilRef.current
-		const shouldUseLightweightPreview = !isEditingState && !isCollapsed && (isSmallCard || !canLoad) && !inExitGrace
+		const shouldUseLightweightPreview = !isEditingState && !isCollapsed &&
+			(isSmallCard || (isViewportCullingEnabled && !canLoad)) && !inExitGrace
 		const lowDetailFontSize = getShapeLowDetailFontSize(Math.min(shape.props.w, shape.props.h), efficientZoom)
 		const isMainCard = Boolean(shape.props.isMain);
 		const collapsedTextSize = shape.props.collapsedTextSize || 21; // 折叠文字大小，默认21px
@@ -383,6 +402,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		// 缓存 blockId 以减少属性访问
 		const blockId = shape.props.blockId;
 		const fontSize = shape.props.fontSize || 16;
+		const staticPreviewBlockLimit = getStaticPreviewBlockLimit(shape.props.h, fontSize)
 
 		// 追踪上一次的编辑状态，用于检测编辑->非编辑的切换
 		const prevIsEditingRef = useRef(isEditingState);
@@ -1263,12 +1283,16 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			};
 
 			// 从 API 获取静态预览 - 用于文档块(isMain)的静态渲染
-			const useStaticPreviewFromGetDoc = async (targetBlockId: string, forceRefresh = false) => {
-				if (cancelled || !containerRef.current) return;
+			const useStaticPreviewFromGetDoc = async (
+				targetBlockId: string,
+				forceRefresh = false,
+				signal?: AbortSignal,
+			) => {
+				if (cancelled || signal?.aborted || !containerRef.current) return;
 
 				// 检查缓存（如果非强制刷新）
 				if (!forceRefresh) {
-					const cachedHtml = getCachedPreview(targetBlockId, fontSize);
+					const cachedHtml = getCachedPreview(targetBlockId, fontSize, staticPreviewBlockLimit);
 					if (cachedHtml) {
 						persistLightweightPreviewText(cachedHtml)
 						// 使用缓存的预览
@@ -1295,8 +1319,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							configureStaticPreviewMedia(clone)
 							containerRef.current.appendChild(clone);
 							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
+							if (containsBlockQueryEmbed(clone)) {
+								await renderBlockQueryEmbeds(clone, signal)
+								if (cancelled || signal?.aborted) return;
+							}
 							await renderAllContentIdle(clone, staticPreviewPriorityRef.current, renderTaskId, true);
-							if (cancelled) return;
+							if (cancelled || signal?.aborted) return;
 							return;
 						}
 					}
@@ -1305,26 +1333,32 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				// 使用 getDoc API 获取 DOM 内容
 				let domContent: string | null = null;
 				try {
-					const res = await api.getDoc(targetBlockId);
+					const res = await api.getDoc(targetBlockId, {
+						size: staticPreviewBlockLimit,
+						signal,
+					});
 					if (res && res.content) {
 						domContent = res.content;
 					}
 				} catch (err) {
+					if (signal?.aborted) return;
 					console.error('获取文档 DOM 内容失败:', err);
 				}
 
-				if (cancelled || !domContent) return;
+				if (cancelled || signal?.aborted || !domContent) return;
 				persistLightweightPreviewText(domContent)
 
 				// 对于 isMain 形状，获取文档信息（标题和题头图）
 				let docInfo: api.IResGetDocInfo | null = null;
 				if (isMainCard) {
 					try {
-						docInfo = await api.getDocInfo(targetBlockId);
+						docInfo = await api.getDocInfo(targetBlockId, { signal });
 					} catch (err) {
+						if (signal?.aborted) return;
 						console.error('获取文档信息失败:', err);
 					}
 				}
+				if (cancelled || signal?.aborted || !containerRef.current) return;
 
 				// 移除旧的静态预览
 				if (staticPreviewRef.current?.parentElement === containerRef.current) {
@@ -1441,6 +1475,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 				// 静态预览会先挂载，再按实际 Card 可见高度窗口化正文顶层块。
 				configureStaticPreviewMedia(previewWrapper)
+				// Decode protyle-html before deciding whether the DOM can be windowed:
+				// an embedded query may otherwise be hidden inside data-content.
+				try { convertProtyleHtmlToDom(previewWrapper) } catch (error) { console.warn('convertProtyleHtmlToDom failed', error) }
+				const previewContainsBlockQueryEmbed = containsBlockQueryEmbed(previewWrapper)
 				staticPreviewRef.current = previewWrapper;
 				installStaticPreviewLinkHandlers(previewWrapper);
 				containerRef.current.appendChild(previewWrapper);
@@ -1448,8 +1486,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				const virtualizer = CardContentVirtualizer.create(previewWrapper, {
 					isPinned: (element) =>
 						element.classList.contains('protyle-top') || element.classList.contains('protyle-title'),
-					// 原生媒体/嵌入节点的加载状态绑定在 DOM 实例上。窗口化会重建
-					// outerHTML，因此含这些节点的预览保留完整 DOM，避免视频反复加载。
+					// 原生媒体和嵌入查询的加载/替换状态绑定在 DOM 实例上。窗口化会
+					// 重建 outerHTML，因此含这些节点的预览保留完整 DOM。
 					shouldSkipVirtualization: (content) => content.some(containsNonVirtualizableMedia),
 					onMount: async (mountedContainer) => {
 						mountedContainer.querySelectorAll('img').forEach((img) => {
@@ -1470,15 +1508,18 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					previewWrapper.querySelectorAll('img').forEach((img) => {
 						if (!img.getAttribute('loading')) img.setAttribute('loading', 'lazy')
 					})
-					try { convertProtyleHtmlToDom(previewWrapper); } catch (error) { console.warn('convertProtyleHtmlToDom failed', error) }
+					if (previewContainsBlockQueryEmbed) {
+						await renderBlockQueryEmbeds(previewWrapper, signal)
+						if (cancelled || signal?.aborted) return;
+					}
 					await renderAllContentIdle(previewWrapper, staticPreviewPriorityRef.current, renderTaskId, true)
 				}
 
-				if (cancelled) return;
+				if (cancelled || signal?.aborted) return;
 
 				// 虚拟化预览只保存当前窗口，不能作为完整文档缓存。
 				if (!virtualizer) {
-					cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize);
+					cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize, staticPreviewBlockLimit);
 				}
 			};
 
@@ -1490,7 +1531,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					staticPreviewPriorityRef.current,
 					async (signal) => {
 						if (cancelled || signal.aborted) return
-						await useStaticPreviewFromGetDoc(targetBlockId, forceRefresh)
+						await useStaticPreviewFromGetDoc(targetBlockId, forceRefresh, signal)
 					},
 				)
 				staticPreviewLoadRef.current = handle

@@ -47,6 +47,7 @@ import { tldrawkey } from '@/../my/key';
 import { setupShapeLibraryDropHandler } from './shapelibrary/ShapeLibraryPanel';
 import { buildTldrawLink } from './utils/link-builder';
 import { setInteracting } from './utils/idle-scheduler';
+import { shapeLoadManager } from './shape-load-manager';
 import { markFocusedInstance, registerInstance, unregisterInstance } from './tldraw-instance-manager';
 import { createAssetUrlsWithCustomIcons } from './utils/custom-icons';
 import * as agentOps from './agent/tools/internal/operations/manager-ops';
@@ -996,6 +997,7 @@ export class TldrawManager {
             interactionDebounceTimer = setTimeout(() => {
                 isCurrentlyInteracting = false;
                 setInteracting(false);
+                shapeLoadManager.notifyViewportSettled();
                 interactionDebounceTimer = null;
             }, 100);
         };
@@ -1062,6 +1064,7 @@ export class TldrawManager {
             interactionDebounceTimer = setTimeout(() => {
                 isCurrentlyInteracting = false;
                 setInteracting(false);
+                shapeLoadManager.notifyViewportSettled();
                 interactionDebounceTimer = null;
             }, 200);
         };
@@ -1101,6 +1104,7 @@ export class TldrawManager {
             window.removeEventListener('blur', handlePointerUp);
             unsubscribe();
             setInteracting(false);
+            shapeLoadManager.notifyViewportSettled();
         };
         
         // 保存清理函数以便后续调用
