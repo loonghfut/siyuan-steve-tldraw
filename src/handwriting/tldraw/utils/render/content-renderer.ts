@@ -7,7 +7,7 @@
  * - 使用思源原生渲染方法，保证一致性
  */
 import { Protyle, ProtyleMethod } from 'siyuan'
-import { IdleRenderCancelledError, isIdleRenderCancelledError, isInteracting, scheduleIdleRender } from '../idle-scheduler'
+import { cancelIdleRender, IdleRenderCancelledError, isIdleRenderCancelledError, isInteracting, scheduleIdleRender } from '../idle-scheduler'
 import { getBlockDOMsWithEmbed } from '@/api/api'
 
 // 用于生成唯一的渲染任务 ID
@@ -140,24 +140,55 @@ export async function renderAllContentIdle(
 	container: HTMLElement,
 	priority = 10,
 	taskId?: string,
-	forceIdle = false
+	forceIdle = false,
+	externalSignal?: AbortSignal,
 ): Promise<void> {
 	const effectiveTaskId = taskId || `render-${++renderTaskIdCounter}`
+	if (externalSignal?.aborted) return
+	const cancelOnAbort = () => cancelIdleRender(effectiveTaskId)
+	externalSignal?.addEventListener('abort', cancelOnAbort, { once: true })
+
+	// The Card loading queue owns the network/DOM admission decision, while the
+	// idle scheduler owns expensive rich-content rendering. Link their signals
+	// so a Card that leaves the viewport can abandon both phases instead of
+	// keeping an idle task alive until all formulas/embeds finish rendering.
+	const renderWithLinkedSignal = async (schedulerSignal?: AbortSignal) => {
+		const controller = new AbortController()
+		const abort = () => controller.abort()
+		if (externalSignal?.aborted || schedulerSignal?.aborted) {
+			controller.abort()
+		}
+		externalSignal?.addEventListener('abort', abort, { once: true })
+		schedulerSignal?.addEventListener('abort', abort, { once: true })
+		try {
+			if (controller.signal.aborted) return
+			await renderAllContent(container, controller.signal)
+		} finally {
+			externalSignal?.removeEventListener('abort', abort)
+			schedulerSignal?.removeEventListener('abort', abort)
+		}
+	}
 
 	// 非交互、且调用方未明确要求延后时立即完成，保持普通内容的响应速度。
 	if (!forceIdle && !isInteracting()) {
-		await renderAllContent(container)
-		return
+		try {
+			await renderWithLinkedSignal()
+			return
+		} finally {
+			externalSignal?.removeEventListener('abort', cancelOnAbort)
+		}
 	}
 
 	try {
 		await scheduleIdleRender(effectiveTaskId, async (signal) => {
-			await renderAllContent(container, signal)
+			await renderWithLinkedSignal(signal)
 		}, priority)
 	} catch (error) {
 		// 组件 cleanup 主动取消是预期控制流；调用方不应因此把预览标成失败。
 		if (isIdleRenderCancelledError(error)) return
 		throw error
+	} finally {
+		externalSignal?.removeEventListener('abort', cancelOnAbort)
 	}
 }
 

@@ -19,7 +19,7 @@ import { ContentLoadHandle, enqueueProtyleLoad, ProtyleLoadHandle } from '../pro
 import { shapeLoadManager } from '../shape-load-manager'
 import { enqueueStaticPreviewLoad } from '../static-preview-load-queue'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
-import { renderAllContentIdle, renderBlockQueryEmbeds } from '../utils/render/content-renderer'
+import { renderAllContentIdle } from '../utils/render/content-renderer'
 import { cancelIdleRender, isIdleRenderCancelledError } from '../utils/idle-scheduler'
 import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
@@ -50,9 +50,11 @@ const staticPreviewCache = new Map<string, { html: string; fontSize: number; blo
 const MAX_CACHE_SIZE = 50;
 // Static Cards are previews, not editors. Keep enough blocks for the visible
 // area and overscan, but never inherit SiYuan getDoc's 102400-block default.
-// Entering edit mode still mounts the complete Protyle document.
-const MIN_STATIC_PREVIEW_BLOCKS = 40
-const MAX_STATIC_PREVIEW_BLOCKS = 160
+// Entering edit mode still mounts the complete Protyle document. The previous
+// fixed minimum of 40 made a board with many small Cards download hundreds of
+// offscreen blocks before the first pixels could be painted.
+const MIN_STATIC_PREVIEW_BLOCKS = 12
+const MAX_STATIC_PREVIEW_BLOCKS = 96
 
 // Card 的静态预览会按思源顶层块进行窗口化；只有当前可显示的块会留在 DOM 中。
 const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
@@ -75,10 +77,6 @@ function containsNonVirtualizableMedia(element: HTMLElement) {
 	return element.matches(NON_VIRTUALIZABLE_MEDIA_SELECTOR) || Boolean(element.querySelector(NON_VIRTUALIZABLE_MEDIA_SELECTOR))
 }
 
-function containsBlockQueryEmbed(root: ParentNode): boolean {
-	return Boolean(root.querySelector('[data-type="NodeBlockQueryEmbed"]'))
-}
-
 function configureStaticPreviewMedia(root: HTMLElement) {
 	// 卡片预览不播放视频；仅加载元数据可避免多个可见 Card 同时触发媒体解码。
 	root.querySelectorAll<HTMLVideoElement>('video').forEach((video) => {
@@ -89,7 +87,7 @@ function configureStaticPreviewMedia(root: HTMLElement) {
 function getStaticPreviewBlockLimit(height: number, fontSize: number): number {
 	const estimatedRowHeight = Math.max(28, fontSize * 1.7)
 	const visibleRows = Math.max(1, Math.ceil(Math.max(1, height) / estimatedRowHeight))
-	return Math.min(MAX_STATIC_PREVIEW_BLOCKS, Math.max(MIN_STATIC_PREVIEW_BLOCKS, visibleRows * 4))
+	return Math.min(MAX_STATIC_PREVIEW_BLOCKS, Math.max(MIN_STATIC_PREVIEW_BLOCKS, visibleRows * 3))
 }
 
 function getDefaultCardBlockType(): DefaultCardBlockType {
@@ -211,12 +209,28 @@ function invalidatePreviewCache(blockId: string) {
 	staticPreviewCache.delete(blockId);
 }
 
-// 批量块存在性检查：收集多个卡片的检查请求，合并处理
+function invalidateBlockExistenceCache(blockId: string) {
+	blockExistenceCache.delete(blockId)
+}
+
+// 批量块存在性检查：只对当前准入的卡片执行，并把同一帧内的查询合并成
+// 少量 SQL 请求。旧实现会在 2 秒后为每个 Card 单独发起一次查询，形状多时
+// 会和首屏 DOM 请求争抢网络与内核线程。
 const blockCheckQueue = new Map<string, { shapeId: string; resolve: (exists: boolean) => void }[]>();
+const blockExistenceCache = new Map<string, { exists: boolean; checkedAt: number }>();
+const BLOCK_EXISTENCE_CACHE_TTL_MS = 30_000;
+const BLOCK_CHECK_BATCH_SIZE = 100;
+const BLOCK_CHECK_DELAY_MS = 500;
 let blockCheckTimer: number | null = null;
 
 function scheduleBlockCheck(blockId: string, shapeId: string): Promise<boolean> {
 	return new Promise((resolve) => {
+		const cached = blockExistenceCache.get(blockId);
+		if (cached && Date.now() - cached.checkedAt < BLOCK_EXISTENCE_CACHE_TTL_MS) {
+			queueMicrotask(() => resolve(cached.exists));
+			return;
+		}
+
 		const list = blockCheckQueue.get(blockId) || [];
 		list.push({ shapeId, resolve });
 		blockCheckQueue.set(blockId, list);
@@ -227,19 +241,29 @@ function scheduleBlockCheck(blockId: string, shapeId: string): Promise<boolean> 
 				const entries = [...blockCheckQueue.entries()];
 				blockCheckQueue.clear();
 
-				// 并行检查所有块
-				await Promise.allSettled(
-					entries.map(async ([bid, callbacks]) => {
-						try {
-							const res = await api.getBlockByID(bid);
-							const exists = !!res;
-							callbacks.forEach(cb => cb.resolve(exists));
-						} catch {
-							callbacks.forEach(cb => cb.resolve(false));
-						}
-					})
-				);
-			}, 2000);
+				const ids = entries.map(([bid]) => bid);
+				for (let start = 0; start < ids.length; start += BLOCK_CHECK_BATCH_SIZE) {
+					const batchEntries = entries.slice(start, start + BLOCK_CHECK_BATCH_SIZE);
+					const batchIds = batchEntries.map(([bid]) => bid);
+					const escapedIds = batchIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',');
+					let existingIds = new Set<string>();
+					let querySucceeded = false;
+					try {
+						const rows = await api.sql(`SELECT id FROM blocks WHERE id IN (${escapedIds})`);
+						existingIds = new Set((rows || []).map((row: { id?: string }) => String(row?.id || '')));
+						querySucceeded = true;
+					} catch {
+						// Keep the previous fail-safe behaviour: an unavailable block
+						// check must not keep a stale Protyle alive indefinitely.
+					}
+
+					for (const [bid, callbacks] of batchEntries) {
+						const exists = existingIds.has(bid);
+						if (querySucceeded) blockExistenceCache.set(bid, { exists, checkedAt: Date.now() });
+						callbacks.forEach((cb) => cb.resolve(exists));
+					}
+				}
+			}, BLOCK_CHECK_DELAY_MS);
 		}
 	});
 }
@@ -447,6 +471,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const staticPreviewRef = useRef<HTMLElement | null>(null)
 		const cardContentVirtualizerRef = useRef<CardContentVirtualizer | null>(null)
 		const staticPreviewLoadRef = useRef<ContentLoadHandle | null>(null)
+		const richRenderAbortRef = useRef<AbortController | null>(null)
 		const staticPreviewPriorityRef = useRef(Number.MAX_SAFE_INTEGER)
 		const staticPreviewHandlersRef = useRef<{
 			target: HTMLElement
@@ -575,6 +600,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		}, [])
 
 		const destroyRuntimeResources = useCallback(() => {
+			richRenderAbortRef.current?.abort()
+			richRenderAbortRef.current = null
 			if (loadHandleRef.current) {
 				loadHandleRef.current.cancel()
 				loadHandleRef.current = null
@@ -648,6 +675,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			stopMissingStateEvent(event)
 			if (blockId) {
 				invalidatePreviewCache(blockId)
+				invalidateBlockExistenceCache(blockId)
 			}
 			destroyRuntimeResources()
 			setHasMissingLinkedBlock(false)
@@ -996,6 +1024,11 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				});
 			}
 			if (currentBlockId && !isEditingState) {
+				// Native tldraw culling may mount a Card before the admission
+				// callback has run. Defer the existence check until this Card is
+				// actually eligible for the viewport; otherwise a large offscreen
+				// board creates a second request wave before visible content loads.
+				if (isViewportCullingEnabled && renderAdmission !== 'allowed') return;
 				if (shape.props.isNewlyCreated) {
 					this.editor.updateShape({
 						id: shape.id,
@@ -1016,11 +1049,14 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					return () => { cancelled = true; };
 				}
 			}
-		}, [blockId, editor, enterMissingLinkedBlockState, isEditingState, shape.id, shape.props, shape.type, shape.props.refreshNonce]);
+		}, [blockId, editor, enterMissingLinkedBlockState, isEditingState, isViewportCullingEnabled, renderAdmission, shape.id, shape.props, shape.type, shape.props.refreshNonce]);
 		// Protyle 生命周期管理主 Effect
 		// 注意：对于 live-protyle 模式，编辑状态切换不应触发重建
 		useEffect(() => {
 			const renderTaskId = `render-card-content-${shape.id}`
+			const richRenderAbortController = new AbortController()
+			richRenderAbortRef.current?.abort()
+			richRenderAbortRef.current = richRenderAbortController
 			// 检测是否为手动刷新（通过 refreshNonce 变更触发）
 			const manualRefreshTriggered = refreshNonceRef.current !== shape.props.refreshNonce;
 			const shouldForceReloadLiveProtyle =
@@ -1319,18 +1355,34 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							configureStaticPreviewMedia(clone)
 							containerRef.current.appendChild(clone);
 							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
-							if (containsBlockQueryEmbed(clone)) {
-								await renderBlockQueryEmbeds(clone, signal)
-								if (cancelled || signal?.aborted) return;
-							}
-							await renderAllContentIdle(clone, staticPreviewPriorityRef.current, renderTaskId, true);
-							if (cancelled || signal?.aborted) return;
+							// Do not keep the static-load queue occupied while formulas,
+							// embeds and attribute views are enhanced. The lightweight DOM
+							// is already usable at this point; rich rendering is cancellable
+							// background work tied to this viewport admission.
+							void renderAllContentIdle(
+								clone,
+								staticPreviewPriorityRef.current,
+								renderTaskId,
+								true,
+								richRenderAbortController.signal,
+							).catch((error) => {
+								if (!isIdleRenderCancelledError(error)) console.warn('卡片缓存预览增强失败:', error)
+							});
 							return;
 						}
 					}
 				}
 
 				// 使用 getDoc API 获取 DOM 内容
+				// 主文档标题元数据与正文请求互不依赖，提前发起元数据请求，
+				// 避免正文返回后再额外等待一个网络往返。
+				const docInfoPromise: Promise<api.IResGetDocInfo | null> = isMainCard
+					? api.getDocInfo(targetBlockId, { signal }).catch((err) => {
+						if (signal?.aborted) return null
+						console.error('获取文档信息失败:', err)
+						return null
+					})
+					: Promise.resolve(null)
 				let domContent: string | null = null;
 				try {
 					const res = await api.getDoc(targetBlockId, {
@@ -1348,16 +1400,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				if (cancelled || signal?.aborted || !domContent) return;
 				persistLightweightPreviewText(domContent)
 
-				// 对于 isMain 形状，获取文档信息（标题和题头图）
-				let docInfo: api.IResGetDocInfo | null = null;
-				if (isMainCard) {
-					try {
-						docInfo = await api.getDocInfo(targetBlockId, { signal });
-					} catch (err) {
-						if (signal?.aborted) return;
-						console.error('获取文档信息失败:', err);
-					}
-				}
+				const docInfo = await docInfoPromise;
 				if (cancelled || signal?.aborted || !containerRef.current) return;
 
 				// 移除旧的静态预览
@@ -1478,7 +1521,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				// Decode protyle-html before deciding whether the DOM can be windowed:
 				// an embedded query may otherwise be hidden inside data-content.
 				try { convertProtyleHtmlToDom(previewWrapper) } catch (error) { console.warn('convertProtyleHtmlToDom failed', error) }
-				const previewContainsBlockQueryEmbed = containsBlockQueryEmbed(previewWrapper)
 				staticPreviewRef.current = previewWrapper;
 				installStaticPreviewLinkHandlers(previewWrapper);
 				containerRef.current.appendChild(previewWrapper);
@@ -1499,7 +1541,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						} catch (error) {
 							console.warn('convertProtyleHtmlToDom failed', error)
 						}
-						await renderAllContentIdle(mountedContainer, staticPreviewPriorityRef.current, renderTaskId, true)
+						await renderAllContentIdle(mountedContainer, staticPreviewPriorityRef.current, renderTaskId, true, richRenderAbortController.signal)
 					},
 				})
 				cardContentVirtualizerRef.current = virtualizer
@@ -1508,19 +1550,30 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					previewWrapper.querySelectorAll('img').forEach((img) => {
 						if (!img.getAttribute('loading')) img.setAttribute('loading', 'lazy')
 					})
-					if (previewContainsBlockQueryEmbed) {
-						await renderBlockQueryEmbeds(previewWrapper, signal)
-						if (cancelled || signal?.aborted) return;
-					}
-					await renderAllContentIdle(previewWrapper, staticPreviewPriorityRef.current, renderTaskId, true)
+					// Mounting the raw preview is the critical path. Rich-content
+					// rendering (including query embeds) runs independently so one
+					// expensive Card cannot serialize all following visible Cards.
+					void renderAllContentIdle(
+						previewWrapper,
+						staticPreviewPriorityRef.current,
+						renderTaskId,
+						true,
+						richRenderAbortController.signal,
+					).then(() => {
+						if (!cancelled && !signal?.aborted) {
+							cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize, staticPreviewBlockLimit);
+						}
+					}).catch((error) => {
+						if (!isIdleRenderCancelledError(error)) console.warn('卡片静态内容增强失败:', error)
+					})
 				}
 
 				if (cancelled || signal?.aborted) return;
 
-				// 虚拟化预览只保存当前窗口，不能作为完整文档缓存。
-				if (!virtualizer) {
-					cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize, staticPreviewBlockLimit);
-				}
+				// 虚拟化预览只保存当前窗口，不能作为完整文档缓存。非虚拟化
+				// 预览先缓存原始 DOM，让下一张相同 Card 可以立即复用；富内容
+				// 完成后会再写入一次增强后的版本。
+				if (!virtualizer) cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize, staticPreviewBlockLimit);
 			};
 
 			let cancelled = false;
@@ -1633,6 +1686,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			// 组件卸载/依赖变更清理
 			return () => {
 				cancelled = true;
+				richRenderAbortController.abort();
+				if (richRenderAbortRef.current === richRenderAbortController) {
+					richRenderAbortRef.current = null
+				}
 				staticPreviewLoadRef.current?.cancel()
 				staticPreviewLoadRef.current = null
 				cancelIdleRender(renderTaskId);
