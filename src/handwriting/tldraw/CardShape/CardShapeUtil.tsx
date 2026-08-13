@@ -223,12 +223,25 @@ const BLOCK_CHECK_BATCH_SIZE = 100;
 const BLOCK_CHECK_DELAY_MS = 500;
 let blockCheckTimer: number | null = null;
 
+// 存在性缓存只用于短时合并重复检查，读取逻辑已按 TTL 判断命中；这里在
+// 写入/读取时顺手清掉过期条目，避免长期切换白板后 Map 只增不减。
+function pruneBlockExistenceCache(now = Date.now()) {
+	for (const [blockId, entry] of blockExistenceCache) {
+		if (now - entry.checkedAt >= BLOCK_EXISTENCE_CACHE_TTL_MS) {
+			blockExistenceCache.delete(blockId)
+		}
+	}
+}
+
 function scheduleBlockCheck(blockId: string, shapeId: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		const cached = blockExistenceCache.get(blockId);
-		if (cached && Date.now() - cached.checkedAt < BLOCK_EXISTENCE_CACHE_TTL_MS) {
-			queueMicrotask(() => resolve(cached.exists));
-			return;
+		if (cached) {
+			if (Date.now() - cached.checkedAt < BLOCK_EXISTENCE_CACHE_TTL_MS) {
+				queueMicrotask(() => resolve(cached.exists));
+				return;
+			}
+			blockExistenceCache.delete(blockId)
 		}
 
 		const list = blockCheckQueue.get(blockId) || [];
@@ -263,6 +276,7 @@ function scheduleBlockCheck(blockId: string, shapeId: string): Promise<boolean> 
 						callbacks.forEach((cb) => cb.resolve(exists));
 					}
 				}
+				pruneBlockExistenceCache()
 			}, BLOCK_CHECK_DELAY_MS);
 		}
 	});
