@@ -77,15 +77,11 @@ export default class steveTools extends Plugin {
     async onload() {
         this.pluginConfig = new PluginConfig(this.name, "M_steveTools");
         frontEnd = window.siyuan.config.system.os;
-        this.addIcons(`
-    <symbol id="iconST" viewBox="0 0 512 512">
-       ${ic.steveTools_icon}
-    </symbol>
-        `);
+
 
         this.addTopBar({
-            icon: "iconST",
-            title: "SteveTools",
+            icon: "iconSTWhiteboard",
+            title: "STWhiteboard",
             position: "left",
             callback: () => {
                 // await this.vip();
@@ -180,7 +176,7 @@ export default class steveTools extends Plugin {
 
     openDIYSetting() {
         setdialog = new Dialog({
-            title: "steveTools设置",
+            title: "ST白板设置",
             content: `<div id="SettingPanel" style="height: 100%;"></div>`,
             width: "900px",
             destroyCallback: (options) => {
@@ -194,7 +190,7 @@ export default class steveTools extends Plugin {
             props: {
                 plugin: this,
                 myfile: myfile,
-                setdialog: setdialog,
+                // setdialog: setdialog,
             }
         });
     }
