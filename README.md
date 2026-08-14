@@ -26,6 +26,13 @@ This plugin is split from the **STtools** plugin, bringing the power of [tldraw]
 - 🔗 Seamless integration with Siyuan Note documents
 - 💾 Persistent whiteboard storage tied to documents
 
+## 📋 Recent Updates
+
+- 🔧 Adapted to Siyuan 1.2.4 `addAgentCapability` API
+- ⚡ Fixed save race conditions and optimized rendering performance
+- 🧹 Removed deprecated modules and cleaned up redundant code and icons
+- 🚀 Improved static preview loading and viewport rendering
+
 ## 🚀 Getting Started
 
 ### Installation
