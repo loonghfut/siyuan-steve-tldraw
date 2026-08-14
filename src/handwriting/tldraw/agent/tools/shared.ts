@@ -4,12 +4,23 @@ import { getInstance } from '../../tldraw-instance-manager';
 import { stringArg } from './internal/core/args';
 
 /** Result shape required by SiYuan Agent tool handlers. */
-export type AgentToolResult = Promise<{ result?: string; error?: string }>;
+export type AgentToolResult = Promise<{
+    result?: string;
+    structuredContent?: unknown;
+    error?: string;
+}>;
+
+/** JSON Schema accepted by SiYuan's addAgentCapability registration API. */
+export type AgentToolSchema = Record<string, unknown>;
 
 /** A semantic tldraw tool that can be registered through an AI adapter. */
 export type AgentToolDefinition = {
     name: string;
     description: string;
+    /** Optional capability metadata; the adapter supplies permissive defaults. */
+    title?: string;
+    inputSchema?: AgentToolSchema;
+    outputSchema?: AgentToolSchema;
     handler: (args: Record<string, unknown>, app: unknown) => AgentToolResult;
 };
 

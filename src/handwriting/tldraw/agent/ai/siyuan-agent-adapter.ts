@@ -2,12 +2,25 @@ import { Plugin } from 'siyuan';
 import { settingdata } from '@/index';
 import { getTldrawAgentTools } from '../tools';
 import { isTldrawAgentActionEnabled } from '../tools/settings';
-import type { AgentToolDefinition, AgentToolResult } from '../tools/shared';
+import { stringifyError, type AgentToolDefinition, type AgentToolResult } from '../tools/shared';
 import { beginAgentActivityForArgs } from './activity';
+import { getTldrawAgentActionMeta } from '../tools/metadata';
 
-type AddAgentActionObject = (options: {
+type AgentCapabilityEffects = {
+    localRead?: boolean;
+    localWrite?: boolean;
+    dataEgress?: boolean;
+    externalCost?: boolean;
+};
+
+type AddAgentCapability = (options: {
     name: string;
+    title?: string;
     description: string;
+    inputSchema: Record<string, unknown>;
+    outputSchema?: Record<string, unknown>;
+    effects?: AgentCapabilityEffects;
+    actionEffects?: Record<string, AgentCapabilityEffects>;
     handler: (args: Record<string, unknown>, app: unknown) => AgentToolResult;
 }) => string;
 
@@ -15,15 +28,15 @@ const registeredActionNames = new Set<string>();
 
 /**
  * Registers the tldraw tool layer with SiYuan's Agent API.
- * This file is intentionally the only layer that knows about addAgentAction.
+ * SiYuan 1.2.4 exposes tools through addAgentCapability.
  */
 export function registerTldrawAgentActions(plugin: Plugin) {
     if (settingdata['tldraw-agent-actions-enable'] !== true) {
         return;
     }
-    const addAgentAction = plugin.addAgentAction as AddAgentActionObject | undefined;
-    if (typeof addAgentAction !== 'function') {
-        console.info('SiYuan addAgentAction API is unavailable; skip tldraw agent actions.');
+    const addAgentCapability = plugin.addAgentCapability as AddAgentCapability | undefined;
+    if (typeof addAgentCapability !== 'function') {
+        console.info('SiYuan addAgentCapability API is unavailable; skip tldraw agent capabilities.');
         return;
     }
 
@@ -31,13 +44,42 @@ export function registerTldrawAgentActions(plugin: Plugin) {
         if (registeredActionNames.has(tool.name)) {
             continue;
         }
-        addAgentAction.call(plugin, {
+        const metadata = getTldrawAgentActionMeta(tool.name);
+        addAgentCapability.call(plugin, {
             name: tool.name,
+            title: tool.title || metadata?.title || tool.name,
             description: tool.description,
+            inputSchema: tool.inputSchema || DEFAULT_AGENT_INPUT_SCHEMA,
+            effects: getCapabilityEffects(metadata?.risk),
             handler: createSiyuanAgentHandler(tool),
         });
         registeredActionNames.add(tool.name);
     }
+}
+
+const DEFAULT_AGENT_INPUT_SCHEMA: Record<string, unknown> = {
+    type: 'object',
+    properties: {
+        action: {
+            type: 'string',
+            description: 'Frontend action wrapper field. Leave unset when calling the capability directly.',
+        },
+        id: {
+            type: 'string',
+            description: 'Optional whiteboard or target ID. Individual capabilities may accept more direct named arguments.',
+        },
+        query: {
+            type: 'string',
+            description: 'Optional query or JSON payload accepted by the individual capability.',
+        },
+    },
+    additionalProperties: true,
+};
+
+function getCapabilityEffects(risk?: 'read' | 'write' | 'danger'): AgentCapabilityEffects {
+    if (risk === 'read') return { localRead: true };
+    if (risk === 'write' || risk === 'danger') return { localRead: true, localWrite: true };
+    return { localRead: true };
 }
 
 /**
@@ -84,7 +126,10 @@ function createSiyuanAgentHandler(tool: AgentToolDefinition) {
                 durationMs: Date.now() - startedAt,
                 error,
             });
-            throw error;
+            // addAgentCapability expects failures to be returned in its result
+            // object. Throwing makes SiYuan treat the whole tool invocation as a
+            // transport failure and hides the actionable message from the Agent.
+            return { error: stringifyError(error) };
         } finally {
             endAgentActivity();
         }
