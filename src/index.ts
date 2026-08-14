@@ -41,7 +41,6 @@ export let frontEnd;
 // let islog = false;
 const myfile = "steveTools.json";
 export let settingdata: any = {};
-let setdialog: any;
 export let moduleInstances: ModuleClasses = {};
 
 export default class steveTools extends Plugin {
@@ -78,16 +77,6 @@ export default class steveTools extends Plugin {
         this.pluginConfig = new PluginConfig(this.name, "M_steveTools");
         frontEnd = window.siyuan.config.system.os;
 
-
-        this.addTopBar({
-            icon: "iconSTWhiteboard",
-            title: "STWhiteboard",
-            position: "left",
-            callback: () => {
-                // await this.vip();
-                this.openDIYSetting();
-            }
-        });
         settingdata = await this.loadData(myfile);
         this.runloadModule(settingdata);
         for (const moduleName in moduleInstances) {
@@ -174,23 +163,32 @@ export default class steveTools extends Plugin {
 
 
 
-    openDIYSetting() {
-        setdialog = new Dialog({
+    /**
+     * Called by SiYuan's official plugin-settings entry.
+     *
+     * The entry point is native, while the dialog content intentionally remains
+     * this plugin's custom Svelte settings interface.
+     */
+    openSetting() {
+        let panel: SettingExample | undefined;
+        const dialog = new Dialog({
             title: "ST白板设置",
             content: `<div id="SettingPanel" style="height: 100%;"></div>`,
             width: "900px",
-            destroyCallback: (options) => {
-                //console.log("destroyCallback", options);
-                //You'd better destroy the component when the dialog is closed
-                pannel.$destroy();
+            destroyCallback: () => {
+                panel?.$destroy();
             }
         });
-        let pannel = new SettingExample({
-            target: setdialog.element.querySelector("#SettingPanel"),
+        const target = dialog.element.querySelector("#SettingPanel");
+        if (!target) {
+            dialog.destroy();
+            return;
+        }
+        panel = new SettingExample({
+            target,
             props: {
                 plugin: this,
                 myfile: myfile,
-                // setdialog: setdialog,
             }
         });
     }
