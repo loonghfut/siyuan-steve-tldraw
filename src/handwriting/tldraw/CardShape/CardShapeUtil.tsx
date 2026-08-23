@@ -19,7 +19,8 @@ import { ContentLoadHandle, enqueueProtyleLoad, ProtyleLoadHandle } from '../pro
 import { shapeLoadManager } from '../shape-load-manager'
 import { enqueueStaticPreviewLoad } from '../static-preview-load-queue'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
-import { renderAllContentIdle } from '../utils/render/content-renderer'
+import { preRenderMermaidHtml, renderAllContentIdle } from '../utils/render/content-renderer'
+import { stDebugLog } from '../utils/render/st-debug-log'
 import { cancelIdleRender, isIdleRenderCancelledError } from '../utils/idle-scheduler'
 import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
@@ -997,6 +998,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				this.editor as any,
 				() => ({ editing: isEditingStateRef.current }),
 				(allowed, meta) => {
+					// eslint-disable-next-line no-console
+					stDebugLog('[ST-debug] admission change', 'shape=', shape.id, 'allowed=', allowed, 'inViewport=', meta.inViewport, 'distance=', meta.distance)
 					const distance = Number.isFinite(meta.distance) ? Math.max(0, meta.distance) : 1_000_000
 					const centerPriority = Math.min(100, Math.floor(distance / 160))
 					// The load manager already measures distance from the viewport center.
@@ -1105,6 +1108,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 			const shouldRender = renderAdmission === 'allowed';
 			if (!shouldRender) {
+				// eslint-disable-next-line no-console
+				stDebugLog('[ST-debug] main effect BLOCKED', 'blockId=', blockId, 'isCollapsed=', isCollapsed, 'isSmallCard=', isSmallCard, 'admission=', renderAdmission, 'mode=', effectiveRenderMode)
 				// live-protyle 模式仅在实例存在时隐藏而非销毁，等待准入恢复后复用，避免闪动
 				if (effectiveRenderMode === 'live-protyle' && protyleRef.current) {
 					setProtyleHostVisible(false);
@@ -1344,6 +1349,13 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				if (!forceRefresh) {
 					const cachedHtml = getCachedPreview(targetBlockId, fontSize, staticPreviewBlockLimit);
 					if (cachedHtml) {
+						stDebugLog('[ST-debug] static cache HIT', 'blockId=', targetBlockId, 'len=', cachedHtml.length, 'hasMermaid=', cachedHtml.includes('data-subtype="mermaid"'), 'hasSvg=', cachedHtml.includes('<svg'))
+						// 毒缓存（无 SVG）或新缓存统一预渲染，保证 SVG 随挂载同步上屏
+						let readyHtml = cachedHtml
+						if (!cachedHtml.includes('<svg')) {
+							readyHtml = await preRenderMermaidHtml(cachedHtml)
+							if (cancelled || signal?.aborted) return
+						}
 						persistLightweightPreviewText(cachedHtml)
 						// 使用缓存的预览
 						if (staticPreviewRef.current?.parentElement === containerRef.current) {
@@ -1352,9 +1364,15 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							containerRef.current.removeChild(staticPreviewRef.current);
 						}
 						const wrapper = document.createElement('div');
-						wrapper.innerHTML = cachedHtml;
+						wrapper.innerHTML = readyHtml;
 						const clone = wrapper.firstElementChild as HTMLElement;
 						if (clone && containerRef.current) {
+							// 缓存可能在 mermaid 异步渲染完成前写入（data-render=true 但 SVG 未插入），
+							// 这类毒缓存会让 mermaidRender 直接跳过节点 → 永久灰矩形。
+							// 清除无 SVG 的 mermaid 节点的渲染标记，强制挂载后重新渲染。
+							clone.querySelectorAll('[data-subtype="mermaid"][data-render="true"]').forEach((el) => {
+								if (!el.querySelector('svg')) el.removeAttribute('data-render')
+							})
 							// 清理 Protyle host
 							if (protyleHostRef.current?.parentElement === containerRef.current) {
 								try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
@@ -1386,6 +1404,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						}
 					}
 				}
+				stDebugLog('[ST-debug] static cache MISS', 'blockId=', targetBlockId, 'forceRefresh=', forceRefresh)
 
 				// 使用 getDoc API 获取 DOM 内容
 				// 主文档标题元数据与正文请求互不依赖，提前发起元数据请求，
@@ -1410,6 +1429,13 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					if (signal?.aborted) return;
 					console.error('获取文档 DOM 内容失败:', err);
 				}
+				// 预渲染 mermaid：SVG 随挂载同步上屏，避免异步插入不触发重绘的灰卡问题
+				if (domContent) {
+					domContent = await preRenderMermaidHtml(domContent)
+					if (cancelled || signal?.aborted) return
+				}
+				// eslint-disable-next-line no-console
+				stDebugLog('[ST-debug] getDoc done blockId=', targetBlockId, 'len=', domContent?.length ?? 0, 'hasMermaid=', domContent?.includes('data-subtype="mermaid"') ?? false)
 
 				if (cancelled || signal?.aborted || !domContent) return;
 				persistLightweightPreviewText(domContent)
@@ -1538,6 +1564,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				staticPreviewRef.current = previewWrapper;
 				installStaticPreviewLinkHandlers(previewWrapper);
 				containerRef.current.appendChild(previewWrapper);
+				stDebugLog('[ST-debug] static preview mounted', 'blockId=', targetBlockId, 'mermaidNodes=', previewWrapper.querySelectorAll('[data-subtype="mermaid"]').length, 'cardConnected=', containerRef.current.isConnected)
 				destroyCardContentVirtualizer()
 				const virtualizer = CardContentVirtualizer.create(previewWrapper, {
 					isPinned: (element) =>
@@ -1648,6 +1675,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							await loadStaticPreview(id, wasEditing || manualRefreshTriggered);
 							if (cancelled) return;
 						} else {
+							// eslint-disable-next-line no-console
+							stDebugLog('[ST-debug] static-dom normal-card enter', 'shape=', shape.id, 'blockId=', id, 'isMainCard=', isMainCard)
 							// 普通块：使用 getDoc API 直接获取静态 DOM
 							if (protyleRef.current) {
 								if (protyleHostRef.current?.parentElement) {
@@ -1808,7 +1837,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						overflow: 'auto', // 内容区域可滚动
 						pointerEvents: isEditingState || (!isMainCard && isCollapsed) ? 'all' : 'none',
 						touchAction: isEditingState || (!isMainCard && isCollapsed) ? 'auto' : 'none',
-						contain: 'strict',
 						padding: `${cardInnerGap}px`,
 						boxSizing: 'border-box',
 					}}

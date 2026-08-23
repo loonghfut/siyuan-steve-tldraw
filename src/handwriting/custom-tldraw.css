@@ -19,6 +19,12 @@
   --layer-header-footer: 999;
   --layer-following-indicator: 1000;
 }
+/* 修复 mermaid 等异步渲染内容不显示（最小化窗口/切标签后才出现）：
+   tldraw v5 的 .tl-canvas 有 content-visibility:auto，异步 DOM 变更不触发
+   重绘检查。强制 visible 让内容变更立即上屏。 */
+.tl-canvas {
+  content-visibility: visible !important;
+}
 .tlui-button__tool[aria-pressed=true]:not(:disabled,[data-disabled]):after {
     background: var(--b3-theme-primary) !important;
     opacity: 1;

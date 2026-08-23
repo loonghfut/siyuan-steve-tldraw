@@ -699,8 +699,6 @@ export class TldrawManager {
                                 x: e.clientX,
                                 y: e.clientY,
                             });
-                            const idid = await api.generateSiyuanID();
-                            const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
                             let aproblock: string;
                             // const content = (await api.getBlockKramdown(blockId)).kramdown;
                             /**
@@ -734,10 +732,13 @@ export class TldrawManager {
                                 console.debug("拖拽的是子文档块");
                                 await api.prependBlock("markdown", `((${blockId} '${docname}'))`, this.id)
                             } else {
-                                aproblock = idid as string;
+                                // 其余类型（列表/列表项/callout/表格/代码块mermaid/超级块等容器块）：
+                                // 直接引用原块，卡片经内嵌 Protyle 渲染可保留层级结构。
+                                // 不能走 insertBlock(nextID=原块)：容器块后面插入标题块会被内核拒绝，
+                                // 且 api 层会吞掉错误码，导致卡片指向不存在的块（“找不到绑定块”）。
+                                aproblock = blockId;
                                 const link = buildTldrawLink(this.id, aproblock);
-                                await api.insertBlock("markdown", `###### ${timestamp}
-{: id="${idid}" custom-st-tldraw="1" custom-tldraw-link="${link}"}`, blockId)
+                                await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link, 'custom-st-tldraw': "1" })
                             }
                             // 创建新的Card形状
                             // console.debug("创建新的卡片形状",  aproblock[0].doOperations[0].id);
@@ -807,8 +808,12 @@ export class TldrawManager {
                         document.addEventListener('dragstart', this._dragStartHandler, true);
                         document.addEventListener('dragend', this._dragEndHandler, true);
 
-                        // 添加拖放事件监听器
-                        container.addEventListener('drop', handleDrop);
+                        // 添加拖放事件监听器（捕获异常，避免未处理的 Promise 拒绝导致思源重载）
+                        container.addEventListener('drop', (ev: DragEvent) => {
+                            handleDrop(ev).catch((err) => {
+                                console.error('ST白板: 拖放处理失败', err);
+                            });
+                        });
 
                         // 删除组件块逻辑 — 将不同类型的 Shape 分开处理
                         editor.sideEffects.registerAfterDeleteHandler('shape', async (shape) => {
@@ -1777,15 +1782,13 @@ export class TldrawManager {
             if (remainingCardsCount === 0) {
                 // 如果没有其他 card 引用，可执行删除或更新属性
                 if (await api.getBlockByID(blockId)) {
+                    // 安全限制：卡片 blockId 均指向用户文档中的原块，删除卡片绝不删除原块，
+                    // 即使 SyncDelete=true 也只重置属性（否则会误删整棵列表/表格等容器块）。
                     if (settingdata['SyncDelete']) {
-                        // SyncDelete=true 的情况：删除块
-                        await api.deleteBlock(blockId);
-                        console.debug(`Deleted block ${blockId} because no other cards reference it.`);
-                    } else {
-                        // 否则只重置属性，保留块
-                        await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
-                        console.debug(`Block attribute updated for ${blockId} as no other cards reference it.`);
+                        console.warn('ST白板: 已忽略 SyncDelete（卡片引用原块，同步删除会导致笔记内容丢失）');
                     }
+                    await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
+                    console.debug(`Block attribute updated for ${blockId} as no other cards reference it.`);
                 }
             } else {
                 console.debug(`Card deletion: ${remainingCardsCount} remaining card(s) reference block ${blockId}; skipping block update.`);
@@ -1809,11 +1812,11 @@ export class TldrawManager {
             if (remainingSingleBlockCount === 0) {
                 const block = await api.getBlockKramdown(blockId);
                 if (block) {
-                    // single-block 删除行为：默认与 card 保持一致。
+                    // single-block 删除行为：与 card 一致——即使 SyncDelete=true 也不删原块，只重置属性。
                     if (settingdata['SyncDelete']) {
-                        await api.deleteBlock(blockId);
-                        console.debug(`Deleted block ${blockId} because no other single-blocks reference it.`);
-                    } else {
+                        console.warn('ST白板: 已忽略 SyncDelete（single-block 引用原块，同步删除会导致笔记内容丢失）');
+                    }
+                    {
                         await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
                         // console.debug("%%%",block.markdown);
                         // 只删除指向当前画板(this.id) 与该块(blockId) 的[*](...)链接

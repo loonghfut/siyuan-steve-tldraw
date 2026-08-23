@@ -29,6 +29,7 @@ import { check, trackFeatureUsage } from "./stats/public-stats";
 // import * as api from "@/api"
 import SettingExample from "@/setting.svelte";
 import { PluginConfig } from "./savedata";
+import { stDebugLog } from "./handwriting/tldraw/utils/render/st-debug-log";
 
 declare global {
     interface Window {
@@ -76,6 +77,9 @@ export default class steveTools extends Plugin {
     async onload() {
         this.pluginConfig = new PluginConfig(this.name, "M_steveTools");
         frontEnd = window.siyuan.config.system.os;
+
+        // eslint-disable-next-line no-console
+        stDebugLog('[ST-debug] === plugin v4.0.15-local-debug loaded ===', 'frontend=', frontEnd)
 
         settingdata = await this.loadData(myfile);
         this.runloadModule(settingdata);
