@@ -21,6 +21,7 @@ import { enqueueStaticPreviewLoad } from '../static-preview-load-queue'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
 import { preRenderMermaidHtml, renderAllContentIdle } from '../utils/render/content-renderer'
 import { stDebugLog } from '../utils/render/st-debug-log'
+import { tryOpenAssetLocally } from '../utils/open-asset-link'
 import { cancelIdleRender, isIdleRenderCancelledError } from '../utils/idle-scheduler'
 import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
@@ -553,6 +554,9 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			if (!target.href || target.href === '#') return
 			const href = target.href.startsWith('assets/') ? `/${target.href}` : target.href
 			if (isSteveToolsPluginUrl(href)) return
+
+			// 资产附件（Excel 等）用系统默认程序打开本地文件，避免浏览器自签证书报错
+			if (tryOpenAssetLocally(href)) return
 
 			try {
 				if (href.startsWith('siyuan://')) {
