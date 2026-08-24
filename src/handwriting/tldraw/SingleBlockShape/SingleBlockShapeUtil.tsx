@@ -42,6 +42,7 @@ import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLow
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
 import { getDefaultColorTheme } from '../utils/color-theme'
 import { getCachedSvgExportSnapshot, getSvgExportGlobalStyles, isSvgExportOutlineOnly, serializeElementForSvgExport } from '../utils/export-dom-snapshot'
+import { stDebugLog } from '../utils/render/st-debug-log'
 import {
 	beginBranchAttachmentDrag,
 	beginBranchResize,
@@ -209,12 +210,16 @@ function useSingleBlockSize(
 		// 优先测量 Protyle 的内容区域（编辑态）
 		let target: HTMLElement | null = null
 		if (isEditingState && protyleHostRef.current) {
-			target = (protyleHostRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || protyleHostRef.current
+			target = protyleHostRef.current.querySelector('.protyle-wysiwyg') as HTMLElement | null
 		}
 		// 非编辑态时从容器中测量静态内容
 		if (!target && containerRef.current) {
-			target = (containerRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || containerRef.current
+			target = containerRef.current.querySelector('.protyle-wysiwyg') as HTMLElement | null
 		}
+		// 真实内容（.protyle-wysiwyg）尚未挂载时跳过测量：
+		// containerRef 自身 height:100%，其 scrollHeight 只是当前几何高度的回声，
+		// 此时测量会把已保存的高度（可能已损坏，如历史拖拽出的超大值）原样写回，
+		// 导致启动时框体异常放大。
 		if (!target) return
 
 		// 图片尚未加载完成时跳过测量：此时内容高度接近 0，会把框体缩成最小高度。
@@ -223,7 +228,10 @@ function useSingleBlockSize(
 		const pendingImages = Array.from(target.querySelectorAll('img')).filter(
 			(img) => !img.complete && img.naturalWidth === 0
 		)
-		if (pendingImages.length > 0) return
+		if (pendingImages.length > 0) {
+			stDebugLog('[ST-debug] single-block measure SKIP imgs-pending', 'shape=', shape.id, 'pending=', pendingImages.length)
+			return
+		}
 
 		// 获取实际 DOM 尺寸
 		const contentH = Math.ceil(target.scrollHeight || target.offsetHeight || 0)
@@ -233,6 +241,9 @@ function useSingleBlockSize(
 		const nextWidth = Math.max(shape.props.w, 1)
 
 		// 保存测量的高度
+		if (lastHeightRef.current !== nextHeight) {
+			stDebugLog('[ST-debug] single-block measured', 'shape=', shape.id, 'block=', shape.props.blockId, 'contentH=', contentH, 'h=', nextHeight, 'prevH=', lastHeightRef.current)
+		}
 		lastHeightRef.current = nextHeight
 
 		// 更新全局 atom 中的尺寸
@@ -794,7 +805,13 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						if (container) {
 							const images = Array.from(container.querySelectorAll('img'))
 							for (const img of images) {
-								if (img.complete) continue
+								if (img.complete) {
+									// 图片在监听器挂接前已加载完成（本地缓存常见）：
+									// load 事件不会再触发，必须立即安排重测，
+									// 否则框体保持错误高度，直到下一次 DOM 变化（如缩放画布）才恢复
+									scheduleShapeSizeUpdate()
+									continue
+								}
 								const remeasure = () => scheduleShapeSizeUpdate()
 								img.addEventListener('load', remeasure, { once: true })
 								img.addEventListener('error', remeasure, { once: true })
