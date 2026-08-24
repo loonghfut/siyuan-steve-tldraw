@@ -79,7 +79,7 @@ export default class steveTools extends Plugin {
         frontEnd = window.siyuan.config.system.os;
 
         // eslint-disable-next-line no-console
-        stDebugLog('[ST-debug] === plugin v4.0.16-local-debug loaded ===', 'frontend=', frontEnd)
+        stDebugLog('[ST-debug] === plugin v4.0.17-local-debug loaded ===', 'frontend=', frontEnd)
 
         settingdata = await this.loadData(myfile);
         this.runloadModule(settingdata);

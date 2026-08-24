@@ -217,6 +217,14 @@ function useSingleBlockSize(
 		}
 		if (!target) return
 
+		// 图片尚未加载完成时跳过测量：此时内容高度接近 0，会把框体缩成最小高度。
+		// 重开白板时静态内容先挂载、图片后加载，是“框体自动折叠”的根因；
+		// 图片 load/error 后由静态内容挂载处的监听器重新测量。
+		const pendingImages = Array.from(target.querySelectorAll('img')).filter(
+			(img) => !img.complete && img.naturalWidth === 0
+		)
+		if (pendingImages.length > 0) return
+
 		// 获取实际 DOM 尺寸
 		const contentH = Math.ceil(target.scrollHeight || target.offsetHeight || 0)
 		const borderPx = shape.props.transparentBackground ? 0 : BORDER_PX
@@ -774,12 +782,24 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			const renderTaskId = `render-static-${shape.id}`
 			let cancelled = false
 
-			// 使用 requestAnimationFrame 确保 DOM 已更新
+				// 使用 requestAnimationFrame 确保 DOM 已更新
 			const rafId = requestAnimationFrame(() => {
 				if (staticContentRef.current) {
 					// 使用空闲调度渲染，在交互时会暂停
 					renderAllContentIdle(staticContentRef.current, 10, renderTaskId).then(() => {
 						if (!cancelled) setIsContentRendered(true)
+						// 图片加载完成后重新测量框体尺寸：防止图片未加载时
+						// 测量导致框体被缩成最小高度（重开白板时常见）
+						const container = staticContentRef.current
+						if (container) {
+							const images = Array.from(container.querySelectorAll('img'))
+							for (const img of images) {
+								if (img.complete) continue
+								const remeasure = () => scheduleShapeSizeUpdate()
+								img.addEventListener('load', remeasure, { once: true })
+								img.addEventListener('error', remeasure, { once: true })
+							}
+						}
 					}).catch((error) => {
 						if (!isIdleRenderCancelledError(error)) {
 							console.warn('单块静态内容渲染失败:', error)
