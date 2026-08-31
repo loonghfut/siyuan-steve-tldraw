@@ -405,9 +405,10 @@ export class M_handwriting {
                     console.error('更新白板列表 dock 时出错:', err);
                 }
             },
-            init: async (dock) => {
+            init() {
                 try {
                     // 清理旧内容并挂载组件
+                    const dock = this as any;
                     dock.element.innerHTML = '';
                     const root = document.createElement('div');
                     root.className = 'steve-handwriting-dock-root';
@@ -416,7 +417,7 @@ export class M_handwriting {
                     dock.element.appendChild(root);
                     // @ts-ignore
                     self.dockComponent = new TldrawWhiteboardCards({ target: root, props: { plugin: self.plugin } });
-                    (dock as any).__svelteComponent = self.dockComponent;
+                    dock.__svelteComponent = self.dockComponent;
                 } catch (err) {
                     console.error('挂载白板列表组件到 dock 出错:', err);
                 }
@@ -473,8 +474,9 @@ export class M_handwriting {
                     console.error('更新 Slide 截图 dock 时出错:', err);
                 }
             },
-            init: async (dock) => {
+            init() {
                 try {
+                    const dock = this as any;
                     dock.element.innerHTML = '';
                     const root = document.createElement('div');
                     root.className = 'steve-slide-screenshot-dock-root';
@@ -489,7 +491,7 @@ export class M_handwriting {
                             onOpen: (item: SlideScreenshotRecord) => self.openSlideScreenshotTarget(item),
                         },
                     });
-                    (dock as any).__svelteComponent = self.slideScreenshotDockComponent;
+                    dock.__svelteComponent = self.slideScreenshotDockComponent;
                 } catch (err) {
                     console.error('挂载 Slide 截图 dock 出错:', err);
                 }
