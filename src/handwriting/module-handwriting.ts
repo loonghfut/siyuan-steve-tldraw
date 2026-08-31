@@ -1,12 +1,12 @@
 import * as ic from "@/icon"
-import { openTab, Plugin, showMessage } from "siyuan";
+import { openTab, Plugin, showMessage, type IProtyle } from "siyuan";
 // import './handwriting.css';
 import { TldrawManager } from './tldraw/tldraw-manager';
 // 替换为新的卡片视图组件
 import TldrawWhiteboardCards from './tldraw/ui/tldraw-whiteboard-cards.svelte';
 import TldrawWhiteboardManager from './tldraw/ui/tldraw-whiteboard-manager.svelte';
 import SlideScreenshotDock from './tldraw/ui/slide-screenshot-dock.svelte';
-import { addWhiteboardButton, setupFileTreeObserver } from "./function/assist";
+import { setupFileTreeObserver } from "./function/assist";
 import { TldrawLinkIconController } from './function/tldraw-link-icon-controller';
 import * as api from "@/api/api";
 import { getCursorBlockId } from "@/api/api2";
@@ -26,6 +26,9 @@ import {
     slideScreenshotUrlToAssetPath,
     type SlideScreenshotRecord,
 } from './tldraw/SlideShape/slide-screenshot-store';
+// 面包屑「进入画板」按钮的插件内唯一 id
+const WHITEBOARD_BREADCRUMB_BUTTON_ID = "open-whiteboard";
+
 export class M_handwriting {
     private plugin: Plugin;
     // 存储画布实例的映射表
@@ -100,8 +103,18 @@ export class M_handwriting {
         this.plugin.addIcons(`
             <symbol id="iconSTWhiteboard" viewBox="0 0 24 24">
                ${ic.steveTools_whiteboard}
-            </symbol>  
+            </symbol>
         `);
+        // 通过官方插件 API 在文档面包屑注册「进入画板」按钮：
+        // 思源会自动把按钮挂到每个已打开及后续打开文档的面包屑上，无需监听 switch-protyle 逐个注入
+        this.plugin.addBreadcrumbButton({
+            id: WHITEBOARD_BREADCRUMB_BUTTON_ID,
+            icon: "iconSTWhiteboard",
+            title: "在画板中打开",
+            callback: (_event, protyle) => {
+                void this.openWhiteBoard_in(protyle);
+            },
+        });
         // 统一处理插件 URL 的逻辑，供多处调用（事件总线或页面点击）
         const handlePluginUrl = async (url: string) => {
             try {
@@ -504,7 +517,6 @@ export class M_handwriting {
             this.currentid = e.detail.protyle.block.rootID;
             // console.debug(this.currentid);
 
-            addWhiteboardButton(e);
             const protyleEl = e.detail?.protyle?.element as HTMLElement | undefined;
             if (protyleEl) {
                 this.tldrawLinkIconController?.watchProtyle(protyleEl);
@@ -528,11 +540,11 @@ export class M_handwriting {
     /**
      * 在当前笔记页中打开画板
      */
-    public async openWhiteBoard_in(e) {
+    public async openWhiteBoard_in(protyle: IProtyle) {
         // 查找当前页面的内容容器
-        const id = e.detail.protyle.block.rootID;
+        const id = protyle.block.rootID;
         const tabId = this.plugin.name + "steveTool-whiteboard";
-        const titleText = e.detail.protyle.title.editElement.textContent;
+        const titleText = protyle.title?.editElement?.textContent ?? "";
 
         await openTab({
             app: this.plugin.app,
@@ -633,6 +645,8 @@ export class M_handwriting {
      * 插件卸载时的清理工作
      */
     async onunload() {
+        // 移除面包屑上的进入画板按钮（思源销毁插件时也会统一清理，这里显式移除一次）
+        this.plugin.removeBreadcrumbButton(WHITEBOARD_BREADCRUMB_BUTTON_ID);
         this.unbindSlideScreenshotDropHandlers();
         clearActiveSlideScreenshotStore(this.slideScreenshotStore);
         // 移除链接点击拦截器
