@@ -154,7 +154,7 @@ function findContentElement(shape: ISingleBlockShape): HTMLElement | null {
 
 /**
  * 将选中的 single-block 形状的宽度自适应调整为内容所需宽度。
- * 高度由 useSingleBlockSize hook 在宽度变化后自动重新测量。
+ * 高度不再自动跟随内容，宽度变化后如有需要由用户手动调整。
  */
 export function fitSingleBlockWidth(editor: Editor, shapes: ISingleBlockShape[]) {
     if (!shapes.length) return

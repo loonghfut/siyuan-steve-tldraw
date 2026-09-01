@@ -22,7 +22,6 @@ import {
 import "@/index.scss";
 import * as api from "@/api/api";
 // import { ModuleA } from "./libs/moduleA";
-import * as ic from "@/icon"
 import { MODULE_CONFIG, ModuleClasses } from "./modules.config";
 import { check, trackFeatureUsage } from "./stats/public-stats";
 

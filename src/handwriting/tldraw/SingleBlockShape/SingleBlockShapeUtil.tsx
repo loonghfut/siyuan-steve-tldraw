@@ -1,4 +1,4 @@
-import React, { ReactElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import React, { ReactElement, useCallback, useEffect, useRef, useState } from 'react'
 import {
 	HTMLContainer,
 	EASINGS,
@@ -9,8 +9,6 @@ import {
 	TLShapeId,
 	createShapeId,
 	resizeBox,
-	AtomMap,
-	EditorAtom,
 	BindingUtil,
 	TLBaseBinding,
 	BindingOnShapeChangeOptions,
@@ -18,7 +16,6 @@ import {
 	invLerp,
 	lerp,
 	VecModel,
-	Editor,
 	useValue,
 } from '@tldraw/tldraw'
 import { openAttributePanel, Protyle, showMessage, TProtyleAction } from 'siyuan'
@@ -63,222 +60,22 @@ import {
 	getBranchInteractionHintForShape,
 	setBranchInteractionHint,
 	syncBranchMoveForRootContent,
-	requestBranchRelayout,
 	updateBranchAttachmentAfterDrag,
 	useBranchInteractionHint,
 } from '../BranchShape'
 
 const draggingBranchSingleBlockIds = new Set<string>()
 
-// ===== DOM 尺寸测量（仅影响高度）=====
-// 用 EditorAtom 存储每个 shape 的测量尺寸，保证 getGeometry 响应式更新
-const SingleBlockSizes = new EditorAtom('single-block sizes', (editor) => {
-	const map = new AtomMap<TLShapeId, { width: number; height: number }>('single-block sizes')
-	editor.sideEffects.registerAfterDeleteHandler('shape', (shape) => {
-		map.delete(shape.id)
-	})
-	return map
-})
+// ===== 形状尺寸 =====
+// 高度不再由 DOM 自动测量，完全由用户手动调整（与 Card 行为一致）；
+// props.h 是唯一的尺寸来源。旧白板中的形状在此前从未把测量高度写回
+// props.h，因此组件在首次挂载时做一次一次性测高回填（见组件内 effect），
+// 之后完全交给用户手动调整。
 const BORDER_PX = 3 // 与样式、SVG 导出保持一致
+// 字号回退值：与 getDefaultProps 的 fontSize 默认值保持一致，
+// 避免各处 16/20/22 混用导致旧形状（fontSize 为 undefined）在不同视图间字号跳变
+const SINGLE_BLOCK_DEFAULT_FONT_SIZE = 22
 const MIN_HEIGHT = 30
-
-function setMeasuredSingleBlockSize(editor: Editor, shapeId: TLShapeId, size: { width: number; height: number }) {
-	let changed = false
-	SingleBlockSizes.update(editor, (map) => {
-		const existing = map.get(shapeId)
-		if (existing && existing.width === size.width && existing.height === size.height) return map
-		changed = true
-		return map.set(shapeId, size)
-	})
-	if (changed) requestBranchRelayout(editor, shapeId)
-}
-// ===== 独立的尺寸测量 Hook =====
-// 参考 tldraw 官方示例，将尺寸测量逻辑抽取为可复用的 hook
-function useSingleBlockSize(
-	editor: Editor,
-	shape: ISingleBlockShape,
-	containerRef: React.RefObject<HTMLDivElement>,
-	protyleHostRef: React.RefObject<HTMLDivElement | null>,
-	isEditingState: boolean,
-	shouldSkipMeasurement: boolean
-) {
-	// 用于在编辑态切换时临时锁定高度，防止闪烁
-	const heightLockRef = useRef(false)
-	const prevEditingRef = useRef(isEditingState)
-	// 记录上次测量的高度，用于锁定期间保持稳定
-	const lastHeightRef = useRef<number | null>(null)
-	const measurementFrameRef = useRef<number | null>(null)
-
-	// 检测编辑态切换，临时锁定高度
-	useEffect(() => {
-		if (prevEditingRef.current !== isEditingState) {
-			prevEditingRef.current = isEditingState
-			heightLockRef.current = true
-			// 延迟解锁，等待新内容渲染稳定
-			const timer = setTimeout(() => {
-				heightLockRef.current = false
-			}, 150)
-			return () => clearTimeout(timer)
-		}
-	}, [isEditingState])
-
-	const updateShapeSize = useCallback(() => {
-		if (shouldSkipMeasurement) return
-		if (!editor) return
-
-		// 如果高度被锁定，使用上次测量的高度
-		if (heightLockRef.current && lastHeightRef.current !== null) {
-			const lockedHeight = lastHeightRef.current
-			const lockedWidth = Math.max(shape.props.w, 1)
-			setMeasuredSingleBlockSize(editor, shape.id, { width: lockedWidth, height: lockedHeight })
-			return
-		}
-
-		// 没有 blockId 的新块固定最小高度
-		if (!shape.props.blockId) {
-			const fallbackHeight = Math.max(shape.props.h, MIN_HEIGHT)
-			const fallbackWidth = Math.max(shape.props.w, 1)
-			lastHeightRef.current = fallbackHeight
-			setMeasuredSingleBlockSize(editor, shape.id, { width: fallbackWidth, height: fallbackHeight })
-			return
-		}
-
-		// 优先测量 Protyle 的内容区域（编辑态）
-		let target: HTMLElement | null = null
-		if (isEditingState && protyleHostRef.current) {
-			target = (protyleHostRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || protyleHostRef.current
-		}
-		// 非编辑态时从容器中测量静态内容
-		if (!target && containerRef.current) {
-			target = (containerRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || containerRef.current
-		}
-		if (!target) return
-
-		// 获取实际 DOM 尺寸
-		const contentH = Math.ceil(target.scrollHeight || target.offsetHeight || 0)
-		const borderPx = shape.props.transparentBackground ? 0 : BORDER_PX
-		const addBorder = settingdata["showCardBorder"] !== false && !shape.props.transparentBackground
-		const nextHeight = Math.max(contentH + (addBorder ? borderPx * 2 : 0), MIN_HEIGHT)
-		const nextWidth = Math.max(shape.props.w, 1)
-
-		// 保存测量的高度
-		lastHeightRef.current = nextHeight
-
-		// 更新全局 atom 中的尺寸
-		setMeasuredSingleBlockSize(editor, shape.id, { width: nextWidth, height: nextHeight })
-	}, [
-		editor,
-		shape.id,
-		shape.props.blockId,
-		shape.props.h,
-		shape.props.w,
-		shape.props.transparentBackground,
-		isEditingState,
-		shouldSkipMeasurement,
-	])
-
-	const scheduleShapeSizeUpdate = useCallback(() => {
-		if (shouldSkipMeasurement || measurementFrameRef.current !== null) return
-		measurementFrameRef.current = requestAnimationFrame(() => {
-			measurementFrameRef.current = null
-			updateShapeSize()
-		})
-	}, [shouldSkipMeasurement, updateShapeSize])
-
-	// 仅在测量输入变化时同步一次；后续 DOM 变化由观察器合帧处理。
-	useLayoutEffect(() => {
-		if (shouldSkipMeasurement) return
-		updateShapeSize()
-	}, [shouldSkipMeasurement, updateShapeSize])
-
-	useEffect(() => {
-		if (shouldSkipMeasurement && measurementFrameRef.current !== null) {
-			cancelAnimationFrame(measurementFrameRef.current)
-			measurementFrameRef.current = null
-		}
-	}, [shouldSkipMeasurement])
-
-	useEffect(() => {
-		return () => {
-			if (measurementFrameRef.current !== null) {
-				cancelAnimationFrame(measurementFrameRef.current)
-				measurementFrameRef.current = null
-			}
-		}
-	}, [])
-
-	// 使用 ResizeObserver 监听 DOM 尺寸变化
-	useLayoutEffect(() => {
-		if (shouldSkipMeasurement) return
-		let target: HTMLElement | null = null
-		if (isEditingState && protyleHostRef.current) {
-			target = (protyleHostRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || protyleHostRef.current
-		}
-		if (!target && containerRef.current) {
-			target = (containerRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || containerRef.current
-		}
-		if (!target) return
-
-		const observer = new ResizeObserver(() => {
-			scheduleShapeSizeUpdate()
-		})
-		observer.observe(target)
-
-		return () => {
-			observer.disconnect()
-		}
-	}, [isEditingState, scheduleShapeSizeUpdate, shouldSkipMeasurement])
-
-	// 使用 MutationObserver 监听 DOM 内容变化
-	useLayoutEffect(() => {
-		if (shouldSkipMeasurement) return
-		let target: HTMLElement | null = null
-		if (isEditingState && protyleHostRef.current) {
-			target = (protyleHostRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || protyleHostRef.current
-		}
-		if (!target && containerRef.current) {
-			target = (containerRef.current.querySelector('.protyle-wysiwyg') as HTMLElement) || containerRef.current
-		}
-		if (!target) return
-
-		const observer = new MutationObserver(() => {
-			scheduleShapeSizeUpdate()
-		})
-		// 不监听 attributes：Protyle 打字时会频繁更新 data-* 属性，纯属性变化
-		// 极少影响滚动高度；由此引发的尺寸变化仍会被 ResizeObserver 捕获。
-		observer.observe(target, { subtree: true, childList: true, characterData: true })
-
-		return () => {
-			observer.disconnect()
-		}
-	}, [isEditingState, scheduleShapeSizeUpdate, shouldSkipMeasurement])
-
-	// 监听图片加载完成后重新测量
-	useEffect(() => {
-		if (shouldSkipMeasurement) return
-		let target: HTMLElement | null = null
-		if (isEditingState && protyleHostRef.current) {
-			target = protyleHostRef.current
-		}
-		if (!target && containerRef.current) {
-			target = containerRef.current
-		}
-		if (!target) return
-
-		const handlers: Array<() => void> = []
-		target.querySelectorAll('img').forEach((img) => {
-			const handler = () => scheduleShapeSizeUpdate()
-			img.addEventListener('load', handler)
-			handlers.push(() => img.removeEventListener('load', handler))
-		})
-
-		return () => {
-			handlers.forEach((off) => off())
-		}
-	}, [isEditingState, scheduleShapeSizeUpdate, shouldSkipMeasurement])
-
-	return { updateShapeSize }
-}
 
 export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 	static override type = 'single-block' as const
@@ -349,14 +146,16 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			transparentBackground: false,
 			// 是否允许与其他形状建立绑定（默认允许）
 			allowBinding: true,
+			// 新建形状高度即生效为手动模式，不触发旧白板的一次性回填
+			heightBackfilled: true,
 		}
 	}
 
 	getGeometry(shape: ISingleBlockShape) {
-		const size = SingleBlockSizes.get(this.editor).get(shape.id)
+		// 高度完全由 props.h 决定，与 Card 行为一致
 		return new Rectangle2d({
 			width: shape.props.w,
-			height: size?.height ?? shape.props.h,
+			height: shape.props.h,
 			isFilled: true,
 		})
 	}
@@ -374,7 +173,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 	component(shape: ISingleBlockShape) {
 		const editor = this.editor
-		// 保存 editor 引用供 useSingleBlockSize hook 使用
 		const theme = getDefaultColorTheme({ isDarkMode: editor.user.getIsDarkMode() })
 		const isEditing = useValue('single-block is editing', () => editor.getEditingShapeId() === shape.id, [editor, shape.id])
 		const branchInteractionHint = useBranchInteractionHint()
@@ -507,9 +305,33 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			editor.deleteShape(shape.id)
 		}, [editor, shape.id])
 
-		// 使用独立的尺寸测量 hook（自动处理尺寸更新）
-		// 如果有加载错误，跳过测量以避免异常增长
-		useSingleBlockSize(editor, shape, containerRef, protyleHostRef, isEditingState, shouldUseLightweightPreview || hasLoadError)
+		// 一次性回填：旧白板中的 SingleBlock 此前高度由运行时测量决定、从未写回 props.h，
+		// 移除自动测高后会塌缩到默认值的 50px。内容就绪后测量一次并写回（heightBackfilled），
+		// 之后高度完全由用户手动调整（与 Card 行为一致）。新建形状的默认 props 已带
+		// heightBackfilled: true，不触发回填；仅迁移补齐为 false 的旧形状执行一次。
+		useEffect(() => {
+			if (shape.props.heightBackfilled !== false) return
+			if (shouldUseLightweightPreview || hasLoadError) return
+			const frame = requestAnimationFrame(() => {
+				const target = isEditingState ? protyleHostRef.current : staticContentRef.current
+				if (!target) return
+				const wysiwyg = target.querySelector('.protyle-wysiwyg') as HTMLElement | null
+				const measured = Math.ceil((wysiwyg || target).scrollHeight || 0)
+				if (measured <= 0) return
+				const borderPx = shape.props.transparentBackground ? 0 : BORDER_PX
+				const addBorder = settingdata["showCardBorder"] !== false && !shape.props.transparentBackground
+				const nextHeight = Math.max(measured + (addBorder ? borderPx * 2 : 0), MIN_HEIGHT)
+				editor.updateShape({
+					id: shape.id,
+					type: shape.type,
+					props: {
+						h: nextHeight,
+						heightBackfilled: true,
+					},
+				})
+			})
+			return () => cancelAnimationFrame(frame)
+		}, [shape.props.heightBackfilled, staticHtml, isEditingState, shouldUseLightweightPreview, hasLoadError, editor, shape.id, shape.type, shape.props.transparentBackground])
 
 		// 编辑模式切换时聚焦到形状，并在退出编辑后恢复之前的视角
 		useRestoreCameraOnEdit(editor, isEditing, shape.id, '形状')
@@ -806,7 +628,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					protyleRef.current = protyleInstance
 					currentContainer.appendChild(host)
 					if (protyleInstance.protyle?.wysiwyg?.element) {
-						protyleInstance.protyle.wysiwyg.element.style.fontSize = `${shape.props.fontSize || 16}px`
+						protyleInstance.protyle.wysiwyg.element.style.fontSize = `${shape.props.fontSize || SINGLE_BLOCK_DEFAULT_FONT_SIZE}px`
 					}
 					// 等待 Protyle 就绪
 					await readyWithTimeout.catch(() => undefined)
@@ -814,7 +636,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 						clearTimeout(readyTimeoutId)
 						readyTimeoutId = null
 					}
-					// 尺寸测量由 useSingleBlockSize hook 自动处理
 					// 启用编辑
 					protyleInstance.enable()
 					if (signal.aborted || disposed) {
@@ -1029,12 +850,11 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 		useEffect(() => {
 			if (protyleRef.current?.protyle?.wysiwyg?.element) {
-				protyleRef.current.protyle.wysiwyg.element.style.fontSize = `${shape.props.fontSize || 20}px`;
+				protyleRef.current.protyle.wysiwyg.element.style.fontSize = `${shape.props.fontSize || SINGLE_BLOCK_DEFAULT_FONT_SIZE}px`;
 			} else if (containerRef.current) {
 				const wys = containerRef.current.querySelector(".protyle-wysiwyg");
-				if (wys) (wys as HTMLElement).style.fontSize = `${shape.props.fontSize || 20}px`;
+				if (wys) (wys as HTMLElement).style.fontSize = `${shape.props.fontSize || SINGLE_BLOCK_DEFAULT_FONT_SIZE}px`;
 			}
-			// 字号变化可能导致高度变化，由 useSingleBlockSize hook 自动处理
 		}, [shape.props.fontSize]);
 
 
@@ -1210,8 +1030,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					style={{
 						width: '100%',
 						height: '100%',
-						// 编辑态隐藏滚动条，非编辑态允许滚动
-						overflow: isEditingState ? 'hidden' : 'auto',
+						// 内容溢出时容器内滚动，编辑态同样允许滚动（与 Card 行为一致）
+						overflow: 'auto',
 						// Prevent content interactions when not editing to avoid blocking
 						// TL editor pointer handling. The overlay itself can still react
 						// to hover because HTMLContainer has pointer-events enabled.
@@ -1264,7 +1084,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 								width: '100%',
 								height: '100%',
 								// 字号由容器控制并随 props 变化，缓存 HTML 不再内联 font-size
-								fontSize: `${shape.props.fontSize || 16}px`,
+								fontSize: `${shape.props.fontSize || SINGLE_BLOCK_DEFAULT_FONT_SIZE}px`,
 								pointerEvents: 'none',
 								userSelect: 'none',
 							}}
@@ -1393,7 +1213,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 
 	override toSvg(shape: ISingleBlockShape, ctx: SvgExportContext): ReactElement | null {
 		const theme = getDefaultColorTheme({ isDarkMode: ctx.isDarkMode })
-		const { w, h: hProp, color, fontSize = 16, blockId, transparentBackground } = shape.props
+		const { w, h: hProp, color, fontSize = SINGLE_BLOCK_DEFAULT_FONT_SIZE, blockId, transparentBackground } = shape.props
 		const showBorder = settingdata["showCardBorder"] !== false && !transparentBackground
 		// 背景是否透明与是否显示边框是两个独立的选项。画布上的
 		// singleblock 在关闭边框时仍然保留颜色背景，导出也应保持一致。
@@ -1403,9 +1223,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const strokeColor = showBorder ? theme[color].solid : 'none'
 		const fillColor = hasBackground ? theme[color].semi : 'none'
 		const textColor = theme[color].solid
-		const size = SingleBlockSizes.get(this.editor).get(shape.id)
-		// 使用实际渲染高度，如果没有则使用属性高度，确保导出与实际一致
-		const h = size?.height ?? Math.max(hProp, MIN_HEIGHT)
+		// 高度与几何一致，直接采用属性高度
+		const h = Math.max(hProp, MIN_HEIGHT)
 		if (isSvgExportOutlineOnly()) {
 			return <rect width={w} height={h} fill="none" stroke={theme[color].solid} strokeWidth={border || 1} rx={radius} ry={radius} />
 		}

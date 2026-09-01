@@ -19,5 +19,7 @@ export type ISingleBlockShape = TLBaseShape<
 		allowBinding?: boolean
         /** 是否使用透明背景并且不显示边框 */
         transparentBackground?: boolean
+		/** 高度回填完成标记：旧白板形状首次挂载时做一次性测高写回，此后高度完全手动调整 */
+		heightBackfilled?: boolean
 	}
 >

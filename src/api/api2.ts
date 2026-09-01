@@ -109,7 +109,7 @@ export function createIframeDock(options: IframeDockOptions) {
 }
 
 
-interface WebviewExtraOptions {
+export interface WebviewExtraOptions {
     enableButtons?: boolean;               // 是否启用顶部悬浮按钮 (默认 true)
     buttonTexts?: {                        // 按钮文字自定义
         copy?: string;                     // 复制(插入)按钮文字

@@ -14,6 +14,8 @@ export function getSingleBlockShapeDefaultProps(): ISingleBlockShape['props'] {
 		connectOnEnter: false,
 		transparentBackground: false,
 		allowBinding: true,
+		// 新建形状高度即生效为手动模式，不触发旧白板的一次性回填
+		heightBackfilled: true,
 	}
 }
 
@@ -29,4 +31,5 @@ export const singleBlockShapeProps: RecordProps<ISingleBlockShape> = {
 	connectOnEnter: T.optional(T.boolean),
 	allowBinding: T.optional(T.boolean),
 	transparentBackground: T.optional(T.boolean),
+	heightBackfilled: T.optional(T.boolean),
 }

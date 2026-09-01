@@ -13,7 +13,7 @@ import { getCursorBlockId } from "@/api/api2";
 import { TLShapeId } from "@tldraw/tldraw";
 import { registerTab, unregisterTab } from './tldraw/tldraw-instance-manager';
 import { settingdata } from "@/index";
-import { buildH6CSS, H6_STYLE_DEFAULTS, type H6StyleConfig } from "@/settings/style-h6";
+import { buildH6CSS, type H6StyleConfig } from "@/settings/style-h6";
 import { registerTldrawAgentActions, syncTldrawAgentActions } from "./tldraw/agent/ai/siyuan-agent-adapter";
 import { buildTldrawLink } from './tldraw/utils/link-builder';
 import { buildSlideScreenshotMarkdown } from './tldraw/SlideShape/slide-block-binding';
@@ -33,7 +33,6 @@ export class M_handwriting {
     private plugin: Plugin;
     // 存储画布实例的映射表
 
-    private currentid: string = "";
     // svelte dock component instance
     private dockComponent: any | null = null;
     private slideScreenshotDockComponent: any | null = null;
@@ -516,8 +515,6 @@ export class M_handwriting {
         // 可以在这里初始化任何需要DOM加载完成后的逻辑
         this.plugin.eventBus.on('switch-protyle', (e) => {
             // console.debug("切换思源块:", e);
-            this.currentid = e.detail.protyle.block.rootID;
-            // console.debug(this.currentid);
 
             const protyleEl = e.detail?.protyle?.element as HTMLElement | undefined;
             if (protyleEl) {

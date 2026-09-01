@@ -482,7 +482,7 @@ export class WhiteboardFileManager {
     static async restoreBackupFile(backupPath: string, whiteboardId: string): Promise<FileOperationResult> {
         try {
             // 读取备份文件内容
-            let data = await api.getFile(backupPath);
+            const data = await api.getFile(backupPath);
             
             if (!data) {
                 return {
@@ -520,18 +520,18 @@ export class WhiteboardFileManager {
      */
     static async getBackupPreview(backupPath: string): Promise<BackupPreview> {
         try {
-            let data = await api.getFile(backupPath);
+            const data = await api.getFile(backupPath);
             
             if (!data) {
                 throw new Error('备份文件为空');
             }
             
-            if (typeof data === 'string') {
-                data = JSON.parse(data);
-            }
-            
+            // JSON.parse 返回 any，直接重新赋值给联合类型变量不会收窄；
+            // 换用显式 any 的独立变量承接解析结果
+            const parsed: any = typeof data === 'string' ? JSON.parse(data) : data;
+
             // 规范化文档对象
-            const doc = data?.document ?? data;
+            const doc = parsed?.document ?? parsed;
             
             // 提取页面条目
             let pageEntries: any[] = [];

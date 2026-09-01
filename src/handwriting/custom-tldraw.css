@@ -1513,6 +1513,13 @@ div.bq[data-type="NodeBlockquote"][custom-st-tldraw="1"] {
 	height: 0 !important;
 	display: none !important;
 }
+/* 思源样式表对 .protyle-wysiwyg 根元素声明 font-size: var(--b3-font-size-editor)，
+   会截断静态容器上按 props.fontSize 设置的字号继承（形状字号设置因此失效，
+   编辑态内联字号与静态态不一致）。这里让缓存 HTML 的 wysiwyg 根恢复继承，
+   标题等 em 相对字号也随之按形状字号正确缩放。 */
+.single-block-static-content .protyle-wysiwyg {
+	font-size: inherit;
+}
 .single-block-static-content,
 .single-block-static-content .protyle-wysiwyg {
 	pointer-events: none !important;

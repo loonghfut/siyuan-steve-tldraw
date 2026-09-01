@@ -240,6 +240,9 @@ export function extractStaticHtml(container: HTMLElement): string {
 	if (!wysiwyg) return ''
 
 	const clone = wysiwyg.cloneNode(true) as HTMLElement
+	// live 元素上由编辑态写入的内联 font-size 会随 cloneNode 保留下来，
+	// 使缓存快照钉死在抓取时的字号；清除后字号恢复由静态容器继承控制
+	clone.style.removeProperty('font-size')
 
 	// 递归内联计算样式到每个元素
 	const inlineComputedStyles = (source: Element, target: Element) => {

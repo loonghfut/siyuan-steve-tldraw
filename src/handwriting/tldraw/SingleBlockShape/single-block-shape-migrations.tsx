@@ -4,6 +4,7 @@ const versions = createShapePropsMigrationIds('single-block', {
 	addRefreshNonce: 1,
     addAllowBinding: 2,
     addLightweightPreviewText: 3,
+	addHeightBackfilled: 4,
 })
 
 export const singleBlockShapeMigrations = createShapePropsMigrationSequence({
@@ -33,6 +34,17 @@ export const singleBlockShapeMigrations = createShapePropsMigrationSequence({
 			},
 			down(props) {
 				delete props.previewText
+			},
+		},
+		{
+			id: versions.addHeightBackfilled,
+			up(props) {
+				// 存量形状未回填过高度：首次挂载时做一次性测高写回，
+				// 回填完成后置为 true，此后高度完全手动调整
+				props.heightBackfilled = props.heightBackfilled ?? false
+			},
+			down(props) {
+				delete props.heightBackfilled
 			},
 		},
 	],

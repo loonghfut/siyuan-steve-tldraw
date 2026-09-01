@@ -170,7 +170,7 @@ function getTldrawMeta(editor: Editor) {
 async function syncOutlineBlockAttrs(editor: Editor, blockIds: string[]) {
 	if (blockIds.length === 0) return
 
-	const { rootId, title } = getTldrawMeta(editor)
+	const { rootId } = getTldrawMeta(editor)
 	if (!rootId) {
 		console.warn('skip syncing outline block attrs: missing tldraw rootId')
 		return
