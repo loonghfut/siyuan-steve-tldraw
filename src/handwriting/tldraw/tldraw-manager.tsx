@@ -986,6 +986,9 @@ export class TldrawManager {
             if (!isCurrentlyInteracting) {
                 isCurrentlyInteracting = true;
                 setInteracting(true);
+                // 平移/缩放期间暂停向新形状授予准入，避免静态预览挂载与平移帧争抢主线程；
+                // 交互结束（notifyViewportSettled）后一次性按距离优先级授予
+                shapeLoadManager.setGrantsDeferred(true);
             }
         };
         

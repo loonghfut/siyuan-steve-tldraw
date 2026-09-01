@@ -67,6 +67,12 @@ class ShapeLoadManager {
   // 反复销毁重建卡片 DOM。宽限期内预算可能短暂超限，换取稳定的显示。
   private readonly ADMISSION_GRACE_MS = 1500
   private admissionBlockTimers = new Map<TLShapeId, ReturnType<typeof setTimeout>>()
+  // 准入授予避让：平移/缩放期间不向新形状授予准入（撤销照常），新出现的形状
+  // 保持轻量预览，交互结束后一次性按距离优先级挂载。避免大文档的静态预览
+  // 挂载（DOM 解析/序列化）与平移帧争抢主线程，也避免挂载完又被撤销的浪费。
+  private grantsDeferred = false
+  private readonly DEFERRED_GRANT_RECHECK_MS = 800
+  private deferredGrantRecheckTimer: ReturnType<typeof setTimeout> | null = null
 
   attachEditor(editor: Editor) {
     if (this.editorUnsubscribers.has(editor)) return
@@ -188,6 +194,9 @@ class ShapeLoadManager {
       clearTimeout(this.recomputeTimer)
       this.recomputeTimer = null
     }
+    // grantsDeferred 故意不重置：交互可能仍在进行（如切走标签页后全部注销），
+    // 标记应跟随交互状态而非形状数量，由 notifyViewportSettled / 兜底检查归位。
+    this.cancelDeferredGrantRecheck()
     for (const timer of this.admissionBlockTimers.values()) clearTimeout(timer)
     this.admissionBlockTimers.clear()
     for (const unsubscribe of this.editorUnsubscribers.values()) unsubscribe()
@@ -211,7 +220,45 @@ class ShapeLoadManager {
    * normal idle/interacting recompute interval.
    */
   notifyViewportSettled() {
-    this.queueRecompute(true)
+    this.setGrantsDeferred(false)
+  }
+
+  /**
+   * 平移/缩放等画布交互进行中暂停授予新准入；撤销与可见性元数据照常更新。
+   * 交互结束（notifyViewportSettled）后立即补一次重算，把推迟的授予按
+   * 距离优先级一次性放出。
+   */
+  setGrantsDeferred(value: boolean) {
+    if (this.grantsDeferred === value) return
+    this.grantsDeferred = value
+    if (!value) {
+      this.cancelDeferredGrantRecheck()
+      this.queueRecompute(true)
+    }
+  }
+
+  private cancelDeferredGrantRecheck() {
+    if (this.deferredGrantRecheckTimer !== null) {
+      clearTimeout(this.deferredGrantRecheckTimer)
+      this.deferredGrantRecheckTimer = null
+    }
+  }
+
+  /**
+   * 兜底：若交互结束事件因异常未送达（如 pointerup 被吞、窗口失焦路径遗漏），
+   * 推迟的授予不能无限期挂起。交互仍在持续时只顺延检查，不触发重算。
+   */
+  private scheduleDeferredGrantRecheck() {
+    if (this.deferredGrantRecheckTimer !== null) return
+    this.deferredGrantRecheckTimer = setTimeout(() => {
+      this.deferredGrantRecheckTimer = null
+      if (isInteracting()) {
+        this.scheduleDeferredGrantRecheck()
+        return
+      }
+      this.grantsDeferred = false
+      this.queueRecompute(true)
+    }, this.DEFERRED_GRANT_RECHECK_MS)
   }
 
   private queueRecompute(immediate = false) {
@@ -313,6 +360,7 @@ class ShapeLoadManager {
     // visible without allowing off-screen document fetches to consume slots.
 
     const computedById = new Map(sortable.map((item) => [item.id, item.meta]))
+    const editingIds = new Set(sortable.filter((item) => item.editing).map((item) => item.id))
 
     // Notify changes
     for (const s of this.shapes.values()) {
@@ -336,7 +384,13 @@ class ShapeLoadManager {
           clearTimeout(pendingTimer)
           this.admissionBlockTimers.delete(s.id)
         }
-        newAllowed = true
+        // 交互避让：平移/缩放进行中不授予"新"准入（撤销照常）。保持已有准入、
+        // 编辑中的形状不受影响——编辑挂载不能等交互结束。
+        if (s.lastAllowed || !this.grantsDeferred || editingIds.has(s.id)) {
+          newAllowed = true
+        } else {
+          this.scheduleDeferredGrantRecheck()
+        }
       } else if (s.lastAllowed && !this.admissionBlockTimers.has(s.id)) {
         const timer = setTimeout(() => {
           this.admissionBlockTimers.delete(s.id)
