@@ -1472,3 +1472,76 @@ div.bq[data-type="NodeBlockquote"][custom-st-tldraw="1"] {
     transform: scale(1.06);
 }
 
+
+/* ===== Card / SingleBlock 静态内容交互屏蔽（自 shape 组件内联 <style> 迁移，
+   避免每个形状实例各渲染一份重复样式表） ===== */
+.card-static-content,
+.card-static-content .protyle-wysiwyg {
+	pointer-events: none !important;
+	user-select: none !important;
+	-webkit-user-select: none !important;
+	-webkit-touch-callout: none !important;
+}
+.card-static-content * {
+	pointer-events: none !important;
+	user-select: none !important;
+	-webkit-user-select: none !important;
+	-webkit-user-drag: none !important;
+	-webkit-touch-callout: none !important;
+}
+.card-static-content a,
+.card-static-content a *,
+.card-static-content [data-href],
+.card-static-content [data-href] *,
+.card-static-content [data-type*="block-ref"],
+.card-static-content [data-type*="block-ref"] *,
+.card-static-content [data-type*="file-annotation-ref"],
+.card-static-content [data-type*="file-annotation-ref"] * {
+	pointer-events: auto !important;
+	cursor: pointer;
+}
+
+/* ===== SingleBlock ===== */
+.st-single-block-shape__content,
+.st-single-block-shape__content * {
+	scrollbar-width: none !important;
+	-ms-overflow-style: none !important;
+}
+.st-single-block-shape__content::-webkit-scrollbar,
+.st-single-block-shape__content *::-webkit-scrollbar {
+	width: 0 !important;
+	height: 0 !important;
+	display: none !important;
+}
+.single-block-static-content,
+.single-block-static-content .protyle-wysiwyg {
+	pointer-events: none !important;
+	user-select: none !important;
+	-webkit-user-select: none !important;
+}
+.single-block-static-content * {
+	pointer-events: none !important;
+	user-select: none !important;
+	-webkit-user-select: none !important;
+	-webkit-user-drag: none !important;
+}
+.single-block-static-content a,
+.single-block-static-content a *,
+.single-block-static-content [data-href],
+.single-block-static-content [data-href] *,
+.single-block-static-content [data-type*="block-ref"],
+.single-block-static-content [data-type*="block-ref"] *,
+.single-block-static-content [data-type*="file-annotation-ref"],
+.single-block-static-content [data-type*="file-annotation-ref"] * {
+	pointer-events: auto !important;
+	cursor: pointer;
+}
+
+/* 数据库属性图标：用 :has() 依据内容中的属性视图图标显隐，
+   替代此前每个形状一个的 subtree MutationObserver */
+.st-single-block-attr-icon {
+	display: none;
+}
+.st-single-block-shape:has(.protyle-attr--av) .st-single-block-attr-icon {
+	display: flex;
+}

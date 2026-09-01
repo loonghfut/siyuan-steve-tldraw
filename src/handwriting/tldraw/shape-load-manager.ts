@@ -48,6 +48,10 @@ class ShapeLoadManager {
   // cycle, preventing a brief fallback to "blocked" during a re-registration.
   private snapshots: Map<TLShapeId, { lastAllowed: boolean; lastComputed: ComputedMeta }> = new Map()
   private editorUnsubscribers = new Map<Editor, () => void>()
+  // 编辑器容器可见性：后台白板标签页（display:none）的形状不参与准入，
+  // 避免不可见画布占用全局 maxActive 预算。
+  private editorVisibility = new Map<Editor, boolean>()
+  private editorObservers = new Map<Editor, IntersectionObserver>()
   private recomputeTimer: ReturnType<typeof setTimeout> | null = null
   private immediateRecomputeQueued = false
   private lastRecomputeAt = 0
@@ -59,6 +63,10 @@ class ShapeLoadManager {
   // The difference is that an idle whiteboard no longer wakes every frame.
   private readonly IDLE_RECOMPUTE_INTERVAL_MS = 500
   private readonly INTERACTING_RECOMPUTE_INTERVAL_MS = 1000
+  // 准入滞回：离开配额后延迟撤销通知，避免在 maxActive 边界/视口边缘抖动时
+  // 反复销毁重建卡片 DOM。宽限期内预算可能短暂超限，换取稳定的显示。
+  private readonly ADMISSION_GRACE_MS = 1500
+  private admissionBlockTimers = new Map<TLShapeId, ReturnType<typeof setTimeout>>()
 
   attachEditor(editor: Editor) {
     if (this.editorUnsubscribers.has(editor)) return
@@ -71,6 +79,29 @@ class ShapeLoadManager {
       { scope: 'all', source: 'all' }
     )
     this.editorUnsubscribers.set(editor, unsubscribe)
+    this.watchEditorVisibility(editor)
+  }
+
+  private watchEditorVisibility(editor: Editor) {
+    if (this.editorObservers.has(editor)) return
+    // 默认视为可见；IntersectionObserver 的首个回调会校正隐藏标签页。
+    this.editorVisibility.set(editor, true)
+    if (typeof IntersectionObserver === 'undefined') return
+    try {
+      const container = editor.getContainer()
+      if (!container) return
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries.some((entry) => entry.isIntersecting)
+        if (this.editorVisibility.get(editor) === visible) return
+        this.editorVisibility.set(editor, visible)
+        // 可见性翻转影响准入结果，立即重算
+        this.queueRecompute(true)
+      }, { threshold: 0 })
+      observer.observe(container)
+      this.editorObservers.set(editor, observer)
+    } catch {
+      // 容器尚未挂载等场景下忽略；保持默认可见
+    }
   }
 
   register(shapeId: TLShapeId, editor: Editor, metaProvider: () => ShapeLoadMeta, onPermissionChange: (allowed: boolean, meta: ComputedMeta) => void) {
@@ -118,6 +149,11 @@ class ShapeLoadManager {
       this.snapshots.set(shapeId, { lastAllowed: existing.lastAllowed, lastComputed: existing.lastComputed })
     }
     this.shapes.delete(shapeId)
+    const pendingBlockTimer = this.admissionBlockTimers.get(shapeId)
+    if (pendingBlockTimer) {
+      clearTimeout(pendingBlockTimer)
+      this.admissionBlockTimers.delete(shapeId)
+    }
     // Effect cleanups and their replacements run synchronously. Retain the
     // snapshot for that hand-off only; discard orphaned shape ids afterwards.
     queueMicrotask(() => {
@@ -139,6 +175,12 @@ class ShapeLoadManager {
     if (!unsubscribe) return
     unsubscribe()
     this.editorUnsubscribers.delete(editor)
+    const observer = this.editorObservers.get(editor)
+    if (observer) {
+      observer.disconnect()
+      this.editorObservers.delete(editor)
+    }
+    this.editorVisibility.delete(editor)
   }
 
   private stop() {
@@ -146,8 +188,13 @@ class ShapeLoadManager {
       clearTimeout(this.recomputeTimer)
       this.recomputeTimer = null
     }
+    for (const timer of this.admissionBlockTimers.values()) clearTimeout(timer)
+    this.admissionBlockTimers.clear()
     for (const unsubscribe of this.editorUnsubscribers.values()) unsubscribe()
     this.editorUnsubscribers.clear()
+    for (const observer of this.editorObservers.values()) observer.disconnect()
+    this.editorObservers.clear()
+    this.editorVisibility.clear()
   }
 
   forceRecompute() {
@@ -204,22 +251,25 @@ class ShapeLoadManager {
       let inViewport = false
       let inPreloadZone = false
       try {
-        const vp = s.editor?.getViewportPageBounds()
-        const b = s.editor?.getShapePageBounds(s.id)
-        if (vp && b) {
-          inViewport = vp.minX < b.maxX && vp.maxX > b.minX && vp.minY < b.maxY && vp.maxY > b.minY
-          const marginX = vp.width * this.PRELOAD_VIEWPORT_FRACTION
-          const marginY = vp.height * this.PRELOAD_VIEWPORT_FRACTION
-          const expanded = {
-            minX: vp.minX - marginX,
-            minY: vp.minY - marginY,
-            maxX: vp.maxX + marginX,
-            maxY: vp.maxY + marginY,
+        const editorVisible = this.editorVisibility.get(s.editor) ?? true
+        if (editorVisible) {
+          const vp = s.editor?.getViewportPageBounds()
+          const b = s.editor?.getShapePageBounds(s.id)
+          if (vp && b) {
+            inViewport = vp.minX < b.maxX && vp.maxX > b.minX && vp.minY < b.maxY && vp.maxY > b.minY
+            const marginX = vp.width * this.PRELOAD_VIEWPORT_FRACTION
+            const marginY = vp.height * this.PRELOAD_VIEWPORT_FRACTION
+            const expanded = {
+              minX: vp.minX - marginX,
+              minY: vp.minY - marginY,
+              maxX: vp.maxX + marginX,
+              maxY: vp.maxY + marginY,
+            }
+            inPreloadZone = expanded.minX < b.maxX && expanded.maxX > b.minX && expanded.minY < b.maxY && expanded.maxY > b.minY
+            const cx = vp.midX, cy = vp.midY
+            const sx = (b.minX + b.maxX) / 2, sy = (b.minY + b.maxY) / 2
+            distance = Math.hypot(cx - sx, cy - sy)
           }
-          inPreloadZone = expanded.minX < b.maxX && expanded.maxX > b.minX && expanded.minY < b.maxY && expanded.maxY > b.minY
-          const cx = vp.midX, cy = vp.midY
-          const sx = (b.minX + b.maxX) / 2, sy = (b.minY + b.maxY) / 2
-          distance = Math.hypot(cx - sx, cy - sy)
         }
       } catch { /* ignore */ }
 
@@ -266,20 +316,40 @@ class ShapeLoadManager {
 
     // Notify changes
     for (const s of this.shapes.values()) {
-      const newAllowed = allowedSet.has(s.id)
+      const targetAllowed = allowedSet.has(s.id)
       const computed = computedById.get(s.id) || { inViewport: false, inPreloadZone: false, distance: Infinity }
       // Refresh ordering when the viewport center moved meaningfully, while
       // avoiding callbacks on every 500ms recompute during tiny camera motion.
       const distanceChanged = Number.isFinite(computed.distance) && Number.isFinite(s.lastComputed.distance)
         ? Math.abs(computed.distance - s.lastComputed.distance) >= 128
         : computed.distance !== s.lastComputed.distance
-      const changed = newAllowed !== s.lastAllowed ||
-        computed.inViewport !== s.lastComputed.inViewport ||
+      const metaChanged = computed.inViewport !== s.lastComputed.inViewport ||
         computed.inPreloadZone !== s.lastComputed.inPreloadZone ||
         distanceChanged
+
+      // 准入滞回：获得准入立即生效；失去准入延迟 ADMISSION_GRACE_MS 再通知，
+      // 期间若重新获得准入则取消撤销。避免边界抖动造成 DOM 反复重建。
+      let newAllowed = s.lastAllowed
+      if (targetAllowed) {
+        const pendingTimer = this.admissionBlockTimers.get(s.id)
+        if (pendingTimer) {
+          clearTimeout(pendingTimer)
+          this.admissionBlockTimers.delete(s.id)
+        }
+        newAllowed = true
+      } else if (s.lastAllowed && !this.admissionBlockTimers.has(s.id)) {
+        const timer = setTimeout(() => {
+          this.admissionBlockTimers.delete(s.id)
+          s.lastAllowed = false
+          try { s.onChange(false, s.lastComputed) } catch { /* ignore */ }
+        }, this.ADMISSION_GRACE_MS)
+        this.admissionBlockTimers.set(s.id, timer)
+      }
+
+      const allowedChanged = newAllowed !== s.lastAllowed
       s.lastAllowed = newAllowed
       s.lastComputed = computed
-      if (changed) {
+      if (allowedChanged || metaChanged) {
         try { s.onChange(newAllowed, computed) } catch { /* ignore */ }
       }
     }

@@ -47,3 +47,47 @@ export function getShapeLowDetailFontSize(minDimension: number, efficientZoom: n
 	const availableFontSize = Math.max(12, safeDimension * 0.42)
 	return Math.round(Math.min(availableFontSize, 20 / safeZoom))
 }
+
+export interface ShapeRenderPolicyInput {
+	isEditing: boolean
+	isViewportCullingEnabled: boolean
+	isInViewport: boolean
+	canLoad: boolean
+	isSmallShape: boolean
+	isCollapsed?: boolean
+	inExitGrace?: boolean
+}
+
+export interface ShapeRenderPolicy {
+	renderAdmission: 'allowed' | 'blocked'
+	shouldUseStaticPreview: boolean
+	shouldUseLightweightPreview: boolean
+}
+
+/**
+ * Shared render policy for Card / SingleBlock shapes.
+ * Centralizes the decision tree so viewport culling, low-detail preview,
+ * and static-vs-live rendering stay aligned across both shape types.
+ */
+export function getShapeRenderPolicy({
+	isEditing,
+	isViewportCullingEnabled,
+	isInViewport,
+	canLoad,
+	isSmallShape,
+	isCollapsed = false,
+	inExitGrace = false,
+}: ShapeRenderPolicyInput): ShapeRenderPolicy {
+	const renderAdmission = isEditing || !isViewportCullingEnabled || (isInViewport && canLoad)
+		? 'allowed'
+		: 'blocked'
+
+	const shouldUseStaticPreview = !isEditing && !isCollapsed && renderAdmission === 'allowed'
+	const shouldUseLightweightPreview = !isEditing && !isCollapsed && (isSmallShape || (isViewportCullingEnabled && renderAdmission === 'blocked')) && !inExitGrace
+
+	return {
+		renderAdmission,
+		shouldUseStaticPreview,
+		shouldUseLightweightPreview,
+	}
+}

@@ -11,7 +11,7 @@ import {
 import { cardShapeMigrations } from './card-shape-migrations'
 import { cardShapeProps, getCardShapeDefaultProps } from './card-shape-props'
 import { CardRenderMode, ICardShape } from './card-shape-types'
-import { openTab, Protyle, showMessage, TProtyleAction } from 'siyuan';
+import { Protyle, showMessage, TProtyleAction } from 'siyuan';
 import * as api from '@/api/api';
 import { settingdata } from '@/index';
 import { buildTldrawLink } from '../utils/link-builder';
@@ -21,12 +21,26 @@ import { enqueueStaticPreviewLoad } from '../static-preview-load-queue'
 import { PortsOverlay } from '../BezierConnectorShape/Port'
 import { renderAllContentIdle } from '../utils/render/content-renderer'
 import { cancelIdleRender, isIdleRenderCancelledError } from '../utils/idle-scheduler'
-import { getShapeLowDetailCountThreshold, getShapeLowDetailFontSize, getShapeLowDetailThreshold, getVisibleCardAndSingleBlockCount } from '../utils/low-detail'
-import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
+import {
+	getShapeLowDetailCountThreshold,
+	getShapeLowDetailFontSize,
+	getShapeLowDetailThreshold,
+	getShapeRenderPolicy,
+	getVisibleCardAndSingleBlockCount,
+} from '../utils/low-detail'
+import { getLightweightPreviewTextFromElement } from '../utils/lightweight-preview'
 import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
 import { CardContentVirtualizer } from './card-content-virtualizer'
 import { exportCardShapeToSvg } from './CardShapeExport'
 import { getCardCollapsedHeight } from './card-collapse'
+import { cacheStaticPreview, getCachedPreview, invalidatePreviewCache } from './static-preview-cache'
+import { warmCardStaticPreview } from './card-preview-warmup'
+import { invalidateBlockExistenceCache, scheduleBlockCheck } from '../utils/block-existence'
+import { clearStaticTextSelectionSoon, findStaticLinkTarget, isSteveToolsPluginUrl, openStaticLinkTarget } from '../utils/static-links'
+import { safeDestroyProtyle } from '../utils/protyle-lifecycle'
+import { runExclusiveBlockCreation } from '../utils/pending-creation'
+import { MissingBlockOverlay } from '../ui/MissingBlockOverlay'
+import { useRestoreCameraOnEdit } from '../utils/use-restore-camera-on-edit'
 import { getDefaultColorTheme } from '../utils/color-theme'
 import { inputDialogSync } from '@/libs/dialog'
 import {
@@ -42,12 +56,8 @@ import {
 } from '../BranchShape'
 
 // 按卡片隔离创建流程，避免多个新卡片互相复用创建结果
-const pendingCreationPromises = new Map<string, Promise<string>>();
 const draggingBranchCardIds = new Set<string>()
 
-// 静态预览 DOM 缓存：避免重复请求
-const staticPreviewCache = new Map<string, { html: string; fontSize: number; blockLimit: number }>();
-const MAX_CACHE_SIZE = 50;
 // Static Cards are previews, not editors. Keep enough blocks for the visible
 // area and overscan, but never inherit SiYuan getDoc's 102400-block default.
 // Entering edit mode still mounts the complete Protyle document. The previous
@@ -56,9 +66,6 @@ const MAX_CACHE_SIZE = 50;
 const MIN_STATIC_PREVIEW_BLOCKS = 12
 const MAX_STATIC_PREVIEW_BLOCKS = 96
 
-// Card 的静态预览会按思源顶层块进行窗口化；只有当前可显示的块会留在 DOM 中。
-const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
-const STEVE_TOOLS_PLUGIN_URL_RE = /^(?:https:\/\/|siyuan:\/\/)plugins\/siyuan-steve-tools\//i
 const NON_VIRTUALIZABLE_MEDIA_SELECTOR = [
 	'[data-type="NodeVideo"]',
 	'[data-type="NodeAudio"]',
@@ -110,178 +117,6 @@ function buildDefaultCardBlockMarkdown(
 		'\n'
 	)
 }
-
-function decodeLinkTarget(value: string) {
-	return value
-		.replace(/&amp;/g, '&')
-		.replace(/&quot;/g, '"')
-		.replace(/&#39;/g, "'")
-		.replace(/&lt;/g, '<')
-		.replace(/&gt;/g, '>')
-		.trim()
-}
-
-function getSiyuanBlockIdFromLink(rawHref: string): string | null {
-	const href = decodeLinkTarget(rawHref)
-	const directMatch = href.match(/^siyuan:\/\/blocks\/(\d{14}-[0-9a-z]{7})/i)
-	if (directMatch) return directMatch[1]
-	if (/^\d{14}-[0-9a-z]{7}$/i.test(href)) return href
-
-	try {
-		const parsed = new URL(href, window.location.href)
-		const idFromQuery = parsed.searchParams.get('id') || parsed.searchParams.get('blockId')
-		if (idFromQuery && SIYUAN_BLOCK_ID_RE.test(idFromQuery)) return idFromQuery.match(SIYUAN_BLOCK_ID_RE)![0]
-		const idFromHash = parsed.hash.match(SIYUAN_BLOCK_ID_RE)
-		if (idFromHash) return idFromHash[0]
-	} catch {
-		// ignore invalid or relative URLs
-	}
-
-	return null
-}
-
-function isSteveToolsPluginUrl(rawHref: string) {
-	return STEVE_TOOLS_PLUGIN_URL_RE.test(decodeLinkTarget(rawHref))
-}
-
-function clearStaticTextSelection() {
-	try {
-		window.getSelection()?.removeAllRanges()
-	} catch {
-		// ignore
-	}
-}
-
-function clearStaticTextSelectionSoon() {
-	clearStaticTextSelection()
-	if (typeof requestAnimationFrame === 'function') {
-		requestAnimationFrame(clearStaticTextSelection)
-	} else {
-		window.setTimeout(clearStaticTextSelection, 0)
-	}
-}
-
-function findStaticLinkTarget(target: EventTarget | null, root: HTMLElement | null) {
-	if (!(target instanceof HTMLElement) || !root) return null
-
-	let el: HTMLElement | null = target
-	while (el && root.contains(el)) {
-		const dataType = el.getAttribute('data-type') || ''
-		const dataHref = el.getAttribute('data-href') || ''
-		const href = el instanceof HTMLAnchorElement ? el.getAttribute('href') || dataHref : dataHref
-		const nodeId =
-			el.getAttribute('data-id') ||
-			el.getAttribute('data-node-id') ||
-			el.getAttribute('data-av-id') ||
-			''
-
-		if ((dataType.includes('block-ref') || dataType.includes('file-annotation-ref')) && SIYUAN_BLOCK_ID_RE.test(nodeId)) {
-			return { blockId: nodeId.match(SIYUAN_BLOCK_ID_RE)![0], href: '' }
-		}
-
-		if (href) {
-			return { blockId: getSiyuanBlockIdFromLink(href), href: decodeLinkTarget(href) }
-		}
-
-		if (el === root) break
-		el = el.parentElement
-	}
-
-	return null
-}
-
-function cacheStaticPreview(blockId: string, html: string, fontSize: number, blockLimit: number) {
-	if (staticPreviewCache.size >= MAX_CACHE_SIZE) {
-		const firstKey = staticPreviewCache.keys().next().value;
-		if (firstKey) staticPreviewCache.delete(firstKey);
-	}
-	staticPreviewCache.set(blockId, { html, fontSize, blockLimit });
-}
-
-function getCachedPreview(blockId: string, fontSize: number, blockLimit: number): string | null {
-	const cached = staticPreviewCache.get(blockId);
-	if (cached && cached.fontSize === fontSize && cached.blockLimit === blockLimit) return cached.html;
-	return null;
-}
-
-// 使缓存失效
-function invalidatePreviewCache(blockId: string) {
-	staticPreviewCache.delete(blockId);
-}
-
-function invalidateBlockExistenceCache(blockId: string) {
-	blockExistenceCache.delete(blockId)
-}
-
-// 批量块存在性检查：只对当前准入的卡片执行，并把同一帧内的查询合并成
-// 少量 SQL 请求。旧实现会在 2 秒后为每个 Card 单独发起一次查询，形状多时
-// 会和首屏 DOM 请求争抢网络与内核线程。
-const blockCheckQueue = new Map<string, { shapeId: string; resolve: (exists: boolean) => void }[]>();
-const blockExistenceCache = new Map<string, { exists: boolean; checkedAt: number }>();
-const BLOCK_EXISTENCE_CACHE_TTL_MS = 30_000;
-const BLOCK_CHECK_BATCH_SIZE = 100;
-const BLOCK_CHECK_DELAY_MS = 500;
-let blockCheckTimer: number | null = null;
-
-// 存在性缓存只用于短时合并重复检查，读取逻辑已按 TTL 判断命中；这里在
-// 写入/读取时顺手清掉过期条目，避免长期切换白板后 Map 只增不减。
-function pruneBlockExistenceCache(now = Date.now()) {
-	for (const [blockId, entry] of blockExistenceCache) {
-		if (now - entry.checkedAt >= BLOCK_EXISTENCE_CACHE_TTL_MS) {
-			blockExistenceCache.delete(blockId)
-		}
-	}
-}
-
-function scheduleBlockCheck(blockId: string, shapeId: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		const cached = blockExistenceCache.get(blockId);
-		if (cached) {
-			if (Date.now() - cached.checkedAt < BLOCK_EXISTENCE_CACHE_TTL_MS) {
-				queueMicrotask(() => resolve(cached.exists));
-				return;
-			}
-			blockExistenceCache.delete(blockId)
-		}
-
-		const list = blockCheckQueue.get(blockId) || [];
-		list.push({ shapeId, resolve });
-		blockCheckQueue.set(blockId, list);
-
-		if (blockCheckTimer === null) {
-			blockCheckTimer = window.setTimeout(async () => {
-				blockCheckTimer = null;
-				const entries = [...blockCheckQueue.entries()];
-				blockCheckQueue.clear();
-
-				const ids = entries.map(([bid]) => bid);
-				for (let start = 0; start < ids.length; start += BLOCK_CHECK_BATCH_SIZE) {
-					const batchEntries = entries.slice(start, start + BLOCK_CHECK_BATCH_SIZE);
-					const batchIds = batchEntries.map(([bid]) => bid);
-					const escapedIds = batchIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',');
-					let existingIds = new Set<string>();
-					let querySucceeded = false;
-					try {
-						const rows = await api.sql(`SELECT id FROM blocks WHERE id IN (${escapedIds})`);
-						existingIds = new Set((rows || []).map((row: { id?: string }) => String(row?.id || '')));
-						querySucceeded = true;
-					} catch {
-						// Keep the previous fail-safe behaviour: an unavailable block
-						// check must not keep a stale Protyle alive indefinitely.
-					}
-
-					for (const [bid, callbacks] of batchEntries) {
-						const exists = existingIds.has(bid);
-						if (querySucceeded) blockExistenceCache.set(bid, { exists, checkedAt: Date.now() });
-						callbacks.forEach((cb) => cb.resolve(exists));
-					}
-				}
-				pruneBlockExistenceCache()
-			}, BLOCK_CHECK_DELAY_MS);
-		}
-	});
-}
-
 
 export class CardShapeUtil extends ShapeUtil<ICardShape> {
 	static override type = 'card' as const
@@ -373,6 +208,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const isEditingState = isEditing
 		const [isInViewport, setIsInViewport] = useState(false);
 		const [canLoad, setCanLoad] = useState(false); // gating heavy render by global manager
+		const [inPreloadZone, setInPreloadZone] = useState(false); // 视口外扩预载环，用于缓存预热
 		const [hasMissingLinkedBlock, setHasMissingLinkedBlock] = useState(false);
 		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false;
 		const tldrawHeaderImage = settingdata['tldraw-header-image'] !== false;
@@ -401,8 +237,16 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const exitEditGraceUntilRef = useRef(0)
 		// 退出编辑的宽限期内不降级为轻量预览，避免相机动画过程中尺寸/缩放抖动引发的闪动
 		const inExitGrace = Date.now() < exitEditGraceUntilRef.current
-		const shouldUseLightweightPreview = !isEditingState && !isCollapsed &&
-			(isSmallCard || (isViewportCullingEnabled && !canLoad)) && !inExitGrace
+		const renderPolicy = getShapeRenderPolicy({
+			isEditing: isEditingState,
+			isViewportCullingEnabled,
+			isInViewport,
+			canLoad,
+			isSmallShape: isSmallCard,
+			isCollapsed,
+			inExitGrace,
+		})
+		const shouldUseLightweightPreview = renderPolicy.shouldUseLightweightPreview
 		const lowDetailFontSize = getShapeLowDetailFontSize(Math.min(shape.props.w, shape.props.h), efficientZoom)
 		const isMainCard = Boolean(shape.props.isMain);
 		const collapsedTextSize = shape.props.collapsedTextSize || 21; // 折叠文字大小，默认21px
@@ -427,9 +271,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				? globalRenderMode
 				: (shape.props.renderMode as Exclude<CardRenderMode, 'inherit'>);
 		// While editing, viewport admission must not cancel the queued Protyle mount.
-		const renderAdmission = isEditingState || !isViewportCullingEnabled || (isInViewport && canLoad)
-			? 'allowed'
-			: 'blocked'
+		const renderAdmission = renderPolicy.renderAdmission
 		const cardInnerEdgeShadow = 'inset 0 0 0 5px var(--b3-body-background, var(--b3-theme-background, #fff))'
 		const cardOuterShadow = isRootAttachTarget
 			? '0 0 0 4px rgba(34, 197, 94, 0.42), 0 0 20px rgba(34, 197, 94, 0.32)'
@@ -494,15 +336,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			click: (event: MouseEvent) => void
 			dragStart: (event: DragEvent) => void
 		} | null>(null)
-		// 防止重复销毁：为每个 Protyle 实例设置一个已销毁标记
-		const DESTROYED_MARK = '__st_destroyed__'
-		const safeDestroyProtyle = (pt: Protyle | null | undefined) => {
-			if (!pt) return
-			const anyPt = pt as any
-			if (anyPt[DESTROYED_MARK]) return
-			try { pt.destroy() } catch { }
-			anyPt[DESTROYED_MARK] = true
-		}
 		const removeStaticPreviewLinkHandlers = useCallback((preview?: HTMLElement | null) => {
 			const handlers = staticPreviewHandlersRef.current
 			const target = handlers?.target || preview || staticPreviewRef.current
@@ -515,9 +348,37 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			staticPreviewHandlersRef.current = null
 		}, [])
 		const destroyCardContentVirtualizer = useCallback(() => {
-			cardContentVirtualizerRef.current?.destroy()
+			const virtualizer = cardContentVirtualizerRef.current
+			const preview = staticPreviewRef.current
+			// 虚拟化预览在富内容渲染完成后会把渲染结果回写到块 HTML 上（含
+			// data-card-rich-rendered 块级标记）；销毁前把完整文档写回缓存。
+			// 注意条目级 rendered 必须为 false：只有被窗口化渲染过的块才真正
+			// 完成了富渲染，未滚动到的块靠块级标记在后续窗口里按需渲染。
+			if (virtualizer && preview && virtualizer.hasRenderedContent()) {
+				const previewBlockId = preview.dataset.cardPreviewBlockId
+				if (previewBlockId) {
+					cacheStaticPreview(
+						previewBlockId,
+						virtualizer.getFullHtml(),
+						Number(preview.dataset.cardPreviewBlockLimit || 0),
+						preview.dataset.cardPreviewText || '',
+						false,
+					)
+				}
+			}
+			virtualizer?.destroy()
 			cardContentVirtualizerRef.current = null
 		}, [])
+		// 统一的静态预览移除入口：回写缓存快照、解绑事件、摘除 DOM
+		const removeStaticPreview = useCallback(() => {
+			const current = staticPreviewRef.current
+			destroyCardContentVirtualizer()
+			removeStaticPreviewLinkHandlers()
+			if (current?.parentElement) {
+				try { current.parentElement.removeChild(current) } catch { }
+			}
+			staticPreviewRef.current = null
+		}, [destroyCardContentVirtualizer, removeStaticPreviewLinkHandlers])
 		// tldraw will re-render this component when this shape's props change.
 		// React to the two props the virtualizer cares about directly instead of
 		// registering one store listener per Card. Store listeners remain active for
@@ -526,48 +387,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		useEffect(() => {
 			cardContentVirtualizerRef.current?.refresh()
 		}, [shape.props.w, shape.props.h])
-		const openStaticLinkTarget = useCallback((target: { blockId: string | null; href: string }) => {
-			if (target.blockId) {
-				if (!window.siyuan?.ws?.app) return
-				void openTab({
-					app: window.siyuan.ws.app,
-					doc: {
-						id: target.blockId,
-						action: ['cb-get-hl', 'cb-get-all'],
-						zoomIn: false,
-					},
-					position: 'right',
-					keepCursor: false,
-				}).catch((err) => {
-					console.error('jump to card linked block failed', err)
-					try {
-						showMessage('跳转到链接块失败', 3000, 'error')
-					} catch {
-						// ignore
-					}
-				})
-				return
-			}
-
-			if (!target.href || target.href === '#') return
-			const href = target.href.startsWith('assets/') ? `/${target.href}` : target.href
-			if (isSteveToolsPluginUrl(href)) return
-
-			try {
-				if (href.startsWith('siyuan://')) {
-					window.location.href = href
-				} else {
-					window.open(href, '_blank', 'noopener')
-				}
-			} catch (err) {
-				console.error('open card static link failed', err)
-				try {
-					showMessage('打开链接失败', 3000, 'error')
-				} catch {
-					// ignore
-				}
-			}
-		}, [])
 		const installStaticPreviewLinkHandlers = useCallback((preview: HTMLElement) => {
 			removeStaticPreviewLinkHandlers()
 			preview.classList.add('card-static-content')
@@ -604,7 +423,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			preview.addEventListener('pointerup', pointerHandler, true)
 			preview.addEventListener('click', clickHandler, true)
 			preview.addEventListener('dragstart', dragStartHandler, true)
-		}, [openStaticLinkTarget, removeStaticPreviewLinkHandlers])
+		}, [removeStaticPreviewLinkHandlers])
 		// 全局由 shapeLoadManager 计算可见性，无需本地定时轮询
 		const loadHandleRef = useRef<ProtyleLoadHandle | null>(null)
 
@@ -624,16 +443,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				staticPreviewLoadRef.current.cancel()
 				staticPreviewLoadRef.current = null
 			}
-			destroyCardContentVirtualizer()
-			removeStaticPreviewLinkHandlers()
-			if (staticPreviewRef.current?.parentElement) {
-				try {
-					staticPreviewRef.current.parentElement.removeChild(staticPreviewRef.current)
-				} catch {
-					// ignore
-				}
-			}
-			staticPreviewRef.current = null
+			removeStaticPreview()
 			if (protyleRef.current) {
 				safeDestroyProtyle(protyleRef.current)
 				protyleRef.current = null
@@ -646,14 +456,11 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				}
 			}
 			protyleHostRef.current = null
-		}, [destroyCardContentVirtualizer, removeStaticPreviewLinkHandlers])
+		}, [removeStaticPreview])
 
 
 		const containerRef = useRef<HTMLDivElement>(null)
 		const lastSizeRef = useRef({ h: shape.props.h })
-		// 保存进入编辑前的相机状态，用于退出编辑后恢复视角
-		const prevCameraRef = useRef<any | null>(null)
-		const hadFocusedRef = useRef(false)
 		// 保存编辑前的形状层级索引，用于退出编辑后恢复原层次
 		const originalIndexRef = useRef<string | null>(null)
 		const stopMissingStateEvent = (event: React.PointerEvent | React.MouseEvent) => {
@@ -671,9 +478,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				props: { previewText },
 			})
 		}, [editor, shape.id, shape.type])
-		const persistLightweightPreviewText = useCallback((html: string) => {
-			persistPreviewText(getLightweightPreviewTextFromHtml(html))
-		}, [persistPreviewText])
 		const enterMissingLinkedBlockState = useCallback(() => {
 			destroyRuntimeResources()
 			setHasMissingLinkedBlock(true)
@@ -833,49 +637,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		}, [isCollapsed, isEditingState, shape.props.h, shape.props.preCollapseHeight, shape.id, shape.props.fontSize, shape.type, isMainCard]);
 
 		// 编辑模式切换时聚焦到形状，并在退出编辑后恢复之前的视角
-		useEffect(() => {
-			// 延迟执行，确保编辑状态完全建立
-			const timer = setTimeout(() => {
-				const enabled = settingdata['restore-camera-on-edit'] === true
-				// 如果该功能被禁用，则不进行任何聚焦/恢复动作；并清理可能残留的状态
-				if (!enabled) {
-					if (!isEditing) {
-						hadFocusedRef.current = false
-						prevCameraRef.current = null
-					}
-					return
-				}
-				if (isEditing) {
-					console.debug('聚焦到Card形状:', shape.id);
-					// 进入编辑：仅在第一次进入时保存当前相机
-					if (!hadFocusedRef.current) {
-						try {
-							prevCameraRef.current = this.editor.getCamera()
-						} catch (e) {
-							prevCameraRef.current = null
-						}
-						hadFocusedRef.current = true
-					}
-					// 刚刚进入编辑模式，选中并聚焦到形状
-					this.editor.select(shape.id)
-					this.editor.zoomToSelection({ animation: { duration: 300 } })
-				} else {
-					// 退出编辑：如果之前保存过相机，则恢复视角
-					if (hadFocusedRef.current && prevCameraRef.current) {
-						try {
-							this.editor.setCamera(prevCameraRef.current, { animation: { duration: 300 } })
-						} catch (e) {
-							// ignore
-						}
-					}
-					// 清理保存的相机状态
-					hadFocusedRef.current = false
-					prevCameraRef.current = null
-				}
-			}, 50) // 50ms 延迟确保状态同步完成
-			// console.debug('大苏打发')
-			return () => clearTimeout(timer)
-		}, [isEditing, shape.id])
+		useRestoreCameraOnEdit(this.editor, isEditing, shape.id, 'Card形状')
 
 		// 解析题头图：提取背景图 URL/渐变，并返回 img src 以及背景信息
 		const parseTitleImg = (titleImg?: string): {
@@ -1005,10 +767,22 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					staticPreviewLoadRef.current?.setPriority(staticPreviewPriorityRef.current)
 					setCanLoad(allowed)
 					setIsInViewport(meta.inViewport)
+					setInPreloadZone(meta.inPreloadZone)
 				}
 			)
 			return unregister
 		}, [shape.id])
+
+		// 预载环预热：尚未获得准入的 Card 提前把 getDoc 结果写入缓存（不挂 DOM），
+		// 用户平移到位时命中缓存即可立即上屏
+		useEffect(() => {
+			if (isEditingState || isCollapsed) return
+			if (isMainCard || effectiveRenderMode !== 'static-dom') return
+			if (!isViewportCullingEnabled || !blockId) return
+			if (canLoad && isInViewport) return
+			if (!inPreloadZone) return
+			warmCardStaticPreview(blockId, staticPreviewBlockLimit)
+		}, [isEditingState, isCollapsed, isMainCard, effectiveRenderMode, isViewportCullingEnabled, blockId, canLoad, isInViewport, inPreloadZone, staticPreviewBlockLimit])
 
 		// 移除轻量预览逻辑，统一使用 Protyle 渲染
 
@@ -1151,21 +925,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				if (!currentBlockId) {
 					const editorElement = containerRef.current?.closest('.tldraw__editor');
 					const tldrawId = editorElement?.getAttribute('data-tldraw-id');
-					const title = editorElement?.getAttribute('data-tldraw-title');
 					if (!settingdata["tl-draw-create-note-id"] && !tldrawId) {
 						showMessage('配置不完整,请检查设置');
 						return null;
 					}
-					const pendingCreationPromise = pendingCreationPromises.get(shape.id as string);
-					if (pendingCreationPromise) {
-						try {
-							currentBlockId = await pendingCreationPromise;
-						} catch (e) {
-							console.error('等待块创建失败', e);
-						}
-						if (cancelled) return null;
-					} else if (!currentBlockId) {
-						const creationPromise = (async () => {
+					try {
+						currentBlockId = await runExclusiveBlockCreation(shape.id as string, async () => {
 							const idid = await api.generateSiyuanID() as string;
 							const link = buildTldrawLink(tldrawId, idid);
 							const defaultBlockType = getDefaultCardBlockType();
@@ -1197,19 +962,11 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 								}
 							}
 							return newBlockId;
-						})();
-						pendingCreationPromises.set(shape.id as string, creationPromise);
-						try {
-							currentBlockId = await creationPromise;
-							if (cancelled) return null;
-						} catch (err) {
-							console.error('创建块失败', err);
-						} finally {
-							if (pendingCreationPromises.get(shape.id as string) === creationPromise) {
-								pendingCreationPromises.delete(shape.id as string);
-							}
-						}
+						});
+					} catch (err) {
+						console.error('创建块失败', err);
 					}
+					if (cancelled) return null;
 				}
 
 				if (!currentBlockId) {
@@ -1226,16 +983,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					if (cancelled || signal.aborted) return;
 					const currentContainer = containerRef.current;
 					if (!currentContainer) return;
-					if (staticPreviewRef.current?.parentElement === currentContainer) {
-						destroyCardContentVirtualizer()
-						removeStaticPreviewLinkHandlers()
-						try {
-							currentContainer.removeChild(staticPreviewRef.current);
-						} catch {
-							// ignore
-						}
-						staticPreviewRef.current = null;
-					}
+					// 静态预览保留到 Protyle 就绪后再移除（见下方），避免进入编辑时白屏闪动；
+					// 这里只清理旧的 Protyle 宿主。
 					if (protyleHostRef.current && protyleHostRef.current.parentElement === currentContainer) {
 						try {
 							protyleHostRef.current.parentElement.removeChild(protyleHostRef.current);
@@ -1317,7 +1066,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 						if (protyleRef.current === protyleInstance) {
 							protyleRef.current = null;
 						}
+						return;
 					}
+					// Protyle 已完成首次渲染：此时再移除静态预览，进入编辑无白屏闪动
+					removeStaticPreview()
 				});
 				loadHandleRef.current = handle;
 				try {
@@ -1332,6 +1084,134 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				return currentBlockId;
 			};
 
+			// 统一的静态预览挂载入口：移除旧预览、应用样式、窗口化、写缓存、调度富渲染。
+			// 缓存命中与现场获取两条路径共用，保证虚拟化/缓存行为一致。
+			const mountPreviewHtml = async (
+				source: HTMLElement | string,
+				blockId: string,
+				options: { previewText: string; alreadyRendered?: boolean },
+			) => {
+				const container = containerRef.current
+				if (cancelled || !container) return
+				removeStaticPreview()
+
+				// 清理 Protyle host 与实例（静态模式接管显示）
+				if (protyleHostRef.current?.parentElement === container) {
+					try { container.removeChild(protyleHostRef.current); } catch { }
+				}
+				try { safeDestroyProtyle(protyleRef.current); } catch { }
+				protyleRef.current = null;
+				protyleHostRef.current = null;
+
+				// 缓存命中的 HTML 自带上一次的包装层（protyle-wysiwyg）：直接复用该元素，
+				// 避免"挂载→写缓存→再命中"层层嵌套；多根 HTML（虚拟化 flush 快照）走
+				// innerHTML 重新包装。
+				let wrapper: HTMLElement
+				if (typeof source === 'string') {
+					const temp = document.createElement('div')
+					temp.innerHTML = source
+					const root = temp.firstElementChild
+					if (root instanceof HTMLElement && root.classList.contains('protyle-wysiwyg') && !root.nextElementSibling) {
+						wrapper = root
+					} else {
+						wrapper = document.createElement('div')
+						wrapper.innerHTML = source
+					}
+				} else {
+					wrapper = source
+				}
+				wrapper.className = 'protyle-wysiwyg protyle-wysiwyg--attr'
+				wrapper.style.width = '100%'
+				wrapper.style.height = '100%'
+				wrapper.style.overflow = 'auto'
+				wrapper.style.fontSize = `${fontSize}px`
+
+				// 静态预览会先挂载，再按实际 Card 可见高度窗口化正文顶层块。
+				configureStaticPreviewMedia(wrapper)
+				// Decode protyle-html before deciding whether the DOM can be windowed:
+				// an embedded query may otherwise be hidden inside data-content.
+				try { convertProtyleHtmlToDom(wrapper) } catch (error) { console.warn('convertProtyleHtmlToDom failed', error) }
+				wrapper.dataset.cardPreviewBlockId = blockId
+				wrapper.dataset.cardPreviewBlockLimit = String(staticPreviewBlockLimit)
+				wrapper.dataset.cardPreviewText = options.previewText
+				// 复用的元素可能带着上一次挂载的渲染标记：按本次语义重置
+				if (options.alreadyRendered) wrapper.dataset.cardRichRendered = '1'
+				else delete wrapper.dataset.cardRichRendered
+				delete wrapper.dataset.cardVirtualized
+				staticPreviewRef.current = wrapper
+				installStaticPreviewLinkHandlers(wrapper)
+				container.appendChild(wrapper)
+
+				// 虚拟化会替换容器内容，完整文档 HTML 必须在此之前快照
+				const fullHtml = wrapper.outerHTML
+				const finishRender = () => { wrapper.dataset.cardRichRendered = '1' }
+
+				let createdVirtualizer: CardContentVirtualizer | null = null
+				createdVirtualizer = CardContentVirtualizer.create(wrapper, {
+					isPinned: (element) =>
+						element.classList.contains('protyle-top') || element.classList.contains('protyle-title'),
+					// 原生媒体和嵌入查询的加载/替换状态绑定在 DOM 实例上。窗口化会
+					// 重建 outerHTML，因此含这些节点的预览保留完整 DOM。
+					shouldSkipVirtualization: (content) => content.some(containsNonVirtualizableMedia),
+					onMount: async (mountedContainer, generation) => {
+						mountedContainer.querySelectorAll('img').forEach((img) => {
+							if (!img.getAttribute('loading')) img.setAttribute('loading', 'lazy')
+						})
+						configureStaticPreviewMedia(mountedContainer)
+						if (options.alreadyRendered) return
+						// 窗口内全部块都已渲染过时跳过重复的富内容渲染（滚动回看零重复开销）
+						const mountedBlocks = Array.from(mountedContainer.querySelectorAll<HTMLElement>('[data-card-virtual-index]'))
+						if (mountedBlocks.length > 0 && mountedBlocks.every((el) => el.dataset.cardRichRendered === '1')) return
+						await renderAllContentIdle(mountedContainer, staticPreviewPriorityRef.current, renderTaskId, true, richRenderAbortController.signal)
+						// renderAllContentIdle 会把"取消"吞掉并正常 resolve；effect 重跑取消时
+						// 绝不能把半成品渲染回写为"已渲染"
+						if (cancelled) return
+						// 同 ID 渲染任务 latest-wins：滚动换窗后旧调用会随新窗口 resolve，
+						// 代际不一致说明当前窗口已易主，快照交给新窗口自己的 onMount
+						if (createdVirtualizer?.getWindowGeneration() !== generation) return
+						createdVirtualizer.snapshotRenderedWindow()
+					},
+				})
+				cardContentVirtualizerRef.current = createdVirtualizer
+
+				if (createdVirtualizer) {
+					// 虚拟化预览：富渲染由 onMount 按窗口调度，快捷路径据此跳过整容器补渲染
+					wrapper.dataset.cardVirtualized = '1'
+					// 虚拟化预览以完整文档 HTML 入缓存；窗口渲染完成后销毁前升级为已渲染版本。
+					// alreadyRendered 命中时 HTML 本身已渲染，保留标记避免降级导致下次重复渲染
+					cacheStaticPreview(blockId, fullHtml, staticPreviewBlockLimit, options.previewText, options.alreadyRendered === true)
+					return
+				}
+
+				wrapper.querySelectorAll('img').forEach((img) => {
+					if (!img.getAttribute('loading')) img.setAttribute('loading', 'lazy')
+				})
+				if (options.alreadyRendered) {
+					finishRender()
+					return
+				}
+				// Do not keep the static-load queue occupied while formulas,
+				// embeds and attribute views are enhanced. The lightweight DOM
+				// is already usable at this point; rich rendering is cancellable
+				// background work tied to this viewport admission.
+				void renderAllContentIdle(
+					wrapper,
+					staticPreviewPriorityRef.current,
+					renderTaskId,
+					true,
+					richRenderAbortController.signal,
+				).then(() => {
+					if (!cancelled) {
+						finishRender()
+						cacheStaticPreview(blockId, wrapper.outerHTML, staticPreviewBlockLimit, options.previewText, true)
+					}
+				}).catch((error) => {
+					if (!isIdleRenderCancelledError(error)) console.warn('卡片静态内容增强失败:', error)
+				})
+				// 先缓存原始 DOM，让下一张相同 Card 可以立即复用；富内容完成后会再写入增强后的版本
+				cacheStaticPreview(blockId, fullHtml, staticPreviewBlockLimit, options.previewText)
+			}
+
 			// 从 API 获取静态预览 - 用于文档块(isMain)的静态渲染
 			const useStaticPreviewFromGetDoc = async (
 				targetBlockId: string,
@@ -1340,50 +1220,39 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			) => {
 				if (cancelled || signal?.aborted || !containerRef.current) return;
 
-				// 检查缓存（如果非强制刷新）
-				if (!forceRefresh) {
-					const cachedHtml = getCachedPreview(targetBlockId, fontSize, staticPreviewBlockLimit);
-					if (cachedHtml) {
-						persistLightweightPreviewText(cachedHtml)
-						// 使用缓存的预览
-						if (staticPreviewRef.current?.parentElement === containerRef.current) {
-							destroyCardContentVirtualizer()
-							removeStaticPreviewLinkHandlers()
-							containerRef.current.removeChild(staticPreviewRef.current);
-						}
-						const wrapper = document.createElement('div');
-						wrapper.innerHTML = cachedHtml;
-						const clone = wrapper.firstElementChild as HTMLElement;
-						if (clone && containerRef.current) {
-							// 清理 Protyle host
-							if (protyleHostRef.current?.parentElement === containerRef.current) {
-								try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
-							}
-							// 销毁 Protyle 实例
-							try { safeDestroyProtyle(protyleRef.current); } catch { }
-							protyleRef.current = null;
-							protyleHostRef.current = null;
-
-							staticPreviewRef.current = clone;
-							installStaticPreviewLinkHandlers(clone);
-							configureStaticPreviewMedia(clone)
-							containerRef.current.appendChild(clone);
-							try { convertProtyleHtmlToDom(clone); } catch (e) { console.warn('convertProtyleHtmlToDom failed', e); }
-							// Do not keep the static-load queue occupied while formulas,
-							// embeds and attribute views are enhanced. The lightweight DOM
-							// is already usable at this point; rich rendering is cancellable
-							// background work tied to this viewport admission.
+				// 快捷路径：同一文档的预览已在挂载（准入抖动/字号变化），只同步字号不重建 DOM。
+				// 字号变化曾会因缓存键含 fontSize 而触发整页重新请求，静态 DOM 内容其实与字号无关。
+				const mountedPreview = staticPreviewRef.current
+				if (!forceRefresh && mountedPreview?.parentElement === containerRef.current && mountedPreview.dataset.cardPreviewBlockId === targetBlockId) {
+					const mountedLimit = Number(mountedPreview.dataset.cardPreviewBlockLimit || 0)
+					if (mountedLimit >= staticPreviewBlockLimit) {
+						mountedPreview.style.fontSize = `${fontSize}px`
+						// 非虚拟化预览：富渲染未完成（可能被上一轮 cleanup 打断）时补跑一次；
+						// 虚拟化预览的窗口渲染由 onMount 的逐块标记自行调度，这里不重复触发
+						if (mountedPreview.dataset.cardVirtualized !== '1' && mountedPreview.dataset.cardRichRendered !== '1') {
 							void renderAllContentIdle(
-								clone,
+								mountedPreview,
 								staticPreviewPriorityRef.current,
 								renderTaskId,
 								true,
 								richRenderAbortController.signal,
-							).catch((error) => {
+							).then(() => {
+								if (!cancelled) mountedPreview.dataset.cardRichRendered = '1'
+							}).catch((error) => {
 								if (!isIdleRenderCancelledError(error)) console.warn('卡片缓存预览增强失败:', error)
-							});
-							return;
+							})
 						}
+						return
+					}
+				}
+
+				// 检查缓存（如果非强制刷新）：命中时直接复用完整 HTML，无需重新解析
+				if (!forceRefresh) {
+					const cached = getCachedPreview(targetBlockId, staticPreviewBlockLimit)
+					if (cached) {
+						persistPreviewText(cached.previewText)
+						await mountPreviewHtml(cached.html, targetBlockId, { previewText: cached.previewText, alreadyRendered: cached.rendered === true })
+						return
 					}
 				}
 
@@ -1412,33 +1281,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				}
 
 				if (cancelled || signal?.aborted || !domContent) return;
-				persistLightweightPreviewText(domContent)
 
 				const docInfo = await docInfoPromise;
 				if (cancelled || signal?.aborted || !containerRef.current) return;
 
-				// 移除旧的静态预览
-				if (staticPreviewRef.current?.parentElement === containerRef.current) {
-					destroyCardContentVirtualizer()
-					removeStaticPreviewLinkHandlers()
-					containerRef.current.removeChild(staticPreviewRef.current);
-				}
-				// 清理 Protyle host
-				if (protyleHostRef.current?.parentElement === containerRef.current) {
-					try { containerRef.current.removeChild(protyleHostRef.current); } catch { }
-				}
-				// 销毁 Protyle 实例
-				try { safeDestroyProtyle(protyleRef.current); } catch { }
-				protyleRef.current = null;
-				protyleHostRef.current = null;
-
 				// 创建预览容器
 				const previewWrapper = document.createElement('div');
-				previewWrapper.className = 'protyle-wysiwyg protyle-wysiwyg--attr';
-				previewWrapper.style.width = '100%';
-				previewWrapper.style.height = '100%';
-				previewWrapper.style.overflow = 'auto';
-				previewWrapper.style.fontSize = `${fontSize}px`;
 				previewWrapper.innerHTML = domContent;
 
 				// 如果是 isMain 形状，添加题头图和标题
@@ -1530,64 +1378,10 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					}
 				}
 
-				// 静态预览会先挂载，再按实际 Card 可见高度窗口化正文顶层块。
-				configureStaticPreviewMedia(previewWrapper)
-				// Decode protyle-html before deciding whether the DOM can be windowed:
-				// an embedded query may otherwise be hidden inside data-content.
-				try { convertProtyleHtmlToDom(previewWrapper) } catch (error) { console.warn('convertProtyleHtmlToDom failed', error) }
-				staticPreviewRef.current = previewWrapper;
-				installStaticPreviewLinkHandlers(previewWrapper);
-				containerRef.current.appendChild(previewWrapper);
-				destroyCardContentVirtualizer()
-				const virtualizer = CardContentVirtualizer.create(previewWrapper, {
-					isPinned: (element) =>
-						element.classList.contains('protyle-top') || element.classList.contains('protyle-title'),
-					// 原生媒体和嵌入查询的加载/替换状态绑定在 DOM 实例上。窗口化会
-					// 重建 outerHTML，因此含这些节点的预览保留完整 DOM。
-					shouldSkipVirtualization: (content) => content.some(containsNonVirtualizableMedia),
-					onMount: async (mountedContainer) => {
-						mountedContainer.querySelectorAll('img').forEach((img) => {
-							if (!img.getAttribute('loading')) img.setAttribute('loading', 'lazy')
-						})
-						configureStaticPreviewMedia(mountedContainer)
-						try {
-							convertProtyleHtmlToDom(mountedContainer)
-						} catch (error) {
-							console.warn('convertProtyleHtmlToDom failed', error)
-						}
-						await renderAllContentIdle(mountedContainer, staticPreviewPriorityRef.current, renderTaskId, true, richRenderAbortController.signal)
-					},
-				})
-				cardContentVirtualizerRef.current = virtualizer
-
-				if (!virtualizer) {
-					previewWrapper.querySelectorAll('img').forEach((img) => {
-						if (!img.getAttribute('loading')) img.setAttribute('loading', 'lazy')
-					})
-					// Mounting the raw preview is the critical path. Rich-content
-					// rendering (including query embeds) runs independently so one
-					// expensive Card cannot serialize all following visible Cards.
-					void renderAllContentIdle(
-						previewWrapper,
-						staticPreviewPriorityRef.current,
-						renderTaskId,
-						true,
-						richRenderAbortController.signal,
-					).then(() => {
-						if (!cancelled && !signal?.aborted) {
-							cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize, staticPreviewBlockLimit);
-						}
-					}).catch((error) => {
-						if (!isIdleRenderCancelledError(error)) console.warn('卡片静态内容增强失败:', error)
-					})
-				}
-
-				if (cancelled || signal?.aborted) return;
-
-				// 虚拟化预览只保存当前窗口，不能作为完整文档缓存。非虚拟化
-				// 预览先缓存原始 DOM，让下一张相同 Card 可以立即复用；富内容
-				// 完成后会再写入一次增强后的版本。
-				if (!virtualizer) cacheStaticPreview(targetBlockId, previewWrapper.outerHTML, fontSize, staticPreviewBlockLimit);
+				// 预览文本提取一次完成：随缓存存储，命中时无需再解析完整 HTML
+				const previewText = getLightweightPreviewTextFromElement(previewWrapper)
+				persistPreviewText(previewText)
+				await mountPreviewHtml(previewWrapper, targetBlockId, { previewText })
 			};
 
 			let cancelled = false;
@@ -1613,13 +1407,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 
 			(async () => {
 				if (isEditingState) {
-					// 进入编辑：移除静态预览，创建或复用 Protyle
-					if (staticPreviewRef.current?.parentElement === containerRef.current) {
-						destroyCardContentVirtualizer()
-						removeStaticPreviewLinkHandlers()
-						containerRef.current.removeChild(staticPreviewRef.current);
-					}
-					staticPreviewRef.current = null;
+					// 进入编辑：复用已有 Protyle 时直接换掉静态预览；挂载新 Protyle 时
+					// 静态预览保留到就绪后再移除（见 mountProtyle），避免白屏闪动
 					if (!protyleRef.current) {
 						const createdBlockId = await mountProtyle(0);
 						if (cancelled) return;
@@ -1630,6 +1419,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 								props: { ...shape.props, blockId: createdBlockId }
 							});
 						}
+					} else {
+						removeStaticPreview()
 					}
 					if (protyleHostRef.current && containerRef.current && protyleHostRef.current.parentElement !== containerRef.current) {
 						containerRef.current.appendChild(protyleHostRef.current);
@@ -1670,12 +1461,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							if (cancelled) return;
 						}
 						// 移除可能存在的静态预览
-						if (staticPreviewRef.current?.parentElement === containerRef.current) {
-							destroyCardContentVirtualizer()
-							removeStaticPreviewLinkHandlers()
-							containerRef.current.removeChild(staticPreviewRef.current);
-						}
-						staticPreviewRef.current = null;
+						removeStaticPreview()
 						// 确保 Protyle host 已挂载
 						if (protyleHostRef.current && containerRef.current && protyleHostRef.current.parentElement !== containerRef.current) {
 							containerRef.current.appendChild(protyleHostRef.current);
@@ -1712,7 +1498,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					destroyRuntimeResources();
 				}
 			};
-		}, [destroyCardContentVirtualizer, destroyRuntimeResources, isEditingState, renderAdmission, shape.id, blockId, shape.props.refreshNonce, isCollapsed, effectiveRenderMode, fontSize, isSmallCard, exitEditGrace, persistLightweightPreviewText, persistPreviewText]);
+		}, [destroyRuntimeResources, removeStaticPreview, isEditingState, renderAdmission, shape.id, blockId, shape.props.refreshNonce, isCollapsed, effectiveRenderMode, fontSize, isSmallCard, exitEditGrace, persistPreviewText]);
 
 		// 真正卸载时（切换到其它白板 / 删除卡片）销毁 Protyle，避免 live 模式下实例被保留后泄漏
 		useEffect(() => {
@@ -1770,35 +1556,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				onPointerMove={handlePointerEvent}
 				onPointerUp={handlePointerEvent}
 			>
-				<style>
-					{`
-						.card-static-content,
-						.card-static-content .protyle-wysiwyg {
-							pointer-events: none !important;
-							user-select: none !important;
-							-webkit-user-select: none !important;
-							-webkit-touch-callout: none !important;
-						}
-						.card-static-content * {
-							pointer-events: none !important;
-							user-select: none !important;
-							-webkit-user-select: none !important;
-							-webkit-user-drag: none !important;
-							-webkit-touch-callout: none !important;
-						}
-						.card-static-content a,
-						.card-static-content a *,
-						.card-static-content [data-href],
-						.card-static-content [data-href] *,
-						.card-static-content [data-type*="block-ref"],
-						.card-static-content [data-type*="block-ref"] *,
-						.card-static-content [data-type*="file-annotation-ref"],
-						.card-static-content [data-type*="file-annotation-ref"] * {
-							pointer-events: auto !important;
-							cursor: pointer;
-						}
-					`}
-				</style>
+				{/* 静态内容交互屏蔽样式已迁移至 custom-tldraw.css（避免每个卡片实例重复一份 <style>） */}
 				<div
 					ref={containerRef}
 					blockid={shape.props.blockId}
@@ -1987,75 +1745,12 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					)}
 				</div>
 				{!isEditingState && hasMissingLinkedBlock && (
-					<div
-						onPointerDown={stopMissingStateEvent}
-						onClick={stopMissingStateEvent}
-						style={{
-							position: 'absolute',
-							inset: '0',
-							zIndex: 20,
-							display: 'flex',
-							alignItems: 'center',
-							justifyContent: 'center',
-							padding: '16px',
-							background: 'rgba(127, 127, 127, 0.14)',
-							backdropFilter: 'blur(2px)',
-							pointerEvents: 'auto',
-						}}
-					>
-						<div
-							style={{
-								display: 'flex',
-								flexDirection: 'column',
-								alignItems: 'center',
-								gap: '12px',
-								maxWidth: '100%',
-								padding: '16px 18px',
-								borderRadius: '12px',
-								background: 'var(--b3-theme-background, #fff)',
-								border: '1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12))',
-								boxShadow: '0 8px 24px rgba(0, 0, 0, 0.12)',
-								color: theme[shape.props.color].solid,
-								textAlign: 'center',
-							}}
-						>
-							<div style={{ fontSize: `${Math.min(fontSize, 16)}px`, fontWeight: 500 }}>
-								找不到绑定块
-							</div>
-							<div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
-								<button
-									type="button"
-									onPointerDown={stopMissingStateEvent}
-									onClick={handleRefreshMissingLinkedBlock}
-									style={{
-										padding: '6px 12px',
-										borderRadius: '8px',
-										border: '1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12))',
-										background: 'transparent',
-										color: 'inherit',
-										cursor: 'pointer',
-									}}
-								>
-									刷新
-								</button>
-								<button
-									type="button"
-									onPointerDown={stopMissingStateEvent}
-									onClick={handleDeleteMissingLinkedBlock}
-									style={{
-										padding: '6px 12px',
-										borderRadius: '8px',
-										border: '1px solid var(--b3-card-error-color, #d23f31)',
-										background: 'var(--b3-card-error-background, rgba(210, 63, 49, 0.12))',
-										color: 'var(--b3-card-error-color, #d23f31)',
-										cursor: 'pointer',
-									}}
-								>
-									删除
-								</button>
-							</div>
-						</div>
-					</div>
+					<MissingBlockOverlay
+						textColor={theme[shape.props.color].solid}
+						fontSize={fontSize}
+						onRefresh={handleRefreshMissingLinkedBlock}
+						onDelete={handleDeleteMissingLinkedBlock}
+					/>
 				)}
 				{/* 端口覆盖层 - 用于贝塞尔连接器 */}
 				<PortsOverlay shapeId={shape.id} />

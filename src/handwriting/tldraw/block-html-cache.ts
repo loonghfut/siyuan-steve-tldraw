@@ -1,9 +1,10 @@
 /**
  * 块内容 HTML 缓存模块
  * 用于缓存 SingleBlockShape 的静态 HTML 内容，避免每次都创建 Protyle 实例
- * 
+ *
  * 缓存策略：只缓存 API 获取的原始 DOM，渲染（公式、图表等）在实际显示时执行
- * 
+ * 缓存键只使用 blockId：字号通过静态容器的 CSS 继承控制，变更字号不应触发重新请求
+ *
  * 优化：
  * - 使用空闲调度，在拖动画布时暂停加载
  * - 批量请求合并，减少网络请求次数
@@ -12,12 +13,14 @@
 
 import * as api from '@/api/api'
 import { isInteracting } from './utils/idle-scheduler'
+import { getLightweightPreviewTextFromHtml } from './utils/lightweight-preview'
 
 interface CacheEntry {
 	html: string
 	timestamp: number
 	blockId: string
-	fontSize?: number
+	/** 写入缓存时提取的轻量预览文本，命中缓存时无需重新解析 HTML。 */
+	previewText: string
 }
 
 // 全局 HTML 内容缓存
@@ -29,14 +32,9 @@ const CACHE_TTL_MS = 10 * 60 * 1000
 // 最大缓存条目数
 const MAX_CACHE_SIZE = 100
 
-function getCacheKey(blockId: string, fontSize?: number): string {
-	return fontSize ? `${blockId}:${fontSize}` : blockId
-}
-
 // ===== 批量请求队列 =====
 interface PendingRequest {
 	blockId: string
-	fontSize: number
 	resolve: (html: string | null) => void
 }
 
@@ -58,26 +56,26 @@ const MAX_BATCH_SIZE = 10
 async function processBatchQueue(): Promise<void> {
 	batchTimer = null
 	rafId = null
-	
+
 	if (pendingQueue.length === 0) return
-	
+
 	// 如果正在交互，推迟处理
 	if (isInteracting()) {
 		scheduleBatchProcessing()
 		return
 	}
-	
+
 	// 取出当前队列中的部分请求（限制批次大小）
 	const batchSize = Math.min(pendingQueue.length, MAX_BATCH_SIZE)
 	const currentBatch = pendingQueue.splice(0, batchSize)
-	
+
 	// 收集所有需要请求的 blockId（排除已缓存的）
 	const toFetch: Map<string, PendingRequest[]> = new Map()
 	for (const req of currentBatch) {
-		const cached = getCachedHtml(req.blockId, req.fontSize)
+		const cached = getCachedHtml(req.blockId)
 		if (cached) {
 			// 已有缓存，直接返回
-			req.resolve(cached)
+			req.resolve(cached.html)
 			continue
 		}
 		// 同一个 blockId 可能有多个请求，收集起来
@@ -88,7 +86,7 @@ async function processBatchQueue(): Promise<void> {
 			toFetch.set(req.blockId, [req])
 		}
 	}
-	
+
 	if (toFetch.size === 0) {
 		// 如果还有剩余的请求，继续调度
 		if (pendingQueue.length > 0) {
@@ -96,19 +94,18 @@ async function processBatchQueue(): Promise<void> {
 		}
 		return
 	}
-	
+
 	// 批量获取 DOM
 	try {
 		const blockIds = Array.from(toFetch.keys())
 		const result = await api.getBlockDOMs(blockIds)
-		
+
 		// 处理结果
 		for (const [blockId, requests] of toFetch) {
 			const dom = result?.[blockId]
 			if (dom) {
-				const fontSize = requests[0].fontSize
-				const html = wrapBlockDomHtml(dom, fontSize)
-				setCachedHtml(blockId, html, fontSize)
+				const html = wrapBlockDomHtml(dom)
+				setCachedHtml(blockId, html)
 				for (const req of requests) {
 					req.resolve(html)
 				}
@@ -127,7 +124,7 @@ async function processBatchQueue(): Promise<void> {
 			}
 		}
 	}
-	
+
 	// 如果还有剩余的请求，继续调度
 	if (pendingQueue.length > 0) {
 		scheduleBatchProcessing()
@@ -140,9 +137,9 @@ async function processBatchQueue(): Promise<void> {
  */
 function scheduleBatchProcessing() {
 	if (batchTimer !== null || rafId !== null) return
-	
+
 	const delay = isInteracting() ? BATCH_DELAY_INTERACTING_MS : BATCH_DELAY_MS
-	
+
 	// 使用 RAF + setTimeout 组合，确保不阻塞交互
 	rafId = requestAnimationFrame(() => {
 		rafId = null
@@ -153,21 +150,20 @@ function scheduleBatchProcessing() {
 /**
  * 请求块的 DOM（会自动批量合并）
  * @param blockId 块 ID
- * @param fontSize 字体大小
  * @returns 包装后的 HTML 或 null
  */
-export function requestBlockDOM(blockId: string, fontSize: number): Promise<string | null> {
+export function requestBlockDOM(blockId: string): Promise<string | null> {
 	return new Promise((resolve) => {
 		// 先检查缓存
-		const cached = getCachedHtml(blockId, fontSize)
+		const cached = getCachedHtml(blockId)
 		if (cached) {
-			resolve(cached)
+			resolve(cached.html)
 			return
 		}
-		
+
 		// 加入队列
-		pendingQueue.push({ blockId, fontSize, resolve })
-		
+		pendingQueue.push({ blockId, resolve })
+
 		// 调度处理
 		scheduleBatchProcessing()
 	})
@@ -175,24 +171,27 @@ export function requestBlockDOM(blockId: string, fontSize: number): Promise<stri
 
 /**
  * 获取缓存的 HTML 内容
+ * 注意：删除过期条目时必须使用与写入一致的 key（此前误用 blockId 导致
+ * 过期条目永远无法删除，只能靠容量淘汰兜底）。
  */
-export function getCachedHtml(blockId: string, fontSize?: number): string | null {
-	const entry = htmlCache.get(getCacheKey(blockId, fontSize))
+export function getCachedHtml(blockId: string): CacheEntry | null {
+	const entry = htmlCache.get(blockId)
 	if (!entry) return null
-	
+
 	// 检查是否过期
 	if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
 		htmlCache.delete(blockId)
 		return null
 	}
-	
-	return entry.html
+
+	return entry
 }
 
 /**
  * 设置缓存的 HTML 内容
+ * 写入时顺带提取轻量预览文本，避免每次命中缓存都重新解析完整 HTML。
  */
-export function setCachedHtml(blockId: string, html: string, fontSize?: number): void {
+export function setCachedHtml(blockId: string, html: string): void {
 	// 如果缓存已满，移除最旧的条目
 	if (htmlCache.size >= MAX_CACHE_SIZE) {
 		let oldestKey: string | null = null
@@ -207,12 +206,12 @@ export function setCachedHtml(blockId: string, html: string, fontSize?: number):
 			htmlCache.delete(oldestKey)
 		}
 	}
-	
-	htmlCache.set(getCacheKey(blockId, fontSize), {
+
+	htmlCache.set(blockId, {
 		html,
 		timestamp: Date.now(),
 		blockId,
-		fontSize,
+		previewText: getLightweightPreviewTextFromHtml(html),
 	})
 }
 
@@ -220,11 +219,7 @@ export function setCachedHtml(blockId: string, html: string, fontSize?: number):
  * 使缓存失效
  */
 export function invalidateCache(blockId: string): void {
-	for (const [key, entry] of htmlCache) {
-		if (entry.blockId === blockId || key === blockId || key.startsWith(`${blockId}:`)) {
-			htmlCache.delete(key)
-		}
-	}
+	htmlCache.delete(blockId)
 }
 
 /**
@@ -236,24 +231,25 @@ export function clearAllCache(): void {
 
 /**
  * 从 DOM 克隆中提取静态 HTML，保留完整的内联样式
+ * 注意：刻意不内联 font-size —— 字号由静态容器的 CSS 继承控制，
+ * 这样变更字号无需重新抓取，且标题等相对字号仍由思源样式表提供。
  * @param container 包含 Protyle 内容的容器
- * @param _fontSize 字体大小（保留参数以保持接口一致）
  */
-export function extractStaticHtml(container: HTMLElement, _fontSize: number): string {
+export function extractStaticHtml(container: HTMLElement): string {
 	const wysiwyg = container.querySelector('.protyle-wysiwyg') as HTMLElement
 	if (!wysiwyg) return ''
-	
+
 	const clone = wysiwyg.cloneNode(true) as HTMLElement
-	
+
 	// 递归内联计算样式到每个元素
 	const inlineComputedStyles = (source: Element, target: Element) => {
 		if (!(source instanceof HTMLElement) || !(target instanceof HTMLElement)) return
-		
+
 		const computed = window.getComputedStyle(source)
 		// 关键样式属性列表 - 保留影响外观的样式
 		const keyProps = [
 			'color', 'background-color', 'background',
-			'font-family', 'font-size', 'font-weight', 'font-style', 'text-decoration',
+			'font-family', 'font-weight', 'font-style', 'text-decoration',
 			'line-height', 'letter-spacing', 'text-align',
 			'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
 			'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
@@ -263,7 +259,7 @@ export function extractStaticHtml(container: HTMLElement, _fontSize: number): st
 			'opacity', 'visibility',
 			'box-shadow', 'text-shadow',
 		]
-		
+
 		const styleText = keyProps
 			.map((prop) => {
 				const value = computed.getPropertyValue(prop)
@@ -271,12 +267,12 @@ export function extractStaticHtml(container: HTMLElement, _fontSize: number): st
 			})
 			.filter(Boolean)
 			.join(';')
-		
+
 		const existing = target.getAttribute('style') || ''
 		if (styleText) {
 			target.setAttribute('style', `${styleText};${existing}`)
 		}
-		
+
 		// 递归处理子元素
 		const sourceChildren = Array.from(source.children)
 		const targetChildren = Array.from(target.children)
@@ -288,24 +284,24 @@ export function extractStaticHtml(container: HTMLElement, _fontSize: number): st
 			}
 		}
 	}
-	
+
 	// 应用计算样式
 	inlineComputedStyles(wysiwyg, clone)
-	
+
 	// 移除可编辑属性
 	clone.querySelectorAll('[contenteditable]').forEach((el) => el.removeAttribute('contenteditable'))
-	
+
 	// 移除不需要的数据属性
 	clone.querySelectorAll('[data-node-id]').forEach((el) => el.removeAttribute('data-node-id'))
 	clone.querySelectorAll('[data-node-index]').forEach((el) => el.removeAttribute('data-node-index'))
 	clone.querySelectorAll('[updated]').forEach((el) => el.removeAttribute('updated'))
 	clone.querySelectorAll('[data-realwidth]').forEach((el) => el.removeAttribute('data-realwidth'))
 	clone.querySelectorAll('[data-readonly]').forEach((el) => el.removeAttribute('data-readonly'))
-	
+
 	// 禁用交互但保留原有样式
 	clone.style.pointerEvents = 'none'
 	clone.style.userSelect = 'none'
-	
+
 	return clone.outerHTML
 }
 
@@ -313,10 +309,10 @@ export function extractStaticHtml(container: HTMLElement, _fontSize: number): st
  * 从 Protyle 宿主提取并缓存静态 HTML
  * 注意：只缓存原始 DOM，不执行内容渲染
  */
-export function cacheFromProtyleHost(blockId: string, host: HTMLElement, fontSize: number): string {
-	const html = extractStaticHtml(host, fontSize)
+export function cacheFromProtyleHost(blockId: string, host: HTMLElement): string {
+	const html = extractStaticHtml(host)
 	if (!html) return html
-	setCachedHtml(blockId, html, fontSize)
+	setCachedHtml(blockId, html)
 	return html
 }
 
@@ -372,13 +368,14 @@ export async function getBlockContent(blockId: string): Promise<{ markdown: stri
  * 包装从 API 获取的 DOM HTML，添加必要的样式
  * 注意：此函数仅做 DOM 包装，不执行内容渲染（如公式、图表等）
  * 渲染应该在实际挂载到页面时调用 renderAllContent
+ * 字号不内联进 HTML（缓存与字号解耦），由静态容器继承控制。
  */
-export function wrapBlockDomHtml(domHtml: string, fontSize: number): string {
+export function wrapBlockDomHtml(domHtml: string): string {
 	const processed = domHtml
 		.replace(/contenteditable="true"/g, 'contenteditable="false"')
 		.replace(/spellcheck="[^"]*"/g, 'spellcheck="false"')
 
-	return `<div class="protyle-wysiwyg protyle-wysiwyg--attr" style="font-size: ${fontSize}px; pointer-events: none; user-select: none;">${processed}</div>`
+	return `<div class="protyle-wysiwyg protyle-wysiwyg--attr" style="pointer-events: none; user-select: none;">${processed}</div>`
 }
 
 /**
@@ -386,7 +383,7 @@ export function wrapBlockDomHtml(domHtml: string, fontSize: number): string {
  * 注意：此函数仅做 HTML 包装，不执行内容渲染（如公式、图表等）
  * 渲染应该在实际挂载到页面时调用 renderAllContent
  */
-export function renderSimpleBlockHtml(content: string, fontSize: number): string {
+export function renderSimpleBlockHtml(content: string): string {
 	let html = content
 		.replace(/&/g, '&amp;')
 		.replace(/</g, '&lt;')
@@ -397,30 +394,38 @@ export function renderSimpleBlockHtml(content: string, fontSize: number): string
 		.replace(/\n/g, '<br>')
 
 	const fallback = '<span style="opacity: 0.5; font-style: italic;">空内容</span>'
-	return `<div class="protyle-wysiwyg protyle-wysiwyg--attr" style="font-size: ${fontSize}px; padding: 8px 16px; pointer-events: none; user-select: none; line-height: 1.6; word-break: break-word;"><div class="p" data-type="NodeParagraph"><div contenteditable="false" spellcheck="false">${html || fallback}</div></div></div>`
+	return `<div class="protyle-wysiwyg protyle-wysiwyg--attr" style="padding: 8px 16px; pointer-events: none; user-select: none; line-height: 1.6; word-break: break-word;"><div class="p" data-type="NodeParagraph"><div contenteditable="false" spellcheck="false">${html || fallback}</div></div></div>`
 }
 
 /**
  * 预加载指定块的内容到缓存
- * 可用于视口内即将可见的块
+ * 用于视口预载环内的块：用户平移到位前先填好缓存，命中时零网络成本
  */
+const preloadingInFlight = new Set<string>()
 
-export async function preloadBlockContent(blockId: string, fontSize: number): Promise<void> {
+export async function preloadBlockContent(blockId: string): Promise<void> {
 	// 如果已有缓存，跳过
-	if (getCachedHtml(blockId, fontSize)) return
-	
-	// 优先使用 getBlockDOM API
-	const dom = await getBlockDOM(blockId)
-	if (dom) {
-		const html = wrapBlockDomHtml(dom, fontSize)
-		setCachedHtml(blockId, html, fontSize)
-		return
-	}
-	
-	// 备用：使用简化渲染
-	const content = await getBlockContent(blockId)
-	if (content) {
-		const html = renderSimpleBlockHtml(content.content || content.markdown, fontSize)
-		setCachedHtml(blockId, html, fontSize)
+	if (getCachedHtml(blockId)) return
+	// 预载环翻转可能频繁触发；同一块只保留一个在途请求
+	if (preloadingInFlight.has(blockId)) return
+	preloadingInFlight.add(blockId)
+	try {
+		// 优先使用 getBlockDOM API
+		const dom = await getBlockDOM(blockId)
+		if (getCachedHtml(blockId)) return
+		if (dom) {
+			const html = wrapBlockDomHtml(dom)
+			setCachedHtml(blockId, html)
+			return
+		}
+
+		// 备用：使用简化渲染
+		const content = await getBlockContent(blockId)
+		if (content) {
+			const html = renderSimpleBlockHtml(content.content || content.markdown)
+			setCachedHtml(blockId, html)
+		}
+	} finally {
+		preloadingInFlight.delete(blockId)
 	}
 }
