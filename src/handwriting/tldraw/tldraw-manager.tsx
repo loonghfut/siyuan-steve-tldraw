@@ -647,7 +647,6 @@ export class TldrawManager {
                                 /nodeheading|nodeblockquote|paragraph|siyuan-file/i.test(type)
                             ) || siyuanDragTypes[0] || blockIdo_rigin;
                             const dragTypeLower = siyuanDragType.toLowerCase();
-                            const isBlockquote = dragTypeLower.includes('nodeblockquote');
                             console.debug('拖拽的数据类型', e);
                             console.debug('拖拽的数据类型', blockIdo_rigin);
                             // 使用正则表达式提取块ID
@@ -664,17 +663,16 @@ export class TldrawManager {
                                     console.error('解析文档大纲拖放数据失败:', err);
                                     return;
                                 }
-                            } else if (e.dataTransfer!.types.includes('application/child-doc')) {
-                                // 处理子文档拖放
+                            } else if (e.dataTransfer!.types.includes('application/siyuan-document-tab')) {
+                                // 处理文档标签页拖放：与文件树文档一致，直接以文档 ID 接收
                                 try {
-                                    const data = e.dataTransfer!.getData('application/child-doc');
+                                    const data = e.dataTransfer!.getData('application/siyuan-document-tab');
                                     const parsed = JSON.parse(data);
-                                    blockId = parsed.docId;
-                                    console.debug('子文档拖放的文档', parsed);
-                                    docname = parsed.docName || '';
-                                    console.debug('子文档拖放', blockId);
+                                    blockId = parsed.rootId || '';
+                                    docname = parsed.title || '';
+                                    console.debug('文档标签页拖放', blockId);
                                 } catch (err) {
-                                    console.error('解析子文档拖放数据失败:', err);
+                                    console.error('解析文档标签页拖放数据失败:', err);
                                     return;
                                 }
                             } else if (siyuanDragType.toLowerCase().startsWith('application/siyuan')) {
@@ -699,49 +697,58 @@ export class TldrawManager {
                                 x: e.clientX,
                                 y: e.clientY,
                             });
-                            const idid = await api.generateSiyuanID();
-                            const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-                            let aproblock: string;
-                            // const content = (await api.getBlockKramdown(blockId)).kramdown;
-                            /**
-                             * 将 linkMarkdown 插入到 kramdown 内容末尾（但在 IAL/attribute block 之前）
-                             * - 如果是 heading 类型（isHeading === true），将 link 插入到最后一行（heading 行）后面： `###### 标题 [🔗](...)`
-                             * - 否则，将 link 作为独立的行插入到内容末尾（在 IAL 之前）
-                             */
-                            // Use class-level helper to create updated content with link to avoid adding link inside IAL/attribute block
-                            // const appendLinkToKramdown = this.appendLinkToKramdown.bind(this);
-                            // console.debug("拖拽块的内容", content);
-                            if (dragTypeLower.includes('nodeheading') || isBlockquote) {
-                                aproblock = blockId;
-                                const link = buildTldrawLink(this.id, aproblock);
-                                // 将链接保存到块的自定义属性中
-                                await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw':"1"})
-                            } else if (dragTypeLower.includes('paragraph')) {
-                                aproblock = blockId;
-                                // 将链接保存到块的自定义属性中
-                                const link = buildTldrawLink(this.id, aproblock);
-                                await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw-single':"1"})
-                            } else if (dragTypeLower.startsWith('application/siyuan-file')) {
-                                aproblock = blockId;
-                                await api.prependBlock("markdown", `((${blockId} '${(window as any).__st_dragName || ''}'))`, this.id)
-                            } else if (blockIdo_rigin.toLowerCase().startsWith('application/doc-outline-block')) {
-                                aproblock = blockId;
-                                console.debug("拖拽的是文档大纲块");
-                                const link = buildTldrawLink(this.id, aproblock);
-                                await api.setBlockAttrs(aproblock, { 'custom-tldraw-link': link ,'custom-st-tldraw':"1"})
-                            } else if (blockIdo_rigin.toLowerCase().startsWith('application/child-doc')) {
-                                aproblock = blockId;
-                                console.debug("拖拽的是子文档块");
-                                await api.prependBlock("markdown", `((${blockId} '${docname}'))`, this.id)
-                            } else {
-                                aproblock = idid as string;
-                                const link = buildTldrawLink(this.id, aproblock);
-                                await api.insertBlock("markdown", `###### ${timestamp}
-{: id="${idid}" custom-st-tldraw="1" custom-tldraw-link="${link}"}`, blockId)
+                            // ===== 拖入块分类与接收 =====
+                            // 文档块（文件树/子文档面板/文档标签页/大纲中的文档节点）：接收逻辑不变（白板文档内嵌入引用 + 折叠主卡片）
+                            // 标题块与容器块（列表/引用块/超级块/Callout）：card 直接绑定被拖块
+                            // 其余块（段落/列表项/代码块/表格/公式等）：single-block 直接绑定被拖块
+                            // 不再创建新的标题块，拖入什么块就绑定什么块
+                            let outlineBlockInfo: any = null;
+                            if (e.dataTransfer!.types.includes('application/doc-outline-block')) {
+                                // 文档大纲拖拽不携带块类型，查询块信息后按类型归类
+                                try {
+                                    outlineBlockInfo = await api.getBlockByID(blockId);
+                                } catch (err) {
+                                    console.warn('查询大纲块信息失败，按其余块处理', err);
+                                }
                             }
-                            // 创建新的Card形状
-                            // console.debug("创建新的卡片形状",  aproblock[0].doOperations[0].id);
-                            if (dragTypeLower.startsWith('application/siyuan-file') || dragTypeLower.includes('application/child-doc')) {
+
+                            // gutter 拖拽类型形如 application/siyuan-gutterNodeHeading…，携带被拖块的节点类型
+                            const gutterDragType = (siyuanDragTypes.find((type) =>
+                                type.toLowerCase().startsWith('application/siyuan-gutter')) || ''
+                            ).toLowerCase();
+                            const isDocDrag = dragTypeLower.startsWith('application/siyuan-file') ||
+                                e.dataTransfer!.types.includes('application/child-doc') ||
+                                e.dataTransfer!.types.includes('application/siyuan-document-tab') ||
+                                outlineBlockInfo?.type === 'd';
+
+                            let blockKind: 'doc' | 'container' | 'leaf';
+                            if (isDocDrag) {
+                                blockKind = 'doc';
+                            } else if (gutterDragType) {
+                                // 注意 nodelistitem 包含 nodelist 子串，列表项按其余块归入 single-block
+                                if (gutterDragType.includes('nodelistitem')) {
+                                    blockKind = 'leaf';
+                                } else if (/nodeheading|nodelist|nodeblockquote|nodesuperblock|nodecallout/.test(gutterDragType)) {
+                                    blockKind = 'container';
+                                } else {
+                                    blockKind = 'leaf';
+                                }
+                            } else if (outlineBlockInfo) {
+                                // SQL 块类型：h=标题 l=列表 b=引用块 s=超级块
+                                const blockType = String(outlineBlockInfo.type || '');
+                                blockKind = (blockType === 'h' || blockType === 'l' || blockType === 'b' || blockType === 's')
+                                    ? 'container'
+                                    : 'leaf';
+                            } else {
+                                blockKind = 'leaf';
+                            }
+
+                            if (blockKind === 'doc') {
+                                // 文档块：白板文档内 prepend 嵌入引用（保持原有逻辑）
+                                if (outlineBlockInfo?.type === 'd' && !docname) {
+                                    docname = outlineBlockInfo.content || '';
+                                }
+                                await api.prependBlock("markdown", `((${blockId} '${docname || (window as any).__st_dragName || ''}'))`, this.id);
                                 editor.createShape({
                                     type: 'card',
                                     x: x, // 默认宽度的一半，使形状中心在鼠标位置
@@ -751,24 +758,16 @@ export class TldrawManager {
                                         h: 700,
                                         color: 'black',
                                         showMask: true,
-                                        blockId: aproblock,
+                                        blockId: blockId,
                                         isMain: true,
                                         isCollapsed: true, // 拖拽进来默认为折叠状态
                                     },
                                 });
-                            } else if (dragTypeLower.includes('paragraph')) {
-                                editor.createShape({
-                                    type: 'single-block',
-                                    x: x, // 默认宽度的一半，使形状中心在鼠标位置
-                                    y: y, // 默认高度的一半
-                                    props: {
-                                        w: 300,
-                                        h: 50,
-                                        color: 'black',
-                                        blockId: aproblock,
-                                    },
-                                });
-                            } else {
+                            } else if (blockKind === 'container') {
+                                // 标题块/容器块：card 直接绑定被拖块
+                                const link = buildTldrawLink(this.id, blockId);
+                                // 将链接保存到块的自定义属性中
+                                await api.setBlockAttrs(blockId, { 'custom-tldraw-link': link, 'custom-st-tldraw': "1" });
                                 editor.createShape({
                                     type: 'card',
                                     x: x, // 默认宽度的一半，使形状中心在鼠标位置
@@ -778,14 +777,30 @@ export class TldrawManager {
                                         h: 300,
                                         color: 'black',
                                         showMask: true,
-                                        blockId: aproblock,
-                                        isCollapsed: false, // 拖拽进来默认为折叠状态
+                                        blockId: blockId,
+                                        isCollapsed: false,
+                                    },
+                                });
+                            } else {
+                                // 其余块：single-block 直接绑定被拖块
+                                const link = buildTldrawLink(this.id, blockId);
+                                // 将链接保存到块的自定义属性中
+                                await api.setBlockAttrs(blockId, { 'custom-tldraw-link': link, 'custom-st-tldraw-single': "1" });
+                                editor.createShape({
+                                    type: 'single-block',
+                                    x: x, // 默认宽度的一半，使形状中心在鼠标位置
+                                    y: y, // 默认高度的一半
+                                    props: {
+                                        w: 300,
+                                        h: 50,
+                                        color: 'black',
+                                        blockId: blockId,
+                                        isNewlyCreated: false,
+                                        // 拖入即绑定已有块：首次挂载按内容回填一次高度，之后手动调整
+                                        heightBackfilled: false,
                                     },
                                 });
                             }
-                            // api.setBlockAttrs(blockId, {
-                            //     'custom-st-tldraw': '1',
-                            // });
                             // console.debug(`已在(${x}, ${y})位置创建包含块ID ${blockId} 的卡片`);
                         };
 

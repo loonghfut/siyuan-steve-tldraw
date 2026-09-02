@@ -201,7 +201,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const lowDetailThreshold = getShapeLowDetailThreshold()
 		const lowDetailCountThreshold = getShapeLowDetailCountThreshold()
 		const hasEnoughShapesForLowDetail = lowDetailCountThreshold <= 0 || visibleCardAndSingleBlockCount >= lowDetailCountThreshold
-		const isSmallSingleBlock = !isEditingState && hasEnoughShapesForLowDetail && lowDetailThreshold > 0 && Math.min(shape.props.w, shape.props.h) * efficientZoom < lowDetailThreshold
+		// 尚未回填高度的形状（heightBackfilled === false，拖入或旧白板迁移）保持完整内容渲染：
+		// 若此时降级轻量预览，内容不挂载会导致回填测量无从进行
+		const isSmallSingleBlock = !isEditingState && hasEnoughShapesForLowDetail && lowDetailThreshold > 0 && shape.props.heightBackfilled !== false && Math.min(shape.props.w, shape.props.h) * efficientZoom < lowDetailThreshold
 		const lowDetailFontSize = getShapeLowDetailFontSize(Math.min(shape.props.w, shape.props.h), efficientZoom)
 		const containerRef = useRef<HTMLDivElement>(null)
 		const protyleRef = useRef<Protyle | null>(null)
@@ -312,25 +314,32 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		useEffect(() => {
 			if (shape.props.heightBackfilled !== false) return
 			if (shouldUseLightweightPreview || hasLoadError) return
+			// 双 rAF：staticHtml 挂载后的首帧布局可能尚未稳定，再等一帧后测量
+			let innerFrame = 0
 			const frame = requestAnimationFrame(() => {
-				const target = isEditingState ? protyleHostRef.current : staticContentRef.current
-				if (!target) return
-				const wysiwyg = target.querySelector('.protyle-wysiwyg') as HTMLElement | null
-				const measured = Math.ceil((wysiwyg || target).scrollHeight || 0)
-				if (measured <= 0) return
-				const borderPx = shape.props.transparentBackground ? 0 : BORDER_PX
-				const addBorder = settingdata["showCardBorder"] !== false && !shape.props.transparentBackground
-				const nextHeight = Math.max(measured + (addBorder ? borderPx * 2 : 0), MIN_HEIGHT)
-				editor.updateShape({
-					id: shape.id,
-					type: shape.type,
-					props: {
-						h: nextHeight,
-						heightBackfilled: true,
-					},
-				})
+				innerFrame = requestAnimationFrame(() => {
+					const target = isEditingState ? protyleHostRef.current : staticContentRef.current
+					if (!target) return
+					const wysiwyg = target.querySelector('.protyle-wysiwyg') as HTMLElement | null
+					const measured = Math.ceil((wysiwyg || target).scrollHeight || 0)
+					if (measured <= 0) return
+					const borderPx = shape.props.transparentBackground ? 0 : BORDER_PX
+					const addBorder = settingdata["showCardBorder"] !== false && !shape.props.transparentBackground
+					const nextHeight = Math.max(measured + (addBorder ? borderPx * 2 : 0), MIN_HEIGHT)
+					editor.updateShape({
+						id: shape.id,
+						type: shape.type,
+						props: {
+							h: nextHeight,
+							heightBackfilled: true,
+						},
+					})
+					})
 			})
-			return () => cancelAnimationFrame(frame)
+			return () => {
+				cancelAnimationFrame(frame)
+				if (innerFrame) cancelAnimationFrame(innerFrame)
+			}
 		}, [shape.props.heightBackfilled, staticHtml, isEditingState, shouldUseLightweightPreview, hasLoadError, editor, shape.id, shape.type, shape.props.transparentBackground])
 
 		// 编辑模式切换时聚焦到形状，并在退出编辑后恢复之前的视角
