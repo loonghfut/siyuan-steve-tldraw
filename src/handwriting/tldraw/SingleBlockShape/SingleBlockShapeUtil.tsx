@@ -45,6 +45,8 @@ import {
 	getShapeLowDetailFontSize,
 	getShapeLowDetailThreshold,
 	getShapeRenderPolicy,
+	getTotalCardAndSingleBlockCount,
+	getViewportCullingCountThreshold,
 	getVisibleCardAndSingleBlockCount,
 } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement, getLightweightPreviewTextFromHtml } from '../utils/lightweight-preview'
@@ -191,7 +193,15 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const [canLoad, setCanLoad] = useState(false)
 		const [inPreloadZone, setInPreloadZone] = useState(false)
 		const [hasLoadError, setHasLoadError] = useState(false)
-		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false
+		const totalCardAndSingleBlockCount = useValue(
+			'total card and single-block count',
+			() => getTotalCardAndSingleBlockCount(editor),
+			[editor],
+		)
+		// 视野裁剪总开关 + 数量门槛：卡片很少的白板直接全部加载，避免加载过程可见
+		const viewportCullingCountThreshold = getViewportCullingCountThreshold()
+		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false &&
+			(viewportCullingCountThreshold <= 0 || totalCardAndSingleBlockCount >= viewportCullingCountThreshold)
 		const efficientZoom = useValue('single-block efficient zoom', () => editor.getEfficientZoomLevel(), [editor])
 		const visibleCardAndSingleBlockCount = useValue(
 			'card and single-block low-detail count',
@@ -582,6 +592,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					}
 					if (signal.aborted || disposed) return
 					const host = document.createElement('div')
+					host.className = 'card-protyle-host'
 					host.style.width = '100%'
 					host.style.height = '100%'
 					host.style.overflow = 'hidden'
@@ -1053,6 +1064,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					{/* 静态内容交互屏蔽/滚动条样式已迁移至 custom-tldraw.css（避免每个实例重复一份 <style>） */}
 					{shouldUseLightweightPreview && (
 						<div
+							className="card-lightweight-preview"
 							style={{
 								width: '100%',
 								height: '100%',

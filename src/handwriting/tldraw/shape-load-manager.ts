@@ -6,6 +6,8 @@ Prioritization rules (sorted ascending by score):
  1. Editing shapes always allowed (score forced to -Infinity)
  2. In-viewport shapes before out-of-viewport
  3. Distance to viewport center (nearer first)
+Admission only kicks in when the whiteboard has enough Card / SingleBlock shapes
+(tldraw-viewport-culling-count-threshold); smaller boards load everything.
 Optional: future extension for renderMode / collapsed state.
 
 API:
@@ -22,6 +24,7 @@ Internals:
 import { settingdata } from '@/index'
 import type { Editor, TLShapeId } from '@tldraw/tldraw'
 import { isInteracting } from './utils/idle-scheduler'
+import { isViewportCullingActive } from './utils/low-detail'
 
 interface ShapeLoadMeta {
   editing: boolean
@@ -58,7 +61,14 @@ class ShapeLoadManager {
   // Keep the preload ring proportional to the visible page bounds instead of
   // a fixed world-unit distance. Fixed world units become an enormous screen
   // area when zoomed in and starve actually visible cards of the load budget.
-  private readonly PRELOAD_VIEWPORT_FRACTION = 0.35
+  // One full viewport ring: panning by up to a screen exposes only shapes that
+  // already had their getDoc result warmed into the preview cache, so users do
+  // not see the lightweight → rendered transition during normal panning.
+  private readonly PRELOAD_VIEWPORT_FRACTION = 1
+  // 预载环按几何范围可能覆盖大量形状（远景缩小后再乘以面积放大）。为保持克制，
+  // 只把距视口中心最近的前若干个环内形状标记为 inPreloadZone（触发缓存预热），
+  // 其余等下一轮重算按距离依次补上。
+  private readonly WARM_RING_MAX_SHAPES = 24
   // Keep the established admission cadence while making it event-driven.
   // The difference is that an idle whiteboard no longer wakes every frame.
   private readonly IDLE_RECOMPUTE_INTERVAL_MS = 500
@@ -73,6 +83,12 @@ class ShapeLoadManager {
   private grantsDeferred = false
   private readonly DEFERRED_GRANT_RECHECK_MS = 800
   private deferredGrantRecheckTimer: ReturnType<typeof setTimeout> | null = null
+  // 授予节奏：交互结束/初次打开时可见形状可能一次多到几十个，若一次性全部
+  // 授予，静态预览队列会并发解析多份完整文档 HTML，造成明显的整帧卡顿。
+  // 每轮重算最多新增一批准入，剩余的由短定时器接续，按距离优先级分批上屏。
+  private readonly MAX_NEW_GRANTS_PER_RECOMPUTE = 8
+  private readonly GRANT_BATCH_CONTINUATION_MS = 120
+  private grantBatchTimer: ReturnType<typeof setTimeout> | null = null
 
   attachEditor(editor: Editor) {
     if (this.editorUnsubscribers.has(editor)) return
@@ -140,7 +156,10 @@ class ShapeLoadManager {
       this.immediateRecomputeQueued = true
       queueMicrotask(() => {
         this.immediateRecomputeQueued = false
-        this.queueRecompute(true)
+        // 交互（平移/缩放）中新注册的形状本来就拿不到准入，meta 刷新交给
+        // 交互节奏与结算重算。快速平移时新形状不断注册，若每次都触发全量
+        // 重算（O(注册数) 几何计算），会与平移帧争抢主线程。
+        if (!isInteracting()) this.queueRecompute(true)
       })
     }
     return () => this.unregister(shapeId, editor)
@@ -197,6 +216,10 @@ class ShapeLoadManager {
     // grantsDeferred 故意不重置：交互可能仍在进行（如切走标签页后全部注销），
     // 标记应跟随交互状态而非形状数量，由 notifyViewportSettled / 兜底检查归位。
     this.cancelDeferredGrantRecheck()
+    if (this.grantBatchTimer !== null) {
+      clearTimeout(this.grantBatchTimer)
+      this.grantBatchTimer = null
+    }
     for (const timer of this.admissionBlockTimers.values()) clearTimeout(timer)
     this.admissionBlockTimers.clear()
     for (const unsubscribe of this.editorUnsubscribers.values()) unsubscribe()
@@ -289,7 +312,18 @@ class ShapeLoadManager {
 
     const maxActive = Math.max(1, Number(settingdata['tldraw-max-active-shapes']) || 40)
 
-    const sortable: Array<{ id: string; score: number; editing: boolean; meta: ComputedMeta }> = []
+    const sortable: Array<{
+      id: string
+      editor: Editor
+      score: number
+      editing: boolean
+      cullingActive: boolean
+      meta: ComputedMeta
+    }> = []
+    const editorCullingActive = new Map<Editor, boolean>()
+    // 预载环候选：仅统计"环内但视口外"的形状，用于按距离截取预热名单
+    const warmRingCandidates = new Map<Editor, Array<{ meta: ComputedMeta }>>()
+
     for (const s of this.shapes.values()) {
       let provided: ShapeLoadMeta = { editing: false }
       try { provided = s.metaProvider() } catch { /* ignore */ }
@@ -320,41 +354,71 @@ class ShapeLoadManager {
         }
       } catch { /* ignore */ }
 
+      let cullingActive = editorCullingActive.get(s.editor)
+      if (cullingActive === undefined) {
+        // 含数量门槛：卡片很少的白板不启用裁剪，全部形状直接允许
+        cullingActive = isViewportCullingActive(s.editor)
+        editorCullingActive.set(s.editor, cullingActive)
+      }
+
       const cmeta: ComputedMeta = { inViewport, inPreloadZone, distance }
+      const item = { id: s.id, editor: s.editor, editing: provided.editing, cullingActive, meta: cmeta, score: 0 }
       if (provided.editing) {
-        sortable.push({ id: s.id, score: -Infinity, editing: true, meta: cmeta })
+        item.score = -Infinity
       } else {
-        let score = distance
-        if (!inViewport) score += 1000000
-        sortable.push({ id: s.id, score, editing: false, meta: cmeta })
+        item.score = distance
+        if (!inViewport) item.score += 1000000
+        // 视野裁剪生效时才需要预热环；未启用裁剪的白板全部直接加载
+        if (cullingActive && inPreloadZone && !inViewport) {
+          let ring = warmRingCandidates.get(s.editor)
+          if (!ring) {
+            ring = []
+            warmRingCandidates.set(s.editor, ring)
+          }
+          ring.push({ meta: cmeta })
+        }
+      }
+      sortable.push(item)
+    }
+
+    // 预载环限流：环内形状超过上限时，只保留距视口中心最近的若干个，
+    // 其余本轮不标记 inPreloadZone（不触发预热），由后续重算按距离补齐。
+    for (const ring of warmRingCandidates.values()) {
+      if (ring.length <= this.WARM_RING_MAX_SHAPES) continue
+      ring.sort((a, b) => a.meta.distance - b.meta.distance)
+      for (let index = this.WARM_RING_MAX_SHAPES; index < ring.length; index++) {
+        ring[index].meta.inPreloadZone = false
       }
     }
 
     sortable.sort((a, b) => a.score - b.score)
 
     const allowedSet = new Set<string>()
-    
+
     // 统计当前需要保留的形状数量（不包括编辑中的）
     let allowedCount = 0
-    
-    // 分离视口内和视口外的形状
-    const inViewportItems = sortable.filter(item => !item.editing && item.meta.inViewport)
-    
+
     // 第一步：编辑中的形状始终允许（不计入配额）
     for (const item of sortable) {
       if (item.editing) {
         allowedSet.add(item.id)
       }
     }
-    
-    // 第二步：优先加载视口内的形状（按距离排序，已排好序）
-    for (const item of inViewportItems) {
-      if (allowedCount < maxActive) {
+
+    // 第二步：优先加载视口内的形状（按距离排序，已排好序）。
+    // 未达到裁剪数量门槛的编辑器不参与配额：直接允许其所有已注册形状，
+    // 让小白板像关闭视野裁剪一样完整加载，避免出现可见的加载过程。
+    for (const item of sortable) {
+      if (item.editing) continue
+      if (item.meta.inViewport) {
+        if (item.cullingActive && allowedCount >= maxActive) continue
         allowedSet.add(item.id)
-        allowedCount++
+        if (item.cullingActive) allowedCount++
+      } else if (!item.cullingActive) {
+        allowedSet.add(item.id)
       }
     }
-    
+
     // Shapes in the preload ring are tracked through `inPreloadZone`, but do
     // not receive full-content admission. Their persisted previewText remains
     // visible without allowing off-screen document fetches to consume slots.
@@ -363,6 +427,8 @@ class ShapeLoadManager {
     const editingIds = new Set(sortable.filter((item) => item.editing).map((item) => item.id))
 
     // Notify changes
+    let newGrants = 0
+    let grantBudgetExhausted = false
     for (const s of this.shapes.values()) {
       const targetAllowed = allowedSet.has(s.id)
       const computed = computedById.get(s.id) || { inViewport: false, inPreloadZone: false, distance: Infinity }
@@ -386,18 +452,19 @@ class ShapeLoadManager {
         }
         // 交互避让：平移/缩放进行中不授予"新"准入（撤销照常）。保持已有准入、
         // 编辑中的形状不受影响——编辑挂载不能等交互结束。
-        if (s.lastAllowed || !this.grantsDeferred || editingIds.has(s.id)) {
-          newAllowed = true
+        const isEditingShape = editingIds.has(s.id)
+        if (s.lastAllowed || !this.grantsDeferred || isEditingShape) {
+          if (!s.lastAllowed && !isEditingShape && newGrants >= this.MAX_NEW_GRANTS_PER_RECOMPUTE) {
+            grantBudgetExhausted = true
+          } else {
+            newAllowed = true
+            if (!s.lastAllowed && !isEditingShape) newGrants++
+          }
         } else {
           this.scheduleDeferredGrantRecheck()
         }
       } else if (s.lastAllowed && !this.admissionBlockTimers.has(s.id)) {
-        const timer = setTimeout(() => {
-          this.admissionBlockTimers.delete(s.id)
-          s.lastAllowed = false
-          try { s.onChange(false, s.lastComputed) } catch { /* ignore */ }
-        }, this.ADMISSION_GRACE_MS)
-        this.admissionBlockTimers.set(s.id, timer)
+        this.scheduleAdmissionRevoke(s)
       }
 
       const allowedChanged = newAllowed !== s.lastAllowed
@@ -407,6 +474,31 @@ class ShapeLoadManager {
         try { s.onChange(newAllowed, computed) } catch { /* ignore */ }
       }
     }
+
+    if (grantBudgetExhausted && this.grantBatchTimer === null) {
+      this.grantBatchTimer = setTimeout(() => {
+        this.grantBatchTimer = null
+        this.queueRecompute(true)
+      }, this.GRANT_BATCH_CONTINUATION_MS)
+    }
+  }
+
+  /**
+   * 准入滞回的撤销侧：失去准入延迟 ADMISSION_GRACE_MS 再通知。若宽限期到点时
+   * 用户仍在平移/缩放，则顺延到交互结束后再执行——这些形状此刻不可见，保持
+   * 挂载没有任何每帧成本，而交互中集中销毁 DOM 会与平移帧争抢主线程。
+   */
+  private scheduleAdmissionRevoke(shape: RegisteredShape) {
+    const timer = setTimeout(() => {
+      this.admissionBlockTimers.delete(shape.id)
+      if (isInteracting()) {
+        this.scheduleAdmissionRevoke(shape)
+        return
+      }
+      shape.lastAllowed = false
+      try { shape.onChange(false, shape.lastComputed) } catch { /* ignore */ }
+    }, this.ADMISSION_GRACE_MS)
+    this.admissionBlockTimers.set(shape.id, timer)
   }
 }
 

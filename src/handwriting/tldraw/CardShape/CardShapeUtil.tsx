@@ -26,6 +26,8 @@ import {
 	getShapeLowDetailFontSize,
 	getShapeLowDetailThreshold,
 	getShapeRenderPolicy,
+	getTotalCardAndSingleBlockCount,
+	getViewportCullingCountThreshold,
 	getVisibleCardAndSingleBlockCount,
 } from '../utils/low-detail'
 import { getLightweightPreviewTextFromElement } from '../utils/lightweight-preview'
@@ -210,7 +212,15 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const [canLoad, setCanLoad] = useState(false); // gating heavy render by global manager
 		const [inPreloadZone, setInPreloadZone] = useState(false); // 视口外扩预载环，用于缓存预热
 		const [hasMissingLinkedBlock, setHasMissingLinkedBlock] = useState(false);
-		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false;
+		const totalCardAndSingleBlockCount = useValue(
+			'total card and single-block count',
+			() => getTotalCardAndSingleBlockCount(editor),
+			[editor],
+		)
+		// 视野裁剪总开关 + 数量门槛：卡片很少的白板直接全部加载，避免加载过程可见
+		const viewportCullingCountThreshold = getViewportCullingCountThreshold()
+		const isViewportCullingEnabled = settingdata['tldraw-viewport-culling'] !== false &&
+			(viewportCullingCountThreshold <= 0 || totalCardAndSingleBlockCount >= viewportCullingCountThreshold);
 		const tldrawHeaderImage = settingdata['tldraw-header-image'] !== false;
 		const [collapsedText, setCollapsedText] = useState<string>('加载中...');
 		const [collapsedDocInfo, setCollapsedDocInfo] = useState<{
@@ -994,6 +1004,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					}
 					if (signal.aborted || cancelled) return;
 					const host = document.createElement('div');
+					host.className = 'card-protyle-host';
 					host.style.width = '100%';
 					host.style.height = '100%';
 					host.style.overflow = 'hidden';
@@ -1718,7 +1729,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					)}
 					{/* 低缩放和限流状态共用同一套轻量预览。 */}
 					{shouldUseLightweightPreview && (
-						<div style={{
+						<div className="card-lightweight-preview" style={{
 							width: '100%',
 							height: '100%',
 							display: 'flex',

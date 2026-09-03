@@ -19,7 +19,9 @@ export interface StaticPreviewCacheEntry {
 }
 
 const staticPreviewCache = new Map<string, StaticPreviewCacheEntry>()
-const MAX_CACHE_SIZE = 50;
+// 预载环扩到一整圈视口后，一次平移结束可能预热数十个文档的 HTML；
+// 缓存太小会让预热结果在被使用前就被淘汰，白费网络请求与解析开销。
+const MAX_CACHE_SIZE = 100;
 
 function evictOldest() {
 	if (staticPreviewCache.size < MAX_CACHE_SIZE) return

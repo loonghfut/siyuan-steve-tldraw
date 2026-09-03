@@ -24,6 +24,16 @@ export function getShapeLowDetailCountThreshold(): number {
 	return Math.min(MAX_LOW_DETAIL_COUNT_THRESHOLD, Math.max(0, configuredThreshold))
 }
 
+// 视野裁剪数量门槛：白板内 Card / 单块总数达到该值后才启用"仅加载视野内形状"。
+// 数量少的白板直接加载全部内容，避免平移时出现轻量 → 完整内容的加载过程。
+const DEFAULT_CULLING_COUNT_THRESHOLD = 30
+
+export function getViewportCullingCountThreshold(): number {
+	const configuredThreshold = Number(settingdata['tldraw-viewport-culling-count-threshold'])
+	if (!Number.isFinite(configuredThreshold)) return DEFAULT_CULLING_COUNT_THRESHOLD
+	return Math.max(0, configuredThreshold)
+}
+
 // getRenderingShapes() is relatively expensive for large documents. Keep one
 // reactive, cached count per Editor so every Card / SingleBlock component
 // observes the same derived value instead of reducing the rendering list.
@@ -38,6 +48,29 @@ const VisibleCardAndSingleBlockCount = new EditorAtom('visible card and single-b
 /** Count the Card / SingleBlock shapes tldraw currently intends to render in the viewport. */
 export function getVisibleCardAndSingleBlockCount(editor: Editor): number {
 	return VisibleCardAndSingleBlockCount.get(editor).get()
+}
+
+// 与上面的可见计数同理：全页计数也做成每个 Editor 一份的响应式缓存，
+// getCurrentPageShapes() 的结果由 tldraw 的 computed 系统追踪，仅在形状增删时重算。
+const TotalCardAndSingleBlockCount = new EditorAtom('total card and single-block count', (editor) =>
+	computed('total card and single-block count', () => {
+		return editor.getCurrentPageShapes().reduce((count, shape) => {
+			return count + (shape.type === 'card' || shape.type === 'single-block' ? 1 : 0)
+		}, 0)
+	}),
+)
+
+/** Count all Card / SingleBlock shapes on the current page, regardless of visibility. */
+export function getTotalCardAndSingleBlockCount(editor: Editor): number {
+	return TotalCardAndSingleBlockCount.get(editor).get()
+}
+
+/** 视野裁剪的总开关是否生效（含数量门槛：总数未达门槛时裁剪不启用）。 */
+export function isViewportCullingActive(editor: Editor): boolean {
+	if (settingdata['tldraw-viewport-culling'] === false) return false
+	const countThreshold = getViewportCullingCountThreshold()
+	if (countThreshold <= 0) return true
+	return getTotalCardAndSingleBlockCount(editor) >= countThreshold
 }
 
 /** Keep lightweight-preview text close to 20 screen pixels where the shape allows it. */

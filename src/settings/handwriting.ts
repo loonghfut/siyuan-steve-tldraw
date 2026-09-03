@@ -16,6 +16,9 @@ export const handwritingDefaults: Record<string, any> = {
     "tldraw-link-scheme": "https",
     "SyncDelete": false,
     "tldraw-viewport-culling": true,
+    // 白板内 Card / 单块总数达到该值后才启用"仅加载视野内形状"；0 表示不受数量限制。
+    // 数量少的白板直接加载全部内容，避免平移时看到从轻量预览到完整内容的加载过程。
+    "tldraw-viewport-culling-count-threshold": 30,
     // 工具栏方向：vertical | horizontal
     "tldraw-toolbar-orientation": "vertical",
     // card 渲染模式：static-dom（非编辑仅保留 Protyle 元素，无实例），live-protyle（非编辑保留 Protyle 实例，禁用交互）
@@ -114,6 +117,7 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
                     }
                 },
                 { type: "checkbox", title: "仅加载视野内形状", description: "启用后 tldraw 仅在视区内加载形状以节省资源", key: "tldraw-viewport-culling", value: ctx.settings["tldraw-viewport-culling"] },
+                { type: "number", title: "仅加载视野内形状的数量门槛", description: "白板内 Card 与单块形状总数达到此值后才启用\"仅加载视野内形状\"；低于此值的白板直接加载全部内容，避免平移时出现加载过程。设为 0 表示不受数量限制。默认 30。", key: "tldraw-viewport-culling-count-threshold", value: ctx.settings["tldraw-viewport-culling-count-threshold"] },
             ]
         },
         {

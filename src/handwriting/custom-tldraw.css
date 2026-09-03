@@ -1473,6 +1473,28 @@ div.bq[data-type="NodeBlockquote"][custom-st-tldraw="1"] {
 }
 
 
+/* ===== 卡片内容挂载过渡：轻量预览 ↔ 完整内容（静态 DOM / Protyle 宿主）
+   切换时平滑淡入，避免"突然跳变"的加载观感。只做淡入不做淡出：
+   被替换的一方随 React 卸载立即消失，短暂的空档由卡片底色兜底。 ===== */
+@keyframes card-content-fade-in {
+	from { opacity: 0; }
+	to { opacity: 1; }
+}
+.card-static-content,
+.single-block-static-content,
+.card-lightweight-preview,
+.card-protyle-host {
+	animation: card-content-fade-in 200ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+	.card-static-content,
+	.single-block-static-content,
+	.card-lightweight-preview,
+	.card-protyle-host {
+		animation: none;
+	}
+}
+
 /* ===== Card / SingleBlock 静态内容交互屏蔽（自 shape 组件内联 <style> 迁移，
    避免每个形状实例各渲染一份重复样式表） ===== */
 .card-static-content,
