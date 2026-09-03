@@ -189,7 +189,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		isEditingStateRef.current = isEditingState;
 		// Stay blocked until ShapeLoadManager computes this shape's visibility.
 		// Effects in the initial commit still see these values after registration.
-		const [isInViewport, setIsInViewport] = useState(false)
 		const [canLoad, setCanLoad] = useState(false)
 		const [inPreloadZone, setInPreloadZone] = useState(false)
 		const [hasLoadError, setHasLoadError] = useState(false)
@@ -231,7 +230,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const renderPolicy = getShapeRenderPolicy({
 			isEditing: isEditingState,
 			isViewportCullingEnabled,
-			isInViewport,
 			canLoad,
 			isSmallShape: isSmallSingleBlock,
 		})
@@ -366,7 +364,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				() => ({ editing: isEditingStateRef.current }),
 				(allowed, meta) => {
 					setCanLoad(allowed)
-					setIsInViewport(meta.inViewport)
 					setInPreloadZone(meta.inPreloadZone)
 					const distance = Number.isFinite(meta.distance) ? Math.max(0, meta.distance) : 1_000_000
 					const centerPriority = Math.min(100, Math.floor(distance / 160))
@@ -377,16 +374,16 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			return unregister
 		}, [shape.id])
 
-		// 预载环预热：尚未获得准入的块提前填充 HTML 缓存（不挂 DOM），
-		// 用户平移到位时命中缓存即可立即上屏
+		// 预热环预热：尚未获得准入的块提前填充 HTML 缓存（不挂 DOM），
+		// 用户平移进入准入环时命中缓存即可立即上屏
 		useEffect(() => {
 			if (isEditingState || isSmallSingleBlock) return
 			if (!isViewportCullingEnabled || !shape.props.blockId) return
-			if (canLoad && isInViewport) return
+			if (canLoad) return
 			if (!inPreloadZone) return
 			if (isInteracting()) return
 			void preloadBlockContent(shape.props.blockId)
-		}, [isEditingState, isSmallSingleBlock, isViewportCullingEnabled, shape.props.blockId, canLoad, isInViewport, inPreloadZone])
+		}, [isEditingState, isSmallSingleBlock, isViewportCullingEnabled, shape.props.blockId, canLoad, inPreloadZone])
 
 		// ===== 核心优化：只在编辑态创建 Protyle，非编辑态使用静态 HTML =====
 
@@ -398,9 +395,9 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			const blockId = shape.props.blockId
 			if (!blockId) return
 
-			// 检查视口可见性
-			const shouldLoad = !isViewportCullingEnabled || (isInViewport && canLoad)
-			if (!shouldLoad) return
+			// 准入完全跟随管理器：canLoad 已包含"视口 + 准入环"的配额判定与
+			// 后台标签页拦截，组件不得再叠加 isInViewport 判断
+			if (!canLoad) return
 
 			// refreshNonce 变化时强制刷新缓存
 			const forceRefresh = refreshNonceRef.current !== shape.props.refreshNonce
@@ -471,7 +468,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			})
 
 			return () => { cancelled = true }
-		}, [isEditingState, isSmallSingleBlock, shape.props.blockId, shape.props.refreshNonce, isInViewport, canLoad, isViewportCullingEnabled, persistPreviewText, persistLightweightPreviewText])
+		}, [isEditingState, isSmallSingleBlock, shape.props.blockId, shape.props.refreshNonce, canLoad, persistPreviewText, persistLightweightPreviewText])
 
 		// ===== 静态内容渲染：在 staticHtml 挂载后执行 renderAllContentIdle =====
 		// 使用空闲调度，避免在拖动画布时阻塞主线程

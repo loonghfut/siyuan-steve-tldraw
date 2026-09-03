@@ -208,9 +208,8 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 			(branchInteractionHint.targetShapeId === shape.id ||
 				(!branchInteractionHint.targetShapeId && branchInteractionHint.draggingShapeId === shape.id))
 		const isEditingState = isEditing
-		const [isInViewport, setIsInViewport] = useState(false);
 		const [canLoad, setCanLoad] = useState(false); // gating heavy render by global manager
-		const [inPreloadZone, setInPreloadZone] = useState(false); // 视口外扩预载环，用于缓存预热
+		const [inPreloadZone, setInPreloadZone] = useState(false); // 准入环之外的预热环，用于缓存预热
 		const [hasMissingLinkedBlock, setHasMissingLinkedBlock] = useState(false);
 		const totalCardAndSingleBlockCount = useValue(
 			'total card and single-block count',
@@ -250,7 +249,6 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 		const renderPolicy = getShapeRenderPolicy({
 			isEditing: isEditingState,
 			isViewportCullingEnabled,
-			isInViewport,
 			canLoad,
 			isSmallShape: isSmallCard,
 			isCollapsed,
@@ -776,23 +774,22 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					staticPreviewPriorityRef.current = meta.inViewport ? centerPriority : 1_000 + centerPriority
 					staticPreviewLoadRef.current?.setPriority(staticPreviewPriorityRef.current)
 					setCanLoad(allowed)
-					setIsInViewport(meta.inViewport)
 					setInPreloadZone(meta.inPreloadZone)
 				}
 			)
 			return unregister
 		}, [shape.id])
 
-		// 预载环预热：尚未获得准入的 Card 提前把 getDoc 结果写入缓存（不挂 DOM），
-		// 用户平移到位时命中缓存即可立即上屏
+		// 预热环预热：尚未获得准入的 Card 提前把 getDoc 结果写入缓存（不挂 DOM），
+		// 用户平移进入准入环时命中缓存即可立即上屏
 		useEffect(() => {
 			if (isEditingState || isCollapsed) return
 			if (isMainCard || effectiveRenderMode !== 'static-dom') return
 			if (!isViewportCullingEnabled || !blockId) return
-			if (canLoad && isInViewport) return
+			if (canLoad) return
 			if (!inPreloadZone) return
 			warmCardStaticPreview(blockId, staticPreviewBlockLimit)
-		}, [isEditingState, isCollapsed, isMainCard, effectiveRenderMode, isViewportCullingEnabled, blockId, canLoad, isInViewport, inPreloadZone, staticPreviewBlockLimit])
+		}, [isEditingState, isCollapsed, isMainCard, effectiveRenderMode, isViewportCullingEnabled, blockId, canLoad, inPreloadZone, staticPreviewBlockLimit])
 
 		// 移除轻量预览逻辑，统一使用 Protyle 渲染
 
@@ -826,7 +823,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				// callback has run. Defer the existence check until this Card is
 				// actually eligible for the viewport; otherwise a large offscreen
 				// board creates a second request wave before visible content loads.
-				if (isViewportCullingEnabled && renderAdmission !== 'allowed') return;
+				if (renderAdmission !== 'allowed') return;
 				if (shape.props.isNewlyCreated) {
 					this.editor.updateShape({
 						id: shape.id,
@@ -847,7 +844,7 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 					return () => { cancelled = true; };
 				}
 			}
-		}, [blockId, editor, enterMissingLinkedBlockState, isEditingState, isViewportCullingEnabled, renderAdmission, shape.id, shape.props, shape.type, shape.props.refreshNonce]);
+		}, [blockId, editor, enterMissingLinkedBlockState, isEditingState, renderAdmission, shape.id, shape.props, shape.type, shape.props.refreshNonce]);
 		// Protyle 生命周期管理主 Effect
 		// 注意：对于 live-protyle 模式，编辑状态切换不应触发重建
 		useEffect(() => {

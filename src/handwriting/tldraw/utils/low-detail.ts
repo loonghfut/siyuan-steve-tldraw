@@ -84,7 +84,6 @@ export function getShapeLowDetailFontSize(minDimension: number, efficientZoom: n
 export interface ShapeRenderPolicyInput {
 	isEditing: boolean
 	isViewportCullingEnabled: boolean
-	isInViewport: boolean
 	canLoad: boolean
 	isSmallShape: boolean
 	isCollapsed?: boolean
@@ -105,13 +104,16 @@ export interface ShapeRenderPolicy {
 export function getShapeRenderPolicy({
 	isEditing,
 	isViewportCullingEnabled,
-	isInViewport,
 	canLoad,
 	isSmallShape,
 	isCollapsed = false,
 	inExitGrace = false,
 }: ShapeRenderPolicyInput): ShapeRenderPolicy {
-	const renderAdmission = isEditing || !isViewportCullingEnabled || (isInViewport && canLoad)
+	// 准入完全跟随管理器的 canLoad：管理器已把"视口 + 准入环"内的形状按配额
+	// 放行、对后台标签页保持拦截。组件不得再叠加 isInViewport 判断，否则
+	// 准入环内已放行（canLoad=true）但严格视口外的形状会被误拦截回轻量预览。
+	const admissionAllowed = isEditing || canLoad
+	const renderAdmission = admissionAllowed
 		? 'allowed'
 		: 'blocked'
 

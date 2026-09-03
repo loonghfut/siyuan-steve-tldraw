@@ -4,10 +4,13 @@ Supports multiple tldraw instances, each shape registers with its own editor.
 Limits the number of simultaneously 'active / heavy' loaded shapes (mounting Protyle etc.)
 Prioritization rules (sorted ascending by score):
  1. Editing shapes always allowed (score forced to -Infinity)
- 2. In-viewport shapes before out-of-viewport
+ 2. In-viewport shapes before admission-ring shapes before the rest
  3. Distance to viewport center (nearer first)
-Admission only kicks in when the whiteboard has enough Card / SingleBlock shapes
-(tldraw-viewport-culling-count-threshold); smaller boards load everything.
+Full-content admission covers the viewport plus an expanded ring
+(ADMISSION_RING_FRACTION); shapes beyond it fall back to the lightweight
+preview after a grace period. Admission only kicks in when the whiteboard has
+enough Card / SingleBlock shapes (tldraw-viewport-culling-count-threshold);
+smaller boards load everything.
 Optional: future extension for renderMode / collapsed state.
 
 API:
@@ -31,7 +34,9 @@ interface ShapeLoadMeta {
 }
 
 interface ComputedMeta {
+  /** 严格视口内（用于排序与渲染优先级）。 */
   inViewport: boolean
+  /** 预热环内（准入环之外、再外扩一圈）：触发 getDoc 缓存预热，不参与准入。 */
   inPreloadZone: boolean
   distance: number
 }
@@ -55,20 +60,23 @@ class ShapeLoadManager {
   // 避免不可见画布占用全局 maxActive 预算。
   private editorVisibility = new Map<Editor, boolean>()
   private editorObservers = new Map<Editor, IntersectionObserver>()
+  // IO 是否已回报过首次交集状态。首个回调到来前不允许"整板放行"（见 recompute），
+  // 防止后台标签页在挂载到 IO 首次回调之间的短暂窗口内被全量加载。
+  private editorVisibilityConfirmed = new Map<Editor, boolean>()
   private recomputeTimer: ReturnType<typeof setTimeout> | null = null
   private immediateRecomputeQueued = false
   private lastRecomputeAt = 0
-  // Keep the preload ring proportional to the visible page bounds instead of
-  // a fixed world-unit distance. Fixed world units become an enormous screen
-  // area when zoomed in and starve actually visible cards of the load budget.
-  // One full viewport ring: panning by up to a screen exposes only shapes that
-  // already had their getDoc result warmed into the preview cache, so users do
-  // not see the lightweight → rendered transition during normal panning.
-  private readonly PRELOAD_VIEWPORT_FRACTION = 1
-  // 预载环按几何范围可能覆盖大量形状（远景缩小后再乘以面积放大）。为保持克制，
+  // 准入环：视口外扩此比例的区域内的形状保持完整内容（不进入轻量预览），
+  // 与视口内形状一起按距离参与配额。平移不超出该环时不会看到轻量 → 完整
+  // 内容的加载过程。按视口比例而非固定世界距离计算，避免缩放时环面积失衡。
+  private readonly ADMISSION_RING_FRACTION = 2
+  // 预热环：准入环之外再外扩一圈。只把 getDoc 结果提前写入预览缓存（不挂
+  // DOM），用户继续平移使形状进入准入环时命中缓存即可立即上屏。
+  private readonly WARM_RING_FRACTION = 3
+  // 预热环按几何范围可能覆盖大量形状（远景缩小后再乘以面积放大）。为保持克制，
   // 只把距视口中心最近的前若干个环内形状标记为 inPreloadZone（触发缓存预热），
   // 其余等下一轮重算按距离依次补上。
-  private readonly WARM_RING_MAX_SHAPES = 24
+  private readonly WARM_RING_MAX_SHAPES = 48
   // Keep the established admission cadence while making it event-driven.
   // The difference is that an idle whiteboard no longer wakes every frame.
   private readonly IDLE_RECOMPUTE_INTERVAL_MS = 500
@@ -108,21 +116,32 @@ class ShapeLoadManager {
     if (this.editorObservers.has(editor)) return
     // 默认视为可见；IntersectionObserver 的首个回调会校正隐藏标签页。
     this.editorVisibility.set(editor, true)
-    if (typeof IntersectionObserver === 'undefined') return
+    if (typeof IntersectionObserver === 'undefined') {
+      // 无法观察时退回"可见"语义，避免可见编辑器永远拿不到整板放行
+      this.editorVisibilityConfirmed.set(editor, true)
+      return
+    }
     try {
       const container = editor.getContainer()
-      if (!container) return
+      if (!container) {
+        this.editorVisibilityConfirmed.set(editor, true)
+        return
+      }
+      this.editorVisibilityConfirmed.set(editor, false)
       const observer = new IntersectionObserver((entries) => {
         const visible = entries.some((entry) => entry.isIntersecting)
-        if (this.editorVisibility.get(editor) === visible) return
+        const isFirstCallback = this.editorVisibilityConfirmed.get(editor) !== true
+        this.editorVisibilityConfirmed.set(editor, true)
+        if (!isFirstCallback && this.editorVisibility.get(editor) === visible) return
         this.editorVisibility.set(editor, visible)
-        // 可见性翻转影响准入结果，立即重算
+        // 可见性翻转（含首次回报）影响准入结果，立即重算
         this.queueRecompute(true)
       }, { threshold: 0 })
       observer.observe(container)
       this.editorObservers.set(editor, observer)
     } catch {
       // 容器尚未挂载等场景下忽略；保持默认可见
+      this.editorVisibilityConfirmed.set(editor, true)
     }
   }
 
@@ -206,6 +225,7 @@ class ShapeLoadManager {
       this.editorObservers.delete(editor)
     }
     this.editorVisibility.delete(editor)
+    this.editorVisibilityConfirmed.delete(editor)
   }
 
   private stop() {
@@ -227,6 +247,7 @@ class ShapeLoadManager {
     for (const observer of this.editorObservers.values()) observer.disconnect()
     this.editorObservers.clear()
     this.editorVisibility.clear()
+    this.editorVisibilityConfirmed.clear()
   }
 
   forceRecompute() {
@@ -314,39 +335,62 @@ class ShapeLoadManager {
 
     const sortable: Array<{
       id: string
-      editor: Editor
       score: number
       editing: boolean
       cullingActive: boolean
+      bulkReady: boolean
+      inAdmissionZone: boolean
       meta: ComputedMeta
     }> = []
-    const editorCullingActive = new Map<Editor, boolean>()
+    // 每个编辑器的准入上下文按轮缓存：
+    // - cullingActive：含数量门槛判定（isViewportCullingActive）；
+    // - bulkReady：编辑器可见且 IO 已回报过首次状态，才允许"整板放行"，
+    //   防止后台标签页在挂载到 IO 首次回调之间的窗口内被全量加载。
+    const editorAdmissionContext = new Map<Editor, { cullingActive: boolean; bulkReady: boolean }>()
     // 预载环候选：仅统计"环内但视口外"的形状，用于按距离截取预热名单
     const warmRingCandidates = new Map<Editor, Array<{ meta: ComputedMeta }>>()
 
     for (const s of this.shapes.values()) {
       let provided: ShapeLoadMeta = { editing: false }
       try { provided = s.metaProvider() } catch { /* ignore */ }
+
+      const editorVisible = this.editorVisibility.get(s.editor) ?? true
+      let admissionContext = editorAdmissionContext.get(s.editor)
+      if (!admissionContext) {
+        let cullingActive = true
+        try {
+          cullingActive = isViewportCullingActive(s.editor)
+        } catch {
+          // 计数异常时按"启用裁剪"处理，走常规视口准入，避免异常导致全量放行
+        }
+        const editorConfirmed = this.editorVisibilityConfirmed.get(s.editor) ?? true
+        admissionContext = { cullingActive, bulkReady: editorVisible && editorConfirmed }
+        editorAdmissionContext.set(s.editor, admissionContext)
+      }
+
       // compute visibility & distance using the shape's own editor
       let distance = Infinity
       let inViewport = false
+      let inAdmissionZone = false
       let inPreloadZone = false
       try {
-        const editorVisible = this.editorVisibility.get(s.editor) ?? true
         if (editorVisible) {
           const vp = s.editor?.getViewportPageBounds()
           const b = s.editor?.getShapePageBounds(s.id)
           if (vp && b) {
-            inViewport = vp.minX < b.maxX && vp.maxX > b.minX && vp.minY < b.maxY && vp.maxY > b.minY
-            const marginX = vp.width * this.PRELOAD_VIEWPORT_FRACTION
-            const marginY = vp.height * this.PRELOAD_VIEWPORT_FRACTION
-            const expanded = {
-              minX: vp.minX - marginX,
-              minY: vp.minY - marginY,
-              maxX: vp.maxX + marginX,
-              maxY: vp.maxY + marginY,
-            }
-            inPreloadZone = expanded.minX < b.maxX && expanded.maxX > b.minX && expanded.minY < b.maxY && expanded.maxY > b.minY
+            const intersects = (r: { minX: number; minY: number; maxX: number; maxY: number }) =>
+              r.minX < b.maxX && r.maxX > b.minX && r.minY < b.maxY && r.maxY > b.minY
+            const expands = (fraction: number) => ({
+              minX: vp.minX - vp.width * fraction,
+              minY: vp.minY - vp.height * fraction,
+              maxX: vp.maxX + vp.width * fraction,
+              maxY: vp.maxY + vp.height * fraction,
+            })
+            inViewport = intersects(vp)
+            // 准入环：环内保持完整内容（参与配额）
+            inAdmissionZone = intersects(expands(this.ADMISSION_RING_FRACTION))
+            // 预热环：准入环之外的部分才值得预热（已准入的形状会直接挂载）
+            inPreloadZone = intersects(expands(this.WARM_RING_FRACTION)) && !inAdmissionZone
             const cx = vp.midX, cy = vp.midY
             const sx = (b.minX + b.maxX) / 2, sy = (b.minY + b.maxY) / 2
             distance = Math.hypot(cx - sx, cy - sy)
@@ -354,22 +398,23 @@ class ShapeLoadManager {
         }
       } catch { /* ignore */ }
 
-      let cullingActive = editorCullingActive.get(s.editor)
-      if (cullingActive === undefined) {
-        // 含数量门槛：卡片很少的白板不启用裁剪，全部形状直接允许
-        cullingActive = isViewportCullingActive(s.editor)
-        editorCullingActive.set(s.editor, cullingActive)
-      }
-
       const cmeta: ComputedMeta = { inViewport, inPreloadZone, distance }
-      const item = { id: s.id, editor: s.editor, editing: provided.editing, cullingActive, meta: cmeta, score: 0 }
+      const item = {
+        id: s.id,
+        editing: provided.editing,
+        cullingActive: admissionContext.cullingActive,
+        bulkReady: admissionContext.bulkReady,
+        inAdmissionZone,
+        meta: cmeta,
+        score: 0,
+      }
       if (provided.editing) {
         item.score = -Infinity
       } else {
         item.score = distance
         if (!inViewport) item.score += 1000000
-        // 视野裁剪生效时才需要预热环；未启用裁剪的白板全部直接加载
-        if (cullingActive && inPreloadZone && !inViewport) {
+        // 预热环限流候选：预热环已排除准入环，只需裁剪生效即收集
+        if (admissionContext.cullingActive && inPreloadZone) {
           let ring = warmRingCandidates.get(s.editor)
           if (!ring) {
             ring = []
@@ -405,16 +450,23 @@ class ShapeLoadManager {
       }
     }
 
-    // 第二步：优先加载视口内的形状（按距离排序，已排好序）。
-    // 未达到裁剪数量门槛的编辑器不参与配额：直接允许其所有已注册形状，
-    // 让小白板像关闭视野裁剪一样完整加载，避免出现可见的加载过程。
+    // 第二步：准入环（视口 + 外扩环）内按距离分配配额，排序已保证视口内
+    // 形状优先于环内形状。两层各自计数：视口内消耗 maxActive，环内其余形状
+    // 消耗独立的环配额（同为 maxActive）——正常密度的画板在准入环内不会出现
+    // 轻量预览，远景高密度时由配额兜底。未达到裁剪数量门槛的编辑器不参与
+    // 配额（整板放行，见 bulkReady 分支）。
+    let ringAllowedCount = 0
     for (const item of sortable) {
       if (item.editing) continue
       if (item.meta.inViewport) {
         if (item.cullingActive && allowedCount >= maxActive) continue
         allowedSet.add(item.id)
         if (item.cullingActive) allowedCount++
-      } else if (!item.cullingActive) {
+      } else if (item.inAdmissionZone && item.cullingActive) {
+        if (ringAllowedCount >= maxActive) continue
+        allowedSet.add(item.id)
+        ringAllowedCount++
+      } else if (!item.cullingActive && item.bulkReady) {
         allowedSet.add(item.id)
       }
     }

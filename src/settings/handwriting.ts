@@ -107,7 +107,7 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
                 { type: "select", title: "画板数据块备用创建位置", description: "选择日记本", key: "tl-draw-create-note-id", value: ctx.settings["tl-draw-create-note-id"], options: (() => { const nb = (window as any).siyuan?.notebooks; if (!Array.isArray(nb) || !nb.length) return { "": "无可用日记本" }; return Object.fromEntries(nb.map((n: any) => [n.id, n.name])); })() },
                 { type: "checkbox", title: "同步删除(不建议启用)", description: "删除画板块时同步删除笔记块", key: "SyncDelete", value: ctx.settings["SyncDelete"] },
                 { type: "checkbox", title: "全局禁止 JS 块执行脚本", description: "启用后所有 JS 形状将不执行脚本代码（安全模式）", key: "js-shape-disable-execution", value: ctx.settings["js-shape-disable-execution"] },
-                { type: "number", title: "最大激活形状数", description: "限制同时激活的形状数量以节省资源", key: "tldraw-max-active-shapes", value: ctx.settings["tldraw-max-active-shapes"] },
+                { type: "number", title: "最大激活形状数", description: "视口内与准入环（视口外扩区域）内各自允许保持完整内容（不进入轻量预览）的形状数量上限，两层分别计数。默认 40。", key: "tldraw-max-active-shapes", value: ctx.settings["tldraw-max-active-shapes"] },
                 { type: "number", title: "Card / 单块轻量预览阈值", description: "Card 或单块的屏幕最小边小于此像素值时只显示轻量预览；设为 0 可关闭。默认 48。", key: "tldraw-card-low-detail-threshold", value: ctx.settings["tldraw-card-low-detail-threshold"] },
                 { type: "number", title: "Card / 单块轻量预览数量阈值", description: "当前视区内 Card 与单块数量达到此值后才按屏幕尺寸启用轻量预览；设为 0 表示不限制数量。默认 90。", key: "tldraw-card-low-detail-count-threshold", value: ctx.settings["tldraw-card-low-detail-count-threshold"] },
                 {
