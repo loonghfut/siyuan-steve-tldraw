@@ -6,13 +6,18 @@
     import { WhiteboardFileManager, WHITEBOARD_TRASH_DIR } from '../whiteboard-file-manager';
     import { closeTab } from '../tldraw-instance-manager';
     import WhiteboardCard from './whiteboard-card.svelte';
-    import type { WhiteboardItem, PreviewShape } from '../utils/whiteboard-utils';
-    import { extractDrawingId, parseSyTimestamp, projectAllShapes, SVG_PAD } from '../utils/whiteboard-utils';
+    import WhiteboardViewSwitcher from './WhiteboardViewSwitcher.svelte';
+    import WhiteboardContextMenu from './WhiteboardContextMenu.svelte';
+    import type { WhiteboardItem } from '../utils/whiteboard-utils';
+    import { extractDrawingId, parseSyTimestamp, projectAllShapes, formatTime, formatRelativeTime, parseBlockTags, latestWhiteboardUpdate, pointerMenuPosition, SVG_PAD, SHAPE_FILL, SHAPE_STROKE, SHAPE_RX } from '../utils/whiteboard-utils';
+    import { fetchWhiteboardShapes } from '../utils/whiteboard-preview';
+    import { whiteboardViewMode, whiteboardSortKey, MANAGER_SORT_OPTIONS } from './whiteboard-view-prefs';
 
     export let plugin: Plugin;
 
-    interface TagGroup {
-        name: string;
+    interface ViewSection {
+        key: string;
+        name?: string;
         items: WhiteboardItem[];
     }
 
@@ -23,22 +28,21 @@
         item: WhiteboardItem | null;
     }
 
-    
+
 
     let allItems: WhiteboardItem[] = [];
     let filteredItems: WhiteboardItem[] = [];
-    let galleryItems: WhiteboardItem[] = [];
-    let galleryGroups: TagGroup[] = [];
+    let viewSections: ViewSection[] = [];
     let searchQuery = '';
     let showOnlyValid = true;
     let loading = true;
-    let sortKey: 'blkUpdated-desc' | 'blkUpdated-asc' | 'blkCreated-desc' | 'blkCreated-asc' | 'title' | 'id' = 'blkUpdated-desc';
     let groupByTag = false;
 
     let availableTags: string[] = [];
     let selectedTagFilter = '';
 
     let contextMenu: ContextMenuState = { visible: false, x: 0, y: 0, item: null };
+    let rootEl: HTMLDivElement; // 面板根元素：右键菜单定位基准（position: relative）
 
     let selectedIds: Set<string> = new Set();
     let selectedItems: WhiteboardItem[] = [];
@@ -133,7 +137,7 @@
                 collectAvailableTags();
                 // 触发响应式更新
                 filteredItems = filteredItems;
-                buildGalleryData();
+                buildViewSections();
             }
 
             showMessage('标签已保存', 2000, 'info');
@@ -194,14 +198,14 @@
     $: {
         searchQuery;
         showOnlyValid;
-        sortKey;
+        $whiteboardSortKey;
         selectedTagFilter;
         applyFilters();
     }
     $: {
         filteredItems;
         groupByTag;
-        buildGalleryData();
+        buildViewSections();
     }
     $: {
         pruneSelection();
@@ -244,6 +248,7 @@
                     mtime: parseSyTimestamp(file.mtime),
                     tags: [],
                     loadingPreview: false,
+                    previewLoaded: false,
                     shapes: [],
                     previewError: undefined,
                 };
@@ -254,7 +259,7 @@
                         item.exists = true;
                         item.blkCreated = parseSyTimestamp(blk.created);
                         item.blkUpdated = parseSyTimestamp(blk.updated);
-                        item.tags = blk.tag ? blk.tag.match(/#([^#]+)#/g)?.map(t => t.replace(/#/g, '')) || [] : [];
+                        item.tags = parseBlockTags(blk.tag);
                         item.docId = blk.root_id || undefined;
 
                         if (blk.root_id) {
@@ -312,10 +317,12 @@
             list = list.filter(item => item.tags.includes(selectedTagFilter));
         }
 
-        switch (sortKey) {
+        switch ($whiteboardSortKey) {
+            case 'mtime-desc':
             case 'blkUpdated-desc':
                 list.sort((a, b) => b.blkUpdated - a.blkUpdated);
                 break;
+            case 'mtime-asc':
             case 'blkUpdated-asc':
                 list.sort((a, b) => a.blkUpdated - b.blkUpdated);
                 break;
@@ -331,12 +338,15 @@
             case 'id':
                 list.sort((a, b) => a.id.localeCompare(b.id));
                 break;
+            case 'exists':
+                list.sort((a, b) => Number(b.exists) - Number(a.exists));
+                break;
         }
 
         filteredItems = list;
     }
 
-    function buildGalleryData() {
+    function buildViewSections() {
         if (groupByTag) {
             const tagMap = new Map<string, WhiteboardItem[]>();
             filteredItems.forEach(item => {
@@ -352,13 +362,11 @@
                     });
                 }
             });
-            galleryGroups = Array.from(tagMap.entries())
+            viewSections = Array.from(tagMap.entries())
                 .sort((a, b) => a[0].localeCompare(b[0]))
-                .map(([name, items]) => ({ name, items }));
-            galleryItems = [];
+                .map(([name, items]) => ({ key: 'tag:' + name, name, items }));
         } else {
-            galleryItems = filteredItems.slice();
-            galleryGroups = [];
+            viewSections = [{ key: 'all', items: filteredItems.slice() }];
         }
     }
 
@@ -431,12 +439,12 @@
         lastSelectedId = item.id;
     }
 
-    // function handleSelectChange(event: Event, item: WhiteboardItem) {
-    //     event.stopPropagation();
-    //     const target = event.currentTarget as HTMLInputElement;
-    //     const useRange = (event as MouseEvent).shiftKey;
-    //     toggleSelection(item, target.checked, useRange);
-    // }
+    // 列表/紧凑视图中复选框的选择处理（支持 Shift 范围选择）
+    function handleRowSelect(event: Event, item: WhiteboardItem) {
+        event.stopPropagation();
+        const target = event.currentTarget as HTMLInputElement;
+        toggleSelection(item, target.checked, (event as MouseEvent).shiftKey);
+    }
 
     function selectAllVisible() {
         const next = new Set(selectedIds);
@@ -555,13 +563,11 @@
 
     // 标签编辑、批量添加/移除与多选相关逻辑已移除
 
+    // 右键菜单以面板根元素为定位基准（position: absolute），坐标由工具函数换算并夹取在面板范围内
     function handleContextMenu(event: MouseEvent, item: WhiteboardItem) {
         event.preventDefault();
-        const menuWidth = 180;
-        const menuHeight = 200;
-        const posX = Math.min(event.clientX, window.innerWidth - menuWidth);
-        const posY = Math.min(event.clientY, window.innerHeight - menuHeight);
-        contextMenu = { visible: true, x: posX, y: posY, item };
+        const { x, y } = pointerMenuPosition(rootEl, event, 180, 210);
+        contextMenu = { visible: true, x, y, item };
     }
 
     function closeContextMenu() {
@@ -595,7 +601,7 @@
                 item.exists = true;
                 item.blkCreated = parseSyTimestamp(blk.created);
                 item.blkUpdated = parseSyTimestamp(blk.updated);
-                item.tags = blk.tag ? blk.tag.match(/#([^#]+)#/g)?.map(t => t.replace(/#/g, '')) || [] : [];
+                item.tags = parseBlockTags(blk.tag);
                 item.docId = blk.root_id || undefined;
 
                 if (blk.root_id) {
@@ -615,6 +621,7 @@
             item.previewRects = [];
             item.previewError = undefined;
             item.loadingPreview = false;
+            item.previewLoaded = false;
 
             // 触发响应式更新
             const idx = allItems.findIndex(i => i.id === item.id);
@@ -630,10 +637,10 @@
                 filteredItems = filteredItems;
             }
 
-            // 重新收集标签并更新过滤列表和画廊数据
+            // 重新收集标签并更新过滤列表和视图数据
             collectAvailableTags();
             applyFilters();
-            buildGalleryData();
+            buildViewSections();
 
             showMessage('已刷新', 1500, 'info');
         } catch (e) {
@@ -669,40 +676,7 @@
         if (item.loadingPreview || item.shapes.length > 0 || item.previewError) return;
         item.loadingPreview = true;
         try {
-            const raw = await api.getFile(item.path);
-            let json: any;
-            if (typeof raw === 'string') {
-                json = JSON.parse(raw);
-            } else if (raw instanceof ArrayBuffer) {
-                const text = new TextDecoder().decode(raw);
-                json = JSON.parse(text);
-            } else if (ArrayBuffer.isView(raw)) {
-                const view = raw as ArrayBufferView;
-                const typed = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-                const text = new TextDecoder().decode(typed);
-                json = JSON.parse(text);
-            } else {
-                json = raw;
-            }
-            const doc = json?.document ?? json;
-            let shapeEntries: Array<[string, any]> = [];
-            if (doc?.shapes && typeof doc.shapes === 'object') {
-                shapeEntries = Object.entries(doc.shapes);
-            } else if (doc?.store && typeof doc.store === 'object') {
-                shapeEntries = Object.entries(doc.store).filter(([key]) => key.startsWith('shape:'));
-            }
-
-            const shapes: PreviewShape[] = [];
-            const sample = shapeEntries.length ? shapeEntries : Object.entries(doc || {}).slice(0, 120);
-            for (const [sid, s] of sample.slice(0, 120)) {
-                const data: any = s;
-                const px = typeof data?.x === 'number' ? data.x : data?.props?.x || 0;
-                const py = typeof data?.y === 'number' ? data.y : data?.props?.y || 0;
-                const w = Number(data?.props?.w ?? data?.props?.width ?? data?.width ?? 0) || 120;
-                const h = Number(data?.props?.h ?? data?.props?.height ?? data?.height ?? 0) || 80;
-                shapes.push({ id: sid, type: data?.type, x: px, y: py, w, h });
-            }
-
+            const shapes = await fetchWhiteboardShapes(item.path);
             item.shapes = shapes;
             item.previewRects = projectAllShapes(shapes, 300, 200, SVG_PAD);
         } catch (e) {
@@ -710,11 +684,11 @@
             item.previewError = '预览失败';
         } finally {
             item.loadingPreview = false;
+            item.previewLoaded = true;
             // trigger reactive updates for arrays used in template
             allItems = allItems;
             filteredItems = filteredItems;
-            galleryItems = galleryItems;
-            galleryGroups = galleryGroups;
+            viewSections = viewSections;
             try { await tick(); } catch {}
         }
     }
@@ -788,13 +762,10 @@
             bind:value={searchQuery} />
         <span class="fn__space"></span>
 
-        <select class="b3-select select-sort" bind:value={sortKey}>
-            <option value="blkUpdated-desc">块更新时间↓</option>
-            <option value="blkUpdated-asc">块更新时间↑</option>
-            <option value="blkCreated-desc">块创建时间↓</option>
-            <option value="blkCreated-asc">块创建时间↑</option>
-            <option value="title">标题</option>
-            <option value="id">ID</option>
+        <select class="b3-select select-sort" bind:value={$whiteboardSortKey}>
+            {#each MANAGER_SORT_OPTIONS as opt (opt.key)}
+                <option value={opt.key}>{opt.label}</option>
+            {/each}
         </select>
         <span class="fn__space"></span>
 
@@ -807,6 +778,9 @@
             </select>
             <span class="fn__space"></span>
         {/if}
+
+        <WhiteboardViewSwitcher />
+        <span class="fn__space"></span>
 
         <button
             type="button"
@@ -891,15 +865,19 @@
         <div class="empty">暂无匹配白板</div>
     {:else}
         <div class="gallery-scroll">
-            {#if groupByTag}
-                {#each galleryGroups as group}
-                    <section class="tag-group">
+            {#each viewSections as sec (sec.key)}
+                <section class="tag-group" class:plain={!sec.name}>
+                    {#if sec.name}
                         <header class="tag-group__header">
-                            <span class="tag-group__name">{group.name}</span>
-                            <span class="tag-group__count">{group.items.length}</span>
+                            <span class="tag-group__name">{sec.name}</span>
+                            <span class="tag-group__count">{sec.items.length}</span>
                         </header>
+                    {/if}
+
+                    {#if $whiteboardViewMode === 'card'}
+                        <!-- 卡片视图 -->
                         <div class="card-grid">
-                            {#each group.items as item (item.id + group.name)}
+                            {#each sec.items as item (sec.key + ':' + item.id)}
                                 <WhiteboardCard
                                     {item}
                                     {selectedIds}
@@ -912,24 +890,75 @@
                                 />
                             {/each}
                         </div>
-                    </section>
-                {/each}
-            {:else}
-                <div class="card-grid">
-                    {#each galleryItems as item (item.id)}
-                        <WhiteboardCard
-                            {item}
-                            {selectedIds}
-                            {setupObserver}
-                            on:contextmenu={(e) => handleContextMenu(e.detail.originalEvent, e.detail.item)}
-                            on:select={(e) => toggleSelection(e.detail.item, e.detail.checked, e.detail.shiftKey)}
-                            on:openboard={() => openWhiteboard(item)}
-                            on:opendoc={() => openDocument(item)}
-                            on:edittags={() => startEditTags(item)}
-                        />
-                    {/each}
-                </div>
-            {/if}
+                    {:else if $whiteboardViewMode === 'list'}
+                        <!-- 列表视图 -->
+                        <div class="rows">
+                            {#each sec.items as item (sec.key + ':' + item.id)}
+                                <div class="list-row" role="button" tabindex="0"
+                                    class:selected={selectedIds.has(item.id)}
+                                    title={item.title + (latestWhiteboardUpdate(item) ? '\n' + formatTime(latestWhiteboardUpdate(item)) : '')}
+                                    on:click={() => openWhiteboard(item)}
+                                    on:contextmenu={(e) => handleContextMenu(e, item)}
+                                    on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openWhiteboard(item); } }}>
+                                    <label class="row-select" on:click|stopPropagation on:keydown|stopPropagation>
+                                        <input type="checkbox" checked={selectedIds.has(item.id)}
+                                            on:change={(e) => handleRowSelect(e, item)} />
+                                    </label>
+                                    <div class="row-thumb" use:setupObserver={item}>
+                                        {#if item.previewError}
+                                            <div class="thumb-fail"></div>
+                                        {:else if item.loadingPreview || !item.previewLoaded}
+                                            <div class="thumb-pending"></div>
+                                        {:else if item.shapes.length === 0}
+                                            <div class="thumb-blank"></div>
+                                        {:else}
+                                            <svg viewBox="0 0 300 200" class="preview-svg" preserveAspectRatio="xMidYMid meet">
+                                                {#each item.previewRects ?? [] as pos}
+                                                    <rect x={pos.x} y={pos.y} width={pos.w} height={pos.h} rx={SHAPE_RX} ry={SHAPE_RX} fill={SHAPE_FILL} stroke={SHAPE_STROKE} stroke-width="1" />
+                                                {/each}
+                                            </svg>
+                                        {/if}
+                                    </div>
+                                    <div class="row-main">
+                                        <div class="row-title">
+                                            <span class="rt-text">{item.title}</span>
+                                            {#if !item.exists}
+                                                <span class="mini-warn">无效</span>
+                                            {/if}
+                                        </div>
+                                        <div class="row-sub">
+                                            <span class="rs-time">{formatRelativeTime(latestWhiteboardUpdate(item)) || formatTime(latestWhiteboardUpdate(item))}</span>
+                                            {#if item.tags.length > 0}
+                                                <span class="rs-tags">{item.tags.slice(0, 3).map(t => '#' + t).join('　')}</span>
+                                            {/if}
+                                        </div>
+                                    </div>
+                                </div>
+                            {/each}
+                        </div>
+                    {:else}
+                        <!-- 紧凑视图 -->
+                        <div class="rows compact">
+                            {#each sec.items as item (sec.key + ':' + item.id)}
+                                <div class="compact-row" role="button" tabindex="0"
+                                    class:selected={selectedIds.has(item.id)}
+                                    title={item.title + '\n' + item.id + '\n' + formatTime(latestWhiteboardUpdate(item))}
+                                    on:click={() => openWhiteboard(item)}
+                                    on:contextmenu={(e) => handleContextMenu(e, item)}
+                                    on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openWhiteboard(item); } }}>
+                                    <label class="row-select" on:click|stopPropagation on:keydown|stopPropagation>
+                                        <input type="checkbox" checked={selectedIds.has(item.id)}
+                                            on:change={(e) => handleRowSelect(e, item)} />
+                                    </label>
+                                    <span class="status-dot" class:miss={!item.exists}></span>
+                                    <span class="cr-title">{item.title}</span>
+                                    <span class="cr-time">{formatRelativeTime(latestWhiteboardUpdate(item))}</span>
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                </section>
+            {/each}
         </div>
     {/if}
 
@@ -998,30 +1027,12 @@
     {/if}
 
     {#if contextMenu.visible && contextMenu.item}
-        <div
-            class="whiteboard-context-menu"
-            role="menu"
-            aria-label="白板菜单"
-            tabindex="0"
-            style={`left:${contextMenu.x}px;top:${contextMenu.y}px;`}
-            on:click={(event) => event.stopPropagation()}
-            on:keydown={(event) => event.stopPropagation()}>
-            <button type="button" role="menuitem" on:click={() => handleMenuAction('board')}>
-                打开白板
-            </button>
-            <button type="button" role="menuitem" on:click={() => handleMenuAction('doc')} disabled={!contextMenu.item.docId}>
-                跳转文档
-            </button>
-            <button type="button" role="menuitem" on:click={() => handleMenuAction('refresh')}>
-                刷新
-            </button>
-            <button type="button" role="menuitem" on:click={() => handleMenuAction('backup')}>
-                备份
-            </button>
-            <button type="button" role="menuitem" class="danger" on:click={() => handleMenuAction('delete')}>
-                删除
-            </button>
-        </div>
+        <WhiteboardContextMenu
+            x={contextMenu.x}
+            y={contextMenu.y}
+            docId={contextMenu.item.docId}
+            on:action={(e) => handleMenuAction(e.detail)}
+        />
     {/if}
 </div>
 
@@ -1031,6 +1042,8 @@
     flex-direction: column;
     height: 100%;
     background: var(--b3-theme-background);
+    /* 右键菜单定位基准（菜单为 absolute） */
+    position: relative;
 }
 
 .toolbar {
@@ -1120,6 +1133,11 @@
     margin-bottom: 24px;
 }
 
+/* 非分组模式下的单一 section 不需要额外间距 */
+.tag-group.plain {
+    margin-bottom: 0;
+}
+
 .tag-group__header {
     display: flex;
     align-items: center;
@@ -1136,40 +1154,190 @@
     color: var(--b3-theme-on-surface-light);
 }
 
-.whiteboard-context-menu {
-    position: fixed;
-    z-index: 10;
-    background: var(--b3-theme-surface);
-    border: 1px solid var(--b3-border-color);
-    border-radius: 8px;
-    box-shadow: 0 16px 32px rgba(0, 0, 0, 0.18);
+/* ================= 列表视图 / 紧凑视图 ================= */
+.rows {
     display: flex;
     flex-direction: column;
-    min-width: 160px;
-    overflow: hidden;
+    gap: 2px;
 }
 
-.whiteboard-context-menu button {
-    border: none;
-    background: none;
-    padding: 10px 16px;
-    text-align: left;
-    font-size: 13px;
+.list-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+    border-radius: 8px;
     cursor: pointer;
-    color: var(--b3-theme-on-background);
+    outline: none;
+    transition: background-color 0.12s ease, box-shadow 0.12s ease;
 }
-
-.whiteboard-context-menu button:hover {
+.list-row:hover {
     background: var(--b3-list-hover);
 }
-
-.whiteboard-context-menu button.danger {
-    color: var(--b3-theme-error);
+.list-row:focus-visible {
+    box-shadow: 0 0 0 2px var(--b3-theme-primary);
+}
+.list-row.selected,
+.compact-row.selected {
+    background: var(--b3-theme-primary-lightest);
 }
 
-.whiteboard-context-menu button:disabled {
+.row-select {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+.row-select input {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    accent-color: var(--b3-theme-primary);
+}
+
+.row-thumb {
+    width: 72px;
+    aspect-ratio: 3 / 2;
+    flex-shrink: 0;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--b3-border-color);
+    background: var(--b3-theme-background);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+.preview-svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    user-select: none;
+}
+.row-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.row-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.rt-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.mini-warn {
+    font-size: 10px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: var(--b3-theme-error);
+    color: #fff;
+    flex-shrink: 0;
+}
+.row-sub {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.65;
+    min-width: 0;
+}
+.rs-time {
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+.rs-tags {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* 缩略图占位 */
+.thumb-pending {
+    width: 60%;
+    height: 60%;
+    border-radius: 4px;
+    animation: wbFadePulse 1.8s infinite;
+    background: var(--b3-list-hover);
+}
+.thumb-blank,
+.thumb-fail {
+    width: 55%;
+    height: 55%;
+    border-radius: 4px;
+    border: 1px dashed var(--b3-border-color);
+}
+.thumb-fail {
+    border-color: var(--b3-theme-error);
     opacity: 0.5;
-    cursor: not-allowed;
+}
+
+.rows.compact {
+    gap: 0;
+}
+.compact-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    outline: none;
+    transition: background-color 0.12s ease, box-shadow 0.12s ease;
+}
+.compact-row:hover {
+    background: var(--b3-list-hover);
+}
+.compact-row:focus-visible {
+    box-shadow: 0 0 0 2px var(--b3-theme-primary);
+}
+.compact-row .row-select input {
+    width: 13px;
+    height: 13px;
+}
+.status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--b3-theme-primary);
+    opacity: 0.7;
+}
+.status-dot.miss {
+    background: var(--b3-theme-error);
+    opacity: 0.6;
+}
+.cr-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.cr-time {
+    font-size: 10.5px;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.5;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+@keyframes wbFadePulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 0.7; }
 }
 
 .loading,

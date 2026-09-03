@@ -34,6 +34,8 @@ export interface WhiteboardItem {
     /** 预览 SVG 的投影结果，在加载文件时预计算。 */
     previewRects?: ProjectedRect[];
     previewError?: string;
+    /** 预览是否已尝试加载完成（用于区分"未加载"与"空白画板"） */
+    previewLoaded?: boolean;
 }
 
 /** Dock 面板使用的轻量卡片数据 (WhiteboardItem 的子集) */
@@ -253,4 +255,87 @@ export function formatTime(ms: number | undefined): string {
     } catch {
         return '-';
     }
+}
+
+/**
+ * 格式化时间戳为简短的相对时间（紧凑视图/列表视图使用）
+ * @param ms - 毫秒时间戳
+ * @returns 如 "刚刚"、"5 分钟前"、"3 天前"；超过一年回落到日期；无效时返回空串
+ */
+export function formatRelativeTime(ms: number | undefined): string {
+    if (!ms || !Number.isFinite(ms) || ms <= 0) return '';
+    const diff = Date.now() - ms;
+    if (diff < 60_000) return '刚刚';
+    const minutes = Math.floor(diff / 60_000);
+    if (minutes < 60) return `${minutes} 分钟前`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} 小时前`;
+    const days = Math.floor(hours / 24);
+    if (days < 31) return `${days} 天前`;
+    try {
+        return new Date(ms).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * 取白板条目的"最近活动时间"：块更新时间 > 文档更新时间 > 文件 mtime
+ */
+export function latestWhiteboardUpdate(item: { blkUpdated?: number; docUpdated?: number; mtime?: number }): number {
+    return item.blkUpdated || item.docUpdated || item.mtime || 0;
+}
+
+/**
+ * 从块属性 tag 字段解析标签数组，形如 "#a##b#" → ["a", "b"]
+ */
+export function parseBlockTags(tag?: string | null): string[] {
+    if (!tag) return [];
+    return tag.match(/#([^#]+)#/g)?.map(t => t.replace(/#/g, '')) || [];
+}
+
+// ==================== 面板内浮层菜单定位 ====================
+
+/** 浮层菜单位置，相对面板根元素的坐标 */
+export interface MenuPosition {
+    x: number;
+    y: number;
+}
+
+/**
+ * 计算跟随鼠标指针的菜单位置，并夹取在面板范围内。
+ * 菜单必须以面板根元素为定位基准（菜单 position: absolute，根元素 position: relative）。
+ */
+export function pointerMenuPosition(
+    panel: HTMLElement,
+    event: MouseEvent,
+    menuWidth: number,
+    menuHeight: number
+): MenuPosition {
+    const rect = panel.getBoundingClientRect();
+    const x = Math.max(4, Math.min(event.clientX - rect.left, rect.width - menuWidth - 4));
+    const y = Math.max(4, Math.min(event.clientY - rect.top, rect.height - menuHeight - 4));
+    return { x, y };
+}
+
+/**
+ * 计算锚定在某个工具栏按钮（如排序按钮）下方、右对齐按钮的菜单位置。
+ * 提供 menuHeight 时会把菜单底部夹取在面板范围内。
+ */
+export function anchoredMenuPosition(
+    panel: HTMLElement,
+    anchor: HTMLElement,
+    menuWidth: number,
+    menuHeight?: number
+): MenuPosition {
+    const rect = panel.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    let y = anchorRect.bottom - rect.top + 6;
+    if (menuHeight && menuHeight > 0) {
+        y = Math.max(4, Math.min(y, rect.height - menuHeight - 4));
+    }
+    return {
+        x: Math.max(4, anchorRect.right - menuWidth - rect.left),
+        y,
+    };
 }
