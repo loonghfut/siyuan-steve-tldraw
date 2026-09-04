@@ -11,28 +11,21 @@ const SORT_KEY_STORAGE_KEY = 'sttools-whiteboard-sort-key';
 
 export const WHITEBOARD_VIEW_MODES: WhiteboardViewMode[] = ['card', 'list', 'compact'];
 
-/** 各面板共用的排序项（mtime 按各自面板的"最近活动时间"语义解释） */
-export const COMMON_SORT_OPTIONS: { key: string; label: string }[] = [
+/**
+ * 两面板统一的排序项。此前 dock 仅支持公共项、管理器额外支持创建时间，
+ * 且共享同一 sortKey 却各自解释，导致同键不同序。现统一为单一集合与语义。
+ */
+export const WHITEBOARD_SORT_OPTIONS: { key: string; label: string }[] = [
     { key: 'mtime-desc', label: '最近更新' },
     { key: 'mtime-asc', label: '最早更新' },
+    { key: 'blkCreated-desc', label: '按创建时间（新→旧）' },
+    { key: 'blkCreated-asc', label: '按创建时间（旧→新）' },
     { key: 'title', label: '按标题' },
     { key: 'id', label: '按块 ID' },
     { key: 'exists', label: '按存在状态' },
 ];
 
-/** 高级管理面板在公共项之外追加的排序项 */
-export const MANAGER_EXTRA_SORT_OPTIONS: { key: string; label: string }[] = [
-    { key: 'blkCreated-desc', label: '按创建时间（新→旧）' },
-    { key: 'blkCreated-asc', label: '按创建时间（旧→新）' },
-];
-
-/** 高级管理面板完整的排序项 */
-export const MANAGER_SORT_OPTIONS: { key: string; label: string }[] = [
-    ...COMMON_SORT_OPTIONS,
-    ...MANAGER_EXTRA_SORT_OPTIONS,
-];
-
-const ALL_SORT_KEYS = new Set(MANAGER_SORT_OPTIONS.map(o => o.key));
+const ALL_SORT_KEYS = new Set(WHITEBOARD_SORT_OPTIONS.map(o => o.key));
 
 function loadStored(key: string, valid: (v: string) => boolean): string | null {
     try {

@@ -15,41 +15,72 @@ export interface PreviewShape {
     h: number;
 }
 
-/** 管理器/卡片组件使用的完整白板数据项 */
-export interface WhiteboardItem {
+/**
+ * 统一的白板数据项：dock 卡片面板与高级管理面板共用同一模型。
+ * 取代此前分裂的 WhiteboardItem 与两处 WhiteboardCard，消除字段/语义不一致。
+ */
+export interface WhiteboardEntry {
     id: string;
     fileName: string;
     path: string;
     title: string;
     exists: boolean;
+    docId?: string;
+    tags: string[];
+    /** 块/文档时间戳（毫秒），缺失为 0 */
     blkCreated: number;
     blkUpdated: number;
     docCreated: number;
     docUpdated: number;
-    docId?: string;
-    mtime: number;
-    tags: string[];
+    /** 数据文件修改时间（毫秒） */
+    fileMtime: number;
+    /** 派生：最近活动时间 = blkUpdated||docUpdated||blkCreated||docCreated||fileMtime */
+    updatedAt: number;
+    /** 派生：创建时间 = blkCreated||docCreated||fileMtime */
+    createdAt: number;
+    /** 预览状态 */
     loadingPreview: boolean;
+    /** 预览是否已尝试加载完成（用于区分"未加载"与"空白画板"） */
+    previewLoaded: boolean;
     shapes: PreviewShape[];
-    /** 预览 SVG 的投影结果，在加载文件时预计算。 */
+    /** 预览 SVG 的投影结果，在加载文件时预计算 */
     previewRects?: ProjectedRect[];
     previewError?: string;
-    /** 预览是否已尝试加载完成（用于区分"未加载"与"空白画板"） */
-    previewLoaded?: boolean;
 }
 
-/** Dock 面板使用的轻量卡片数据 (WhiteboardItem 的子集) */
-export interface WhiteboardCard {
+/** 统一 UI 文案常量，避免两面板措辞不一致（此前 "无附属" vs "无效"） */
+export const MISSING_BLOCK_LABEL = '无附属块';
+export const UNTITLED_DOC_LABEL = '未命名文档';
+
+/** 构造一个基础（未填充元数据）的白板条目 */
+export function createBaseEntry(input: {
     id: string;
     fileName: string;
     path: string;
-    title: string;
-    exists: boolean;
-    mtime: number;
-    loadingPreview: boolean;
-    shapes: PreviewShape[];
-    previewRects?: ProjectedRect[];
-    error?: string;
+    fileMtime?: number;
+}): WhiteboardEntry {
+    const fileMtime = input.fileMtime || 0;
+    return {
+        id: input.id,
+        fileName: input.fileName,
+        path: input.path,
+        title: UNTITLED_DOC_LABEL,
+        exists: false,
+        docId: undefined,
+        tags: [],
+        blkCreated: 0,
+        blkUpdated: 0,
+        docCreated: 0,
+        docUpdated: 0,
+        fileMtime,
+        updatedAt: fileMtime,
+        createdAt: fileMtime,
+        loadingPreview: false,
+        previewLoaded: false,
+        shapes: [],
+        previewRects: undefined,
+        previewError: undefined,
+    };
 }
 
 /** computeBounds 返回的包围盒 */
@@ -280,10 +311,52 @@ export function formatRelativeTime(ms: number | undefined): string {
 }
 
 /**
- * 取白板条目的"最近活动时间"：块更新时间 > 文档更新时间 > 文件 mtime
+ * 统一标题解析：优先 fcontent（首行内容），其次 content，最后占位。
+ * 修复此前 dock 用 content、管理器用 fcontent||content 导致同一白板标题不一致。
  */
-export function latestWhiteboardUpdate(item: { blkUpdated?: number; docUpdated?: number; mtime?: number }): number {
-    return item.blkUpdated || item.docUpdated || item.mtime || 0;
+export function resolveEntryTitle(docBlk?: { fcontent?: string; content?: string } | null): string {
+    if (!docBlk) return UNTITLED_DOC_LABEL;
+    return docBlk.fcontent || docBlk.content || UNTITLED_DOC_LABEL;
+}
+
+/** 派生"最近活动时间"：块更新 > 文档更新 > 块创建 > 文档创建 > 文件 mtime */
+export function computeUpdatedAt(t: Partial<WhiteboardEntry>): number {
+    return t.blkUpdated || t.docUpdated || t.blkCreated || t.docCreated || t.fileMtime || 0;
+}
+
+/** 派生"创建时间"：块创建 > 文档创建 > 文件 mtime */
+export function computeCreatedAt(t: Partial<WhiteboardEntry>): number {
+    return t.blkCreated || t.docCreated || t.fileMtime || 0;
+}
+
+/**
+ * 唯一的排序实现：dock 与管理器共享同一 whiteboardSortKey，
+ * 必须产生完全一致的顺序（修复此前两面板同键不同序）。
+ */
+export function sortEntries(list: WhiteboardEntry[], sortKey: string): WhiteboardEntry[] {
+    const arr = list.slice();
+    switch (sortKey) {
+        case 'mtime-desc': arr.sort((a, b) => b.updatedAt - a.updatedAt); break;
+        case 'mtime-asc': arr.sort((a, b) => a.updatedAt - b.updatedAt); break;
+        case 'blkCreated-desc': arr.sort((a, b) => b.createdAt - a.createdAt); break;
+        case 'blkCreated-asc': arr.sort((a, b) => a.createdAt - b.createdAt); break;
+        case 'title': arr.sort((a, b) => a.title.localeCompare(b.title)); break;
+        case 'id': arr.sort((a, b) => a.id.localeCompare(b.id)); break;
+        case 'exists': arr.sort((a, b) => Number(b.exists) - Number(a.exists)); break;
+    }
+    return arr;
+}
+
+/** 搜索匹配：id / 标题 / 文件名 / 标签，任一命中即可（空查询视为全部命中） */
+export function entryMatchesQuery(entry: WhiteboardEntry, rawQuery: string): boolean {
+    const q = (rawQuery || '').trim().toLowerCase();
+    if (!q) return true;
+    return (
+        entry.id.toLowerCase().includes(q) ||
+        entry.title.toLowerCase().includes(q) ||
+        entry.fileName.toLowerCase().includes(q) ||
+        entry.tags.some(tag => tag.toLowerCase().includes(q))
+    );
 }
 
 /**
