@@ -66,18 +66,8 @@ export const uiOverrides: TLUiOverrides = {
                 })
             },
         }
-        tools['mind-map'] = {
-            id: 'mind-map',
-            icon: 'mindmap',
-            label: 'Mind Map',
-            kbd: 'm',
-            onSelect: () => editor.setCurrentTool('mind-map'),
-            onDragStart: (_source, info) => {
-                onDragFromToolbarToCreateShape(editor, info, {
-                    createShape: (id) => editor.createShape({ id, type: 'mind-map' }),
-                })
-            },
-        }
+        // mind-map 工具已准备弃用：不再向工具栏/快捷键/拖拽创建暴露。
+        // 注意：MindMapShapeUtil 与 MindMapShapeTool 仍保留注册，以确保旧数据完整显示与选中编辑。
         tools.branch = {
             id: 'branch',
             icon: 'branch',

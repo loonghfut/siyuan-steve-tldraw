@@ -18,7 +18,6 @@ export const CustomKeyboardShortcutsDialog: React.FC<any> = (props) => {
             <TldrawUiMenuItem {...tools['single-block']} />
             <TldrawUiMenuItem {...tools['slide']} />
             <TldrawUiMenuItem {...tools['js-shape']} />
-            <TldrawUiMenuItem {...tools['mind-map']} />
             <TldrawUiMenuItem {...tools['branch']} />
             <DefaultKeyboardShortcutsDialogContent />
         </DefaultKeyboardShortcutsDialog>
