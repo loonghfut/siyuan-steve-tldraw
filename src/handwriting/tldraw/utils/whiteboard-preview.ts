@@ -246,16 +246,208 @@ function buildLineElement(shape: any, m: Mat): PreviewElement | null {
     return strokeFromLocalPoints(m, arr.map(p => ({ x: p.x, y: p.y })), { weight: strokeWeight(props), type: shape.type });
 }
 
-/** arrow：props.start / props.end 两点直线近似（忽略 bend） */
-function buildArrowElement(shape: any, m: Mat): PreviewElement | null {
+// ==================== 连接线（箭头 / 贝塞尔连接器） ====================
+// 绑定的连接线端点由 binding + 目标形状决定，props.start/end 仅在未绑定时有效（且可能已过期）。
+// 预览无 editor，故用目标形状的页面包围盒近似端口/锚点位置。
+
+/** 形状的页面包围盒 */
+interface PageBounds { minX: number; minY: number; maxX: number; maxY: number; }
+/** 按连接线 fromId 归组的 binding：{start,end} */
+type BindingMap = Map<string, { start?: any; end?: any }>;
+
+function clampNum(v: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, v));
+}
+
+function anchorPoint(b: PageBounds, nx: number, ny: number): { x: number; y: number } {
+    return { x: b.minX + nx * (b.maxX - b.minX), y: b.minY + ny * (b.maxY - b.minY) };
+}
+
+function centerPoint(b: PageBounds): { x: number; y: number } {
+    return anchorPoint(b, 0.5, 0.5);
+}
+
+/** 把图元的范围并入包围盒 */
+function expandBounds(bb: PageBounds, el: PreviewElement): void {
+    if (el.kind === 'rect') {
+        const x = el.x ?? 0, y = el.y ?? 0, w = el.w ?? 0, h = el.h ?? 0;
+        if (x < bb.minX) bb.minX = x;
+        if (y < bb.minY) bb.minY = y;
+        if (x + w > bb.maxX) bb.maxX = x + w;
+        if (y + h > bb.maxY) bb.maxY = y + h;
+    } else if (el.points) {
+        for (const p of el.points) {
+            if (p.x < bb.minX) bb.minX = p.x;
+            if (p.y < bb.minY) bb.minY = p.y;
+            if (p.x > bb.maxX) bb.maxX = p.x;
+            if (p.y > bb.maxY) bb.maxY = p.y;
+        }
+    }
+}
+
+/** 端口方向 → 归一化锚点（input=左/output=右/top=上/bottom=下，见 shape-ports） */
+const PORT_ANCHOR: Record<string, [number, number]> = {
+    input: [0, 0.5], left: [0, 0.5],
+    output: [1, 0.5], right: [1, 0.5],
+    top: [0.5, 0], bottom: [0.5, 1],
+};
+
+/** 提取端口方向：mind-map 端口形如 'nodeId:direction'，取最后一段 */
+function portDirection(portId?: string | null): string | null {
+    if (!portId) return null;
+    if (portId.includes(':')) return portId.split(':').pop() || null;
+    return portId;
+}
+
+/** auto 端口：按目标中心与对侧锚点的相对方位选边（对齐 resolveAutoPortId） */
+function resolveAutoDir(targetCenter: { x: number; y: number }, opposite: { x: number; y: number }): string {
+    const dx = opposite.x - targetCenter.x;
+    const dy = opposite.y - targetCenter.y;
+    if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? 'output' : 'input';
+    return dy >= 0 ? 'bottom' : 'top';
+}
+
+/** 未绑定端点：props 局部坐标经形状变换到页面空间 */
+function localPropPoint(shape: any, m: Mat, terminal: 'start' | 'end'): { x: number; y: number } | null {
+    const local = terminal === 'start' ? shape?.props?.start : shape?.props?.end;
+    if (local && typeof local.x === 'number' && typeof local.y === 'number') {
+        return applyPoint(m, local.x, local.y);
+    }
+    return null;
+}
+
+/** 箭头端点（页面空间）：绑定→目标包围盒锚点（precise 用 normalizedAnchor，否则中心）；未绑定→props */
+function resolveArrowTerminal(
+    shape: any, m: Mat, binding: any, shapeBounds: Map<string, PageBounds>, terminal: 'start' | 'end',
+): { x: number; y: number } | null {
+    if (binding && typeof binding.toId === 'string') {
+        const b = shapeBounds.get(binding.toId);
+        if (b) {
+            const p = binding.props;
+            let nx = 0.5, ny = 0.5;
+            if (p?.isPrecise && p?.normalizedAnchor && typeof p.normalizedAnchor.x === 'number' && typeof p.normalizedAnchor.y === 'number') {
+                nx = clampNum(p.normalizedAnchor.x, 0, 1);
+                ny = clampNum(p.normalizedAnchor.y, 0, 1);
+            }
+            return anchorPoint(b, nx, ny);
+        }
+    }
+    return localPropPoint(shape, m, terminal);
+}
+
+/** 箭头：两端解析为页面点后连成直线（忽略 bend/elbow 路由，缩略图级别足够） */
+function buildArrowElementBound(
+    shape: any, m: Mat, bindings: BindingMap, shapeBounds: Map<string, PageBounds>,
+): PreviewElement[] {
+    const b = bindings.get(shape.id) || {};
+    const s = resolveArrowTerminal(shape, m, b.start, shapeBounds, 'start');
+    const e = resolveArrowTerminal(shape, m, b.end, shapeBounds, 'end');
+    if (!s || !e || (s.x === e.x && s.y === e.y)) return [];
+    return [{ kind: 'stroke', points: [s, e], weight: strokeWeight(shape.props || {}), type: 'arrow' }];
+}
+
+/** 三次贝塞尔控制点（对齐 BezierConnectorShapeUtil.getConnectionControlPoints 的启发式） */
+function connectionControlPoints(
+    start: { x: number; y: number }, end: { x: number; y: number }, startDir: string | null, endDir: string | null,
+): [{ x: number; y: number }, { x: number; y: number }] {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const isV = (d: string | null) => d === 'top' || d === 'bottom';
+    const isH = (d: string | null) => d === 'input' || d === 'output' || d === 'left' || d === 'right';
+    const offsetAlong = (fwd: number, cross: number) =>
+        fwd >= 0 ? clampNum(fwd * 0.5 + Math.abs(cross) * 0.1, 40, 250) : clampNum(Math.abs(fwd) * 0.25 + 60, 60, 180);
+    const computeCp = (point: { x: number; y: number }, horizontal: boolean, vertical: boolean, dir: string | null, towardX: number, towardY: number) => {
+        if (horizontal) {
+            const sign = (dir === 'input' || dir === 'left') ? -1 : 1;
+            return { x: point.x + sign * offsetAlong(towardX * sign, towardY), y: point.y };
+        }
+        if (vertical) {
+            const sign = dir === 'top' ? -1 : 1;
+            return { x: point.x, y: point.y + sign * offsetAlong(towardY * sign, towardX) };
+        }
+        if (Math.abs(towardX) >= Math.abs(towardY)) {
+            const sign = towardX >= 0 ? 1 : -1;
+            return { x: point.x + sign * clampNum(Math.abs(towardX) * 0.5, 40, 250), y: point.y };
+        }
+        const sign = towardY >= 0 ? 1 : -1;
+        return { x: point.x, y: point.y + sign * clampNum(Math.abs(towardY) * 0.5, 40, 250) };
+    };
+    return [
+        computeCp(start, isH(startDir), isV(startDir), startDir, dx, dy),
+        computeCp(end, isH(endDir), isV(endDir), endDir, -dx, -dy),
+    ];
+}
+
+/** 采样三次贝塞尔为折线点 */
+function sampleCubic(
+    p0: { x: number; y: number }, p1: { x: number; y: number }, p2: { x: number; y: number }, p3: { x: number; y: number }, n: number,
+): { x: number; y: number }[] {
+    const pts: { x: number; y: number }[] = [];
+    for (let i = 0; i <= n; i++) {
+        const t = i / n, mt = 1 - t;
+        const a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
+        pts.push({ x: a * p0.x + b * p1.x + c * p2.x + d * p3.x, y: a * p0.y + b * p1.y + c * p2.y + d * p3.y });
+    }
+    return pts;
+}
+
+/** 贝塞尔连接器：解析两端端口→控制点→采样为折线 */
+function buildBezierElement(
+    shape: any, m: Mat, bindings: BindingMap, shapeBounds: Map<string, PageBounds>,
+): PreviewElement[] {
     const props = shape.props || {};
-    const s = props.start;
-    const e = props.end;
-    const localPts: { x: number; y: number }[] = [];
-    if (s && typeof s.x === 'number' && typeof s.y === 'number') localPts.push({ x: s.x, y: s.y });
-    if (e && typeof e.x === 'number' && typeof e.y === 'number') localPts.push({ x: e.x, y: e.y });
-    if (localPts.length < 2) return null;
-    return strokeFromLocalPoints(m, localPts, { weight: strokeWeight(props), type: shape.type });
+    const b = bindings.get(shape.id) || {};
+    // 先求两端粗略点（绑定→目标中心；未绑定→props），用于 auto 端口换边判定
+    const rough = (binding: any, terminal: 'start' | 'end'): { x: number; y: number } | null => {
+        if (binding && typeof binding.toId === 'string') {
+            const bb = shapeBounds.get(binding.toId);
+            if (bb) return centerPoint(bb);
+        }
+        return localPropPoint(shape, m, terminal);
+    };
+    const roughStart = rough(b.start, 'start');
+    const roughEnd = rough(b.end, 'end');
+
+    const resolveTerminal = (
+        binding: any, terminal: 'start' | 'end', opposite: { x: number; y: number } | null,
+    ): { point: { x: number; y: number } | null; dir: string | null } => {
+        if (binding && typeof binding.toId === 'string') {
+            const bb = shapeBounds.get(binding.toId);
+            if (bb) {
+                const rawPort = binding.props?.portId;
+                let dir = portDirection(rawPort);
+                if (!dir || rawPort === 'auto') {
+                    dir = opposite ? resolveAutoDir(centerPoint(bb), opposite) : 'output';
+                }
+                const anchor = PORT_ANCHOR[dir] || [0.5, 0.5];
+                return { point: anchorPoint(bb, anchor[0], anchor[1]), dir };
+            }
+        }
+        return { point: localPropPoint(shape, m, terminal), dir: null };
+    };
+
+    const S = resolveTerminal(b.start, 'start', roughEnd);
+    const E = resolveTerminal(b.end, 'end', roughStart);
+    if (!S.point || !E.point) return [];
+    const [cp1, cp2] = connectionControlPoints(S.point, E.point, S.dir, E.dir);
+    const pts = sampleCubic(S.point, cp1, cp2, E.point, 24);
+    const weight = Number(props.strokeWidth) || 2;
+    return [{ kind: 'stroke', points: simplifyPoints(pts), weight, type: 'bezier-connector' }];
+}
+
+/** 从 store 收集 binding 记录，按 fromId 归组为 {start,end} */
+function collectBindings(store: Record<string, any>): BindingMap {
+    const map: BindingMap = new Map();
+    for (const rec of Object.values(store)) {
+        if (!rec || typeof rec !== 'object' || rec.typeName !== 'binding') continue;
+        const fromId = rec.fromId;
+        const terminal = rec.props?.terminal;
+        if (typeof fromId !== 'string' || (terminal !== 'start' && terminal !== 'end')) continue;
+        let entry = map.get(fromId);
+        if (!entry) { entry = {}; map.set(fromId, entry); }
+        entry[terminal] = rec;
+    }
+    return map;
 }
 
 /** text：宽=props.w，高按 richText 行数（含按宽折行估算） */
@@ -312,10 +504,6 @@ function buildShapeElements(shape: any, m: Mat): PreviewElement[] {
             const el = buildLineElement(shape, m);
             return el ? [el] : [];
         }
-        case 'arrow': {
-            const el = buildArrowElement(shape, m);
-            return el ? [el] : [];
-        }
         case 'text': {
             const el = buildTextElement(shape, m);
             return el ? [el] : [];
@@ -358,21 +546,59 @@ export async function fetchWhiteboardElements(path: string): Promise<PreviewElem
     }
     if (shapes.length === 0) return [];
 
+    const bindings = collectBindings(store);
     const resolve = buildTransformResolver(byId);
-    const elements: PreviewElement[] = [];
-    for (const shape of shapes) {
-        if (elements.length >= MAX_PREVIEW_ELEMENTS) break;
-        let m: Mat;
+
+    const transformOf = (shape: any): Mat => {
         try {
-            m = resolve(shape);
+            return resolve(shape);
         } catch {
-            m = shapeLocalMatrix(shape);
+            return shapeLocalMatrix(shape);
         }
+    };
+
+    // 连接线（箭头/贝塞尔）延后处理：其端点依赖其它形状的页面包围盒
+    const CONNECTOR_TYPES = new Set(['arrow', 'bezier-connector']);
+    const normalShapes: any[] = [];
+    const connectors: any[] = [];
+    for (const s of shapes) {
+        if (CONNECTOR_TYPES.has(String(s?.type || ''))) connectors.push(s);
+        else normalShapes.push(s);
+    }
+
+    const shapeBounds = new Map<string, PageBounds>();
+    const elements: PreviewElement[] = [];
+    // 为连接线预留名额，避免普通形状填满上限后连接线被截掉
+    const shapeCap = Math.max(0, MAX_PREVIEW_ELEMENTS - connectors.length);
+
+    for (const shape of normalShapes) {
+        if (elements.length >= shapeCap) break;
+        const m = transformOf(shape);
         const built = buildShapeElements(shape, m);
+        if (!built.length) continue;
+        // 记录该形状的页面包围盒，供连接线端点解析
+        const id = typeof shape?.id === 'string' ? shape.id : undefined;
+        if (id) {
+            let bb = shapeBounds.get(id);
+            if (!bb) {
+                bb = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+                shapeBounds.set(id, bb);
+            }
+            for (const el of built) expandBounds(bb, el);
+        }
         for (const el of built) {
-            if (elements.length >= MAX_PREVIEW_ELEMENTS) break;
+            if (elements.length >= shapeCap) break;
             elements.push(el);
         }
     }
+
+    for (const shape of connectors) {
+        const m = transformOf(shape);
+        const built = String(shape?.type) === 'arrow'
+            ? buildArrowElementBound(shape, m, bindings, shapeBounds)
+            : buildBezierElement(shape, m, bindings, shapeBounds);
+        for (const el of built) elements.push(el);
+    }
+
     return elements;
 }
