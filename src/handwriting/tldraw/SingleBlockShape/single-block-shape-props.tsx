@@ -4,7 +4,7 @@ import { ISingleBlockShape } from './single-block-shape-types'
 export function getSingleBlockShapeDefaultProps(): ISingleBlockShape['props'] {
 	return {
 		w: 300,
-		h: 50,
+		h: 150,
 		color: 'black',
 		blockId: '',
 		previewText: '',
@@ -12,7 +12,7 @@ export function getSingleBlockShapeDefaultProps(): ISingleBlockShape['props'] {
 		fontSize: 22,
 		refreshNonce: Date.now(),
 		connectOnEnter: false,
-		transparentBackground: false,
+		transparentBackground: true,
 		allowBinding: true,
 		// 新建形状高度即生效为手动模式，不触发旧白板的一次性回填
 		heightBackfilled: true,

@@ -33,6 +33,7 @@ import { createArrowBetweenShapes } from '../utils/addConnectedSingleBlock'
 import { getShapeHostElement } from '../utils/getShapeHostElement'
 import { getCachedHtml, setCachedHtml, cacheFromProtyleHost, invalidateCache, requestBlockDOM, getBlockContent, renderSimpleBlockHtml, preloadBlockContent } from '../block-html-cache'
 import { renderAllContentIdle } from '../utils/render/content-renderer'
+import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
 import { cancelIdleRender, isIdleRenderCancelledError, isInteracting } from '../utils/idle-scheduler'
 import { scheduleBlockCheck } from '../utils/block-existence'
 import { clearStaticTextSelection, findStaticLinkTarget, openStaticLinkTarget } from '../utils/static-links'
@@ -136,7 +137,7 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 	getDefaultProps(): ISingleBlockShape['props'] {
 		return {
 			w: 300,
-			h: 50,
+			h: 150,
 			color: 'black',
 			blockId: '',
 			// 初始创建时标记为 true，用于后续在用户进入编辑时再创建实际的思源块
@@ -144,8 +145,8 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			fontSize: 22,
 			refreshNonce: Date.now(),
 			connectOnEnter: false,
-			// 默认不透明（带背景和边框）
-			transparentBackground: false,
+			// 默认透明（无背景和边框）
+			transparentBackground: true,
 			// 是否允许与其他形状建立绑定（默认允许）
 			allowBinding: true,
 			// 新建形状高度即生效为手动模式，不触发旧白板的一次性回填
@@ -220,8 +221,12 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 		const refreshNonceRef = useRef(shape.props.refreshNonce)
 		// 静态 HTML 内容（非编辑态显示）
 		const [staticHtml, setStaticHtml] = useState<string>('')
-		// 静态内容容器的 ref，用于渲染后执行 renderAllContent
+		// 静态内容容器的 ref，用于命令式挂载静态 wrapper
 		const staticContentRef = useRef<HTMLDivElement | null>(null)
+		// 命令式挂载的静态内容 wrapper（不受 React 协调，避免 avRender 结果被重渲染冲掉，与 Card 一致）
+		const staticWrapperRef = useRef<HTMLElement | null>(null)
+		// 富内容渲染的中止控制器（与 Card 的 richRenderAbortRef 一致）
+		const richRenderAbortRef = useRef<AbortController | null>(null)
 		// 标记内容是否已渲染（公式、图表等）
 		const [, setIsContentRendered] = useState(false)
 		const [isLoadingContent, setIsLoadingContent] = useState(false)
@@ -470,38 +475,71 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			return () => { cancelled = true }
 		}, [isEditingState, isSmallSingleBlock, shape.props.blockId, shape.props.refreshNonce, canLoad, persistPreviewText, persistLightweightPreviewText])
 
-		// ===== 静态内容渲染：在 staticHtml 挂载后执行 renderAllContentIdle =====
-		// 使用空闲调度，避免在拖动画布时阻塞主线程
+		// ===== 静态内容渲染：命令式挂载 + 富渲染 + 回写缓存（与 Card 一致）=====
+		// 关键：静态内容挂到不受 React 协调的 wrapper 上，avRender 的结果不会被重渲染冲掉；
+		// 渲染完成后把已渲染 HTML 回写缓存，重挂载时直接复用（数据库因此首帧即可显示）。
 		useEffect(() => {
-			if (!staticHtml || isEditingState || shouldUseLightweightPreview || !staticContentRef.current) return
+			if (isEditingState || shouldUseLightweightPreview || !staticHtml) return
+			const container = staticContentRef.current
+			if (!container) return
+
+			// 移除上一次挂载的 wrapper
+			if (staticWrapperRef.current?.parentElement) {
+				try { staticWrapperRef.current.parentElement.removeChild(staticWrapperRef.current) } catch { /* ignore */ }
+			}
+			staticWrapperRef.current = null
+
+			// 由 staticHtml 构建 wrapper：复用 .protyle-wysiwyg 根，避免“挂载→回写→再命中”层层嵌套
+			let wrapper: HTMLElement
+			const temp = document.createElement('div')
+			temp.innerHTML = staticHtml
+			const root = temp.firstElementChild
+			if (root instanceof HTMLElement && root.classList.contains('protyle-wysiwyg') && !root.nextElementSibling) {
+				wrapper = root
+			} else {
+				wrapper = document.createElement('div')
+				wrapper.className = 'protyle-wysiwyg protyle-wysiwyg--attr'
+				wrapper.innerHTML = staticHtml
+			}
+			wrapper.style.width = '100%'
+			// 解码 protyle-html（与 Card 一致），否则内嵌内容可能藏在 data-content 中不显示
+			try { convertProtyleHtmlToDom(wrapper) } catch (error) { console.warn('convertProtyleHtmlToDom failed', error) }
+
+			container.appendChild(wrapper)
+			staticWrapperRef.current = wrapper
 
 			// 重置渲染状态
 			setIsContentRendered(false)
 
-			// 生成唯一的渲染任务 ID
 			const renderTaskId = `render-static-${shape.id}`
+			const abortController = new AbortController()
+			richRenderAbortRef.current?.abort()
+			richRenderAbortRef.current = abortController
 			let cancelled = false
 
-			// 使用 requestAnimationFrame 确保 DOM 已更新
-			const rafId = requestAnimationFrame(() => {
-				if (staticContentRef.current) {
-					// 使用空闲调度渲染，在交互时会暂停；优先级跟随 ShapeLoadManager 的距离评分
-					renderAllContentIdle(staticContentRef.current, renderPriorityRef.current, renderTaskId).then(() => {
-						if (!cancelled) setIsContentRendered(true)
-					}).catch((error) => {
-						if (!isIdleRenderCancelledError(error)) {
-							console.warn('单块静态内容渲染失败:', error)
-						}
-					})
+			// forceIdle + signal：与 Card 一致，交互时暂停、离开视口可中止
+			renderAllContentIdle(wrapper, renderPriorityRef.current, renderTaskId, true, abortController.signal).then(() => {
+				if (cancelled) return
+				// 回写已渲染 HTML（含 data-render="true" 的数据库），后续重挂载直接复用
+				if (shape.props.blockId) setCachedHtml(shape.props.blockId, wrapper.outerHTML)
+				setIsContentRendered(true)
+			}).catch((error) => {
+				if (!isIdleRenderCancelledError(error)) {
+					console.warn('单块静态内容渲染失败:', error)
 				}
 			})
 
 			return () => {
 				cancelled = true
-				cancelAnimationFrame(rafId)
+				abortController.abort()
+				if (richRenderAbortRef.current === abortController) richRenderAbortRef.current = null
 				cancelIdleRender(renderTaskId)
+				if (wrapper.parentElement) {
+					try { wrapper.parentElement.removeChild(wrapper) } catch { /* ignore */ }
+				}
+				if (staticWrapperRef.current === wrapper) staticWrapperRef.current = null
 			}
-		}, [staticHtml, isEditingState, shouldUseLightweightPreview, shape.id])
+		}, [staticHtml, isEditingState, shouldUseLightweightPreview, shape.id, shape.props.blockId])
 
 		// ===== 编辑态专用：创建和管理 Protyle 实例 =====
 		useEffect(() => {
@@ -1097,7 +1135,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 							onPointerUp={handleStaticLinkPointerDown}
 							onDragStart={handleStaticLinkDragStart}
 							onClick={handleStaticLinkClick}
-							dangerouslySetInnerHTML={{ __html: staticHtml }}
 							style={{
 								width: '100%',
 								height: '100%',
