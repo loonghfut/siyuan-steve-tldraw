@@ -5,7 +5,7 @@
      */
     import type { Writable } from 'svelte/store';
     import type { PreviewState } from './whiteboard-list-controller';
-    import { SHAPE_FILL, SHAPE_STROKE, BORDER_STROKE, SHAPE_RX } from '../utils/whiteboard-utils';
+    import { SHAPE_FILL, SHAPE_FILL_SOLID, SHAPE_STROKE, BORDER_STROKE, SHAPE_RX } from '../utils/whiteboard-utils';
 
     /** 该白板独立的预览状态 store */
     export let previewStore: Writable<PreviewState>;
@@ -33,7 +33,7 @@
     {:else}
         <div class="pv-thumb-block pv-pending"></div>
     {/if}
-{:else if state.shapes.length === 0}
+{:else if state.empty}
     {#if variant === 'card'}
         <div class="pv-text pv-blank">空白画板</div>
     {:else}
@@ -41,9 +41,18 @@
     {/if}
 {:else}
     <svg viewBox="0 0 300 200" class="pv-svg" preserveAspectRatio="xMidYMid meet">
-        {#each state.rects ?? [] as pos, i (i)}
-            <rect x={pos.x} y={pos.y} width={pos.w} height={pos.h}
-                rx={SHAPE_RX} ry={SHAPE_RX} fill={SHAPE_FILL} stroke={SHAPE_STROKE} stroke-width="1" />
+        {#each state.prims ?? [] as prim, i (i)}
+            {#if prim.kind === 'rect'}
+                <rect x={prim.x} y={prim.y} width={prim.w} height={prim.h}
+                    rx={SHAPE_RX} ry={SHAPE_RX}
+                    fill={prim.filled ? SHAPE_FILL_SOLID : SHAPE_FILL}
+                    stroke={SHAPE_STROKE} stroke-width="1" />
+            {:else}
+                <path d={prim.d}
+                    fill={prim.filled ? SHAPE_FILL_SOLID : 'none'}
+                    stroke={SHAPE_STROKE} stroke-width={prim.strokeWidth}
+                    stroke-linecap="round" stroke-linejoin="round" />
+            {/if}
         {/each}
         {#if variant === 'card'}
             <rect x="1" y="1" width="298" height="198" fill="none" stroke={BORDER_STROKE} />

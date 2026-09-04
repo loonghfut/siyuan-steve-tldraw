@@ -3,7 +3,12 @@
     import { WhiteboardFileManager } from "../whiteboard-file-manager";
     import { showMessage } from "siyuan";
     import * as api from "@/api/api";
-    import { computeBounds, projectShape, SVG_PAD, SHAPE_FILL, SHAPE_STROKE, SHAPE_RX } from "../utils/whiteboard-utils";
+    import { projectElements, SVG_PAD, SHAPE_FILL, SHAPE_STROKE, SHAPE_RX, type PreviewElement } from "../utils/whiteboard-utils";
+
+    // 备份预览的形状均为左上角盒状近似，转为 rect 图元后统一投影（模板不能写 TS 语法，故放于脚本）
+    function boxesToElements(shapes: Array<{ x: number; y: number; w: number; h: number }>): PreviewElement[] {
+        return (shapes || []).map((s): PreviewElement => ({ kind: 'rect', x: s.x, y: s.y, w: s.w, h: s.h }));
+    }
 
     // 接收初始画板ID（用于在打开面板时自动过滤到当前画板）
     export let initialDrawingId: string | null = null;
@@ -644,23 +649,22 @@
                                                                         preserveAspectRatio="xMidYMid meet"
                                                                     >
                                                                         {#if page.shapes && page.shapes.length}
-                                                                            {@const bounds = computeBounds(page.shapes)}
-                                                                            {@const viewW = 300 - SVG_PAD * 2}
-                                                                            {@const viewH = 200 - SVG_PAD * 2}
-                                                                            {@const scale = Math.min(viewW / bounds.width, viewH / bounds.height)}
-                                                                            {#each page.shapes as s}
-                                                                                {@const pos = projectShape(s, bounds, scale, SVG_PAD)}
-                                                                                <rect
-                                                                                    x={pos.x}
-                                                                                    y={pos.y}
-                                                                                    width={pos.w}
-                                                                                    height={pos.h}
-                                                                                    rx={SHAPE_RX}
-                                                                                    ry={SHAPE_RX}
-                                                                                    fill={SHAPE_FILL}
-                                                                                    stroke={SHAPE_STROKE}
-                                                                                    stroke-width="1"
-                                                                                />
+                                                                            {@const elements = boxesToElements(page.shapes)}
+                                                                            {@const prims = projectElements(elements, 300, 200, SVG_PAD)}
+                                                                            {#each prims as prim}
+                                                                                {#if prim.kind === 'rect'}
+                                                                                    <rect
+                                                                                        x={prim.x}
+                                                                                        y={prim.y}
+                                                                                        width={prim.w}
+                                                                                        height={prim.h}
+                                                                                        rx={SHAPE_RX}
+                                                                                        ry={SHAPE_RX}
+                                                                                        fill={SHAPE_FILL}
+                                                                                        stroke={SHAPE_STROKE}
+                                                                                        stroke-width="1"
+                                                                                    />
+                                                                                {/if}
                                                                             {/each}
                                                                             <!-- page border -->
                                                                             <rect

@@ -17,7 +17,7 @@ import type { Writable, Readable } from 'svelte/store';
 import { openTab, showMessage, confirm } from 'siyuan';
 import type { Plugin } from 'siyuan';
 import { api } from '@frostime/siyuan-plugin-kits';
-import type { WhiteboardEntry, PreviewShape, ProjectedRect } from '../utils/whiteboard-utils';
+import type { WhiteboardEntry, ProjectedPrim } from '../utils/whiteboard-utils';
 import {
     createBaseEntry,
     resolveEntryTitle,
@@ -28,10 +28,11 @@ import {
     parseSyTimestamp,
     parseBlockTags,
     extractDrawingId,
-    projectAllShapes,
+    projectElements,
+    SVG_VIEWBOX,
     SVG_PAD,
 } from '../utils/whiteboard-utils';
-import { fetchWhiteboardShapes } from '../utils/whiteboard-preview';
+import { fetchWhiteboardElements } from '../utils/whiteboard-preview';
 import { whiteboardSortKey } from './whiteboard-view-prefs';
 import { WhiteboardFileManager, WHITEBOARD_TRASH_DIR } from '../whiteboard-file-manager';
 import { closeTab } from '../tldraw-instance-manager';
@@ -56,16 +57,18 @@ export interface ViewSection {
 export interface PreviewState {
     loading: boolean;
     loaded: boolean;
-    shapes: PreviewShape[];
-    rects?: ProjectedRect[];
+    /** 投影到 SVG viewBox 后的图元（矩形 / 笔迹路径） */
+    prims?: ProjectedPrim[];
+    /** 是否无内容（区分“未加载”与“空白画板”） */
+    empty: boolean;
     error?: string;
 }
 
 const EMPTY_PREVIEW: PreviewState = {
     loading: false,
     loaded: false,
-    shapes: [],
-    rects: undefined,
+    prims: undefined,
+    empty: false,
     error: undefined,
 };
 
@@ -316,14 +319,14 @@ export class WhiteboardListController {
         if (state.loaded || state.loading) return;
         this.previewLoading.add(id);
         store.set({ ...state, loading: true });
-        fetchWhiteboardShapes(path)
-            .then(shapes => {
-                const rects = projectAllShapes(shapes, 300, 200, SVG_PAD);
-                store.set({ loading: false, loaded: true, shapes, rects, error: undefined });
+        fetchWhiteboardElements(path)
+            .then(elements => {
+                const prims = projectElements(elements, SVG_VIEWBOX.w, SVG_VIEWBOX.h, SVG_PAD);
+                store.set({ loading: false, loaded: true, prims, empty: elements.length === 0, error: undefined });
             })
             .catch(err => {
                 console.warn('缩略图加载失败:', err);
-                store.set({ loading: false, loaded: true, shapes: [], rects: undefined, error: '预览失败' });
+                store.set({ loading: false, loaded: true, prims: undefined, empty: true, error: '预览失败' });
             })
             .finally(() => { this.previewLoading.delete(id); });
     }

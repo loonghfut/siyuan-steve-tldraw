@@ -1,19 +1,41 @@
 /**
  * 白板卡片与管理器共享工具函数和类型
- * 统一了在多个组件间重复的 extractDrawingId、parseSyTimestamp、computeBounds、projectShape、formatTime 等
+ * 统一了在多个组件间重复的 extractDrawingId、parseSyTimestamp、computeElementBounds、projectElements、formatTime 等
  */
 
 // ==================== 类型定义 ====================
 
-/** 形状预览数据 */
-export interface PreviewShape {
-    id?: string;
+/** 预览图元的类别：矩形（框状形状）或折线（笔迹/连线） */
+export type PreviewElementKind = 'rect' | 'stroke';
+
+/**
+ * 预览图元（页面绝对坐标）。
+ * 由 tldraw 形状几何重建而来：框状形状用 x/y/w/h（左上角+宽高），
+ * 笔迹/连线用 points 折线点序列。坐标均已换算到页面绝对空间（含父级平移与旋转）。
+ */
+export interface PreviewElement {
+    kind: PreviewElementKind;
+    /** rect: 左上角坐标与宽高（页面绝对坐标） */
+    x?: number;
+    y?: number;
+    w?: number;
+    h?: number;
+    /** stroke: 折线点序列（页面绝对坐标） */
+    points?: { x: number; y: number }[];
+    /** stroke: 是否闭合 */
+    closed?: boolean;
+    /** 是否填充（note / 闭合且填充的 draw / geo 等） */
+    filled?: boolean;
+    /** stroke: 相对描边粗细（页面单位），投影时按 scale 缩放 */
+    weight?: number;
+    /** 原始 tldraw 形状类型，便于调试与样式区分 */
     type?: string;
-    x: number;
-    y: number;
-    w: number;
-    h: number;
 }
+
+/** 投影到 SVG viewBox 后的图元，可直接在 Svelte 模板中渲染 */
+export type ProjectedPrim =
+    | { kind: 'rect'; x: number; y: number; w: number; h: number; filled?: boolean }
+    | { kind: 'path'; d: string; filled?: boolean; closed?: boolean; strokeWidth: number };
 
 /**
  * 统一的白板数据项：dock 卡片面板与高级管理面板共用同一模型。
@@ -42,9 +64,10 @@ export interface WhiteboardEntry {
     loadingPreview: boolean;
     /** 预览是否已尝试加载完成（用于区分"未加载"与"空白画板"） */
     previewLoaded: boolean;
-    shapes: PreviewShape[];
+    /** 重建出的预览图元（页面绝对坐标） */
+    elements: PreviewElement[];
     /** 预览 SVG 的投影结果，在加载文件时预计算 */
-    previewRects?: ProjectedRect[];
+    previewPrims?: ProjectedPrim[];
     previewError?: string;
 }
 
@@ -77,13 +100,13 @@ export function createBaseEntry(input: {
         createdAt: fileMtime,
         loadingPreview: false,
         previewLoaded: false,
-        shapes: [],
-        previewRects: undefined,
+        elements: [],
+        previewPrims: undefined,
         previewError: undefined,
     };
 }
 
-/** computeBounds 返回的包围盒 */
+/** computeElementBounds 返回的包围盒 */
 export interface BoundsResult {
     minX: number;
     minY: number;
@@ -93,22 +116,32 @@ export interface BoundsResult {
     height: number;
 }
 
-/** projectShape 返回的投影矩形 */
-export interface ProjectedRect {
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-}
-
 // ==================== SVG 渲染常量 ====================
 
 export const SVG_VIEWBOX = { w: 300, h: 200 } as const;
 export const SVG_PAD = 6;
 export const SHAPE_FILL = 'rgba(61,142,255,0.08)';
+export const SHAPE_FILL_SOLID = 'rgba(61,142,255,0.20)';
 export const SHAPE_STROKE = 'rgba(61,142,255,0.35)';
 export const BORDER_STROKE = 'rgba(0,0,0,0.06)';
 export const SHAPE_RX = 3;
+
+// ============ 预览几何常量（对齐 tldraw 5.2.3 默认值） ============
+
+/** tldraw 字号样式 → 相对倍数（default-shape-constants FONT_SIZES） */
+export const FONT_SIZES: Record<string, number> = { s: 1.125, m: 1.5, l: 2.25, xl: 2.75 };
+/** tldraw 描边尺寸样式 → 相对倍数（STROKE_SIZES） */
+export const STROKE_SIZES: Record<string, number> = { s: 1, m: 1.75, l: 2.5, xl: 5 };
+/** 文本高度估算的基准字号（px） */
+export const BASE_FONT_PX = 16;
+/** 文本行高倍数 */
+export const TEXT_LINE_HEIGHT = 1.35;
+/** note 便签默认边长（NoteShapeUtil noteWidth/noteHeight 默认 200） */
+export const NOTE_BASE = 200;
+/** 预览元素总数上限，超出则截断（bounds 仍按全部计算） */
+export const MAX_PREVIEW_ELEMENTS = 500;
+/** 单条笔迹折线的最大点数，超出均匀降采样 */
+export const MAX_POINTS_PER_STROKE = 64;
 
 // ==================== 工具函数 ====================
 
@@ -182,90 +215,115 @@ export function parseSyTimestamp(value?: string | number | null): number {
 }
 
 /**
- * 计算形状数组的包围盒
- * 形状使用中心坐标 (中心 x/y + 宽度/高度)
+ * 计算预览图元数组的包围盒（页面绝对坐标）。
+ * rect 取左上/右下两角，stroke 取所有折线点；并按最大描边粗细外扩半宽，避免边缘笔迹被裁切。
+ * 注意：tldraw 的 rect 使用左上角坐标（非中心），此处不再做 -w/2 偏移。
  */
-export function computeBounds(shapes: PreviewShape[]): BoundsResult {
-    if (!shapes || shapes.length === 0) {
-        return { minX: 0, minY: 0, maxX: 300, maxY: 200, width: 300, height: 200 };
-    }
+export function computeElementBounds(elements: PreviewElement[]): BoundsResult {
+    const fallback = { minX: 0, minY: 0, maxX: SVG_VIEWBOX.w, maxY: SVG_VIEWBOX.h, width: SVG_VIEWBOX.w, height: SVG_VIEWBOX.h };
+    if (!elements || elements.length === 0) return fallback;
     let minX = Number.POSITIVE_INFINITY;
     let minY = Number.POSITIVE_INFINITY;
     let maxX = Number.NEGATIVE_INFINITY;
     let maxY = Number.NEGATIVE_INFINITY;
-    for (const s of shapes) {
-        const left = (typeof s.x === 'number' ? s.x : 0) - (s.w || 0) / 2;
-        const top = (typeof s.y === 'number' ? s.y : 0) - (s.h || 0) / 2;
-        minX = Math.min(minX, left);
-        minY = Math.min(minY, top);
-        maxX = Math.max(maxX, left + (s.w || 0));
-        maxY = Math.max(maxY, top + (s.h || 0));
+    let maxWeight = 0;
+    const acc = (x: number, y: number) => {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+    };
+    for (const el of elements) {
+        if (el.kind === 'rect') {
+            const x = el.x ?? 0;
+            const y = el.y ?? 0;
+            const w = el.w ?? 0;
+            const h = el.h ?? 0;
+            acc(x, y);
+            acc(x + w, y + h);
+        } else if (el.points && el.points.length > 0) {
+            for (const p of el.points) acc(p.x, p.y);
+            if (typeof el.weight === 'number' && el.weight > maxWeight) maxWeight = el.weight;
+        }
     }
-    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) {
-        return { minX: 0, minY: 0, maxX: 300, maxY: 200, width: 300, height: 200 };
-    }
+    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) return fallback;
+    const pad = maxWeight / 2;
+    minX -= pad;
+    minY -= pad;
+    maxX += pad;
+    maxY += pad;
     const width = Math.max(maxX - minX, 1);
     const height = Math.max(maxY - minY, 1);
     return { minX, minY, maxX, maxY, width, height };
 }
 
 /**
- * 将单个形状投影到 SVG viewBox 坐标系
- * 需要外部预先计算 bounds、scale 和 pad（由调用方通过 Svelte {@const} 计算）
+ * 将预览图元批量投影到 SVG viewBox 坐标系。
+ * rect → 投影矩形；stroke → 生成 `d="M..L.."` 路径（闭合追加 Z，单点补极小线段以显示圆点）。
+ * 统一缩放比例 scale = min((viewW-2pad)/bounds.w, (viewH-2pad)/bounds.h)。
  *
- * @param shape - 要投影的形状
- * @param bounds - 所有形状的包围盒
- * @param scale - 统一缩放比例
- * @param pad - 边距 (px)
- * @param defaultW - 形状默认宽度 (默认 100)
- * @param defaultH - 形状默认高度 (默认 60)
- */
-export function projectShape(
-    shape: PreviewShape,
-    bounds: BoundsResult,
-    scale: number,
-    pad: number,
-    defaultW: number = 100,
-    defaultH: number = 60,
-): ProjectedRect {
-    const cx = shape.x || 0;
-    const cy = shape.y || 0;
-    const w = shape.w || defaultW;
-    const h = shape.h || defaultH;
-    const left = cx - w / 2;
-    const top = cy - h / 2;
-    return {
-        x: (left - bounds.minX) * scale + pad,
-        y: (top - bounds.minY) * scale + pad,
-        w: Math.max(w * scale, 1),
-        h: Math.max(h * scale, 1),
-    };
-}
-
-/**
- * 批量将形状投影到 SVG viewBox 中
- * 返回投影后的矩形数组，可直接在 Svelte 模板中使用
- *
- * @param shapes - 所有形状的数组
+ * @param elements - 页面绝对坐标的图元数组
  * @param viewW - 视图宽度
  * @param viewH - 视图高度
  * @param pad - 内边距
  */
-export function projectAllShapes(
-    shapes: PreviewShape[],
+export function projectElements(
+    elements: PreviewElement[],
     viewW: number,
     viewH: number,
     pad: number,
-    defaultW: number = 100,
-    defaultH: number = 60,
-): ProjectedRect[] {
-    if (!shapes || shapes.length === 0) return [];
-    const bounds = computeBounds(shapes);
+): ProjectedPrim[] {
+    if (!elements || elements.length === 0) return [];
+    const bounds = computeElementBounds(elements);
     const scale = Math.min(
         (viewW - pad * 2) / bounds.width,
         (viewH - pad * 2) / bounds.height,
     );
-    return shapes.map(s => projectShape(s, bounds, scale, pad, defaultW, defaultH));
+    const tx = (x: number) => (x - bounds.minX) * scale + pad;
+    const ty = (y: number) => (y - bounds.minY) * scale + pad;
+    const prims: ProjectedPrim[] = [];
+    const limit = Math.min(elements.length, MAX_PREVIEW_ELEMENTS);
+    for (let i = 0; i < limit; i++) {
+        const el = elements[i];
+        if (el.kind === 'rect') {
+            const x = el.x ?? 0;
+            const y = el.y ?? 0;
+            const w = el.w ?? 0;
+            const h = el.h ?? 0;
+            prims.push({
+                kind: 'rect',
+                x: tx(x),
+                y: ty(y),
+                w: Math.max(w * scale, 1),
+                h: Math.max(h * scale, 1),
+                filled: el.filled,
+            });
+        } else if (el.points && el.points.length > 0) {
+            const pts = el.points;
+            let d: string;
+            if (pts.length === 1) {
+                // 单点（点状笔迹）：补一段极小位移，配合 round linecap 显示为圆点
+                const px = tx(pts[0].x);
+                const py = ty(pts[0].y);
+                d = `M${px.toFixed(2)} ${py.toFixed(2)}L${(px + 0.01).toFixed(2)} ${py.toFixed(2)}`;
+            } else {
+                d = `M${tx(pts[0].x).toFixed(2)} ${ty(pts[0].y).toFixed(2)}`;
+                for (let j = 1; j < pts.length; j++) {
+                    d += `L${tx(pts[j].x).toFixed(2)} ${ty(pts[j].y).toFixed(2)}`;
+                }
+                if (el.closed) d += 'Z';
+            }
+            const weight = (el.weight ?? 1) * scale;
+            prims.push({
+                kind: 'path',
+                d,
+                filled: el.filled,
+                closed: el.closed,
+                strokeWidth: Math.max(0.5, Math.min(weight, 3)),
+            });
+        }
+    }
+    return prims;
 }
 
 /**
