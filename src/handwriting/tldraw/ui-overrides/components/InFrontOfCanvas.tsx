@@ -195,13 +195,8 @@ export const InFrontOfCanvas: React.FC = () => {
                 console.error('未找到块ID')
                 return
             }
-            // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
-            try {
-                openSiYuanDoc(window.siyuan.ws.app, blockId)
-            } catch (err) {
-                console.error('跳转到笔记失败', err)
-                showMessage('跳转到笔记失败', 3000, 'error')
-            }
+            // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById；失败提示由其内部处理
+            openSiYuanDoc(window.siyuan.ws.app, blockId, { position: 'right', errorPrefix: '跳转到笔记失败' })
         }
 
         container.addEventListener('pointerdown', handlePointerDown, { passive: true })
@@ -611,7 +606,7 @@ export const InFrontOfCanvas: React.FC = () => {
                                     }
                                     const blockId = shape.props.blockId
                                     // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
-                                    openSiYuanDoc(window.siyuan.ws.app, blockId)
+                                    openSiYuanDoc(window.siyuan.ws.app, blockId, { position: 'right' })
                                 }}
                                 title="跳转到笔记"
                             >

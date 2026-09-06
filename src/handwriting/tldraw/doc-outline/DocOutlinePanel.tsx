@@ -305,7 +305,7 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId, selectedMainCard
 
     // 跳转到文档块（移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById）
     const jumpToBlockInDoc = useCallback((blockId: string) => {
-        openSiYuanDoc(window.siyuan.ws.app, blockId);
+        openSiYuanDoc(window.siyuan.ws.app, blockId, { position: 'right' });
     }, []);
 
     // 点击处理：已添加则跳转到卡片位置，未添加则跳转到文档

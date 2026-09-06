@@ -11,6 +11,8 @@
  * - z-index 走 window.siyuan.zIndex 自增序列，保证后续弹出的对话框/菜单/键盘工具条
  *   仍能盖在白板之上。
  * - 同一时刻只承载一块白板；切换白板前会 await 旧 manager.destroy()（内部先保存数据）。
+ *   open() 通过 promise 链串行化，避免并发打开产生未销毁的僵尸实例；
+ *   await 期间覆盖层可能已被 close() 移除，恢复执行后必须重新校验存活。
  */
 
 import { showMessage } from "siyuan";
@@ -23,7 +25,7 @@ const NAVIGATE_RETRY_INTERVAL = 200;
 const NAVIGATE_TOTAL_WAIT = 6000;
 
 export interface MobileWhiteboardOpenOptions {
-    /** 白板标题（覆盖层头部展示），缺省时退回「画板 {rootid}」 */
+    /** 白板标题（覆盖层头部展示），缺省时同板保留现标题、换板退回「画板 {rootid}」 */
     title?: string;
     /** 打开后需要定位到的思源块 id */
     blockid?: string;
@@ -38,6 +40,8 @@ class MobileWhiteboardOverlay {
     private manager: TldrawManager | null = null;
     private rootid: string | null = null;
     private navigateTimer: number | null = null;
+    // open() 串行化链：销毁旧实例是异步过程，排队避免并发打开交叉产生僵尸实例
+    private openChain: Promise<void> = Promise.resolve();
 
     isOpen(): boolean {
         return !!this.element;
@@ -51,7 +55,14 @@ class MobileWhiteboardOverlay {
         return this.manager;
     }
 
-    async open(rootid: string, options: MobileWhiteboardOpenOptions = {}): Promise<void> {
+    open(rootid: string, options: MobileWhiteboardOpenOptions = {}): Promise<void> {
+        const task = this.openChain.then(() => this.doOpen(rootid, options));
+        // 链上吞掉异常，保证一次失败不阻塞后续排队
+        this.openChain = task.then(() => undefined, () => undefined);
+        return task;
+    }
+
+    private async doOpen(rootid: string, options: MobileWhiteboardOpenOptions): Promise<void> {
         if (!rootid) return;
 
         if (this.isOpen() && this.rootid === rootid) {
@@ -64,13 +75,16 @@ class MobileWhiteboardOverlay {
 
         this.ensureShell();
         this.show();
-        this.setTitle(options.title);
+        this.setTitle(this.resolveTitle(rootid, options.title));
 
-        // 切换白板前先销毁旧实例，destroy 内部会保存数据
+        // 切换白板前先销毁旧实例，destroy 内部会保存数据（并取消未完成的导航重试）
         await this.destroyManager();
 
+        // 等待期间覆盖层可能已被 close()（返回按钮/插件卸载）移除
+        if (!this.element || !this.bodyElement) return;
+
         this.rootid = rootid;
-        const body = this.bodyElement!;
+        const body = this.bodyElement;
         body.innerHTML = '';
         const manager = new TldrawManager(rootid, body, [rootid], this.getTitle());
         this.manager = manager;
@@ -143,6 +157,13 @@ class MobileWhiteboardOverlay {
         this.element.style.zIndex = String(++window.siyuan.zIndex);
     }
 
+    /** 换板且未传标题时退回占位标题，避免残留上一个画板的标题 */
+    private resolveTitle(rootid: string, title?: string): string {
+        if (title) return title;
+        if (this.rootid === rootid) return this.getTitle();
+        return `画板 ${rootid}`;
+    }
+
     private setTitle(title?: string) {
         if (!this.titleElement) return;
         this.titleElement.textContent = title || this.getTitle();
@@ -153,6 +174,7 @@ class MobileWhiteboardOverlay {
     }
 
     private async destroyManager() {
+        this.cancelNavigate();
         const manager = this.manager;
         this.manager = null;
         if (!manager) return;

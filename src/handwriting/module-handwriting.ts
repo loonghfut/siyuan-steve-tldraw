@@ -169,7 +169,11 @@ export class M_handwriting {
 
                     if (isMobileFrontend()) {
                         // 移动端：openTab 为空操作，改走全屏覆盖层并自带块/形状定位
-                        await mobileWhiteboardOverlay.open(rootid, { title, blockid, shapeid });
+                        await mobileWhiteboardOverlay.open(rootid, {
+                            title,
+                            blockid,
+                            shapeid: shapeid || undefined,
+                        });
                         return;
                     }
 

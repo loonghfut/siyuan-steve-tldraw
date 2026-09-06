@@ -95,16 +95,7 @@ export function findStaticLinkTarget(target: EventTarget | null, root: HTMLEleme
 export function openStaticLinkTarget(target: { blockId: string | null; href: string }, errorPrefix = '打开链接失败') {
 	if (target.blockId) {
 		if (!window.siyuan?.ws?.app) return
-		try {
-			openSiYuanDoc(window.siyuan.ws.app, target.blockId)
-		} catch (err) {
-			console.error('jump to linked block failed', err)
-			try {
-				showMessage('跳转到链接块失败', 3000, 'error')
-			} catch {
-				// ignore
-			}
-		}
+		openSiYuanDoc(window.siyuan.ws.app, target.blockId, { position: 'right', errorPrefix: '跳转到链接块失败' })
 		return
 	}
 

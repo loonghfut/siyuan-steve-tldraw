@@ -257,7 +257,7 @@ function getParentHPath(hPath: string): string {
 
 async function openSummaryWhiteboard(plugin: Plugin, whiteboardId: string, title: string) {
     // 移动端 openTab 为空操作，openWhiteboardBoard 内部会路由到全屏覆盖层
-    await openWhiteboardBoard(plugin, whiteboardId, { title })
+    await openWhiteboardBoard(plugin, whiteboardId, { title, position: 'right' })
 }
 
 async function waitForOpenWhiteboard(whiteboardId: string, waitMs: number) {

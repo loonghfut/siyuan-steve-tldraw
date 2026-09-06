@@ -10,7 +10,7 @@
  * 否则 ui-overrides 画布组件静态引用本模块时会形成循环依赖。覆盖层一律动态 import。
  */
 
-import { getFrontend, openMobileFileById, openTab, type App } from "siyuan";
+import { getFrontend, openMobileFileById, openTab, showMessage, type App } from "siyuan";
 
 /** 是否为思源移动端前端（App 内嵌 WebView 或移动端浏览器） */
 export function isMobileFrontend(): boolean {
@@ -28,6 +28,8 @@ export interface OpenWhiteboardOptions {
     blockid?: string;
     /** 打开后定位到的 tldraw 形状 id */
     shapeid?: string;
+    /** 桌面端页签打开位置（移动端覆盖层全屏展示，忽略该选项） */
+    position?: "right" | "bottom";
 }
 
 /**
@@ -57,21 +59,30 @@ export async function openWhiteboardBoard(
                 rootid: rootid,
             },
         },
+        position: options.position,
     });
     return true;
 }
 
+export interface OpenDocOptions {
+    /** 桌面端页签打开位置（移动端无页签概念，忽略该选项） */
+    position?: "right" | "bottom";
+    /** 桌面端打开失败时的提示文案；不传则仅写控制台（与各调用点原有行为一致） */
+    errorPrefix?: string;
+}
+
 /**
  * 打开一篇思源文档。
- * 桌面端：openTab({doc: ...})；移动端：openMobileFileById。
+ * 桌面端：openTab({doc: ...})，失败时接住 Promise rejection（openFileById 为异步且会 reject）；
+ * 移动端：openMobileFileById。
  */
-export function openSiYuanDoc(app: App, docId: string): void {
+export function openSiYuanDoc(app: App, docId: string, options: OpenDocOptions = {}): void {
     if (!docId) return;
     if (isMobileFrontend()) {
         openMobileFileById(app, docId, ["cb-get-hl", "cb-get-all"]);
         return;
     }
-    void openTab({
+    Promise.resolve(openTab({
         app,
         doc: {
             id: docId,
@@ -79,6 +90,12 @@ export function openSiYuanDoc(app: App, docId: string): void {
             zoomIn: false,
         },
         keepCursor: false,
+        position: options.position,
+    })).catch((err) => {
+        console.error(options.errorPrefix || "打开文档失败", err);
+        if (options.errorPrefix) {
+            showMessage(options.errorPrefix, 3000, "error");
+        }
     });
 }
 

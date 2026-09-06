@@ -281,7 +281,7 @@ export const ChildDocsPanel = track(({ isOpen, onClose, docId, selectedMainCard 
 
     // 跳转到文档（移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById）
     const jumpToDoc = useCallback((docId: string) => {
-        openSiYuanDoc(window.siyuan.ws.app, docId);
+        openSiYuanDoc(window.siyuan.ws.app, docId, { position: 'right' });
     }, []);
 
     // 点击处理：已添加则跳转到卡片位置，未添加则跳转到文档

@@ -91,7 +91,7 @@ async function createAndOpenNewWhiteboard(
 
 async function openWhiteboardTab(context: AgentActionContext, whiteboardId: string, title: string) {
     // 移动端 openTab 为空操作，openWhiteboardBoard 内部会路由到全屏覆盖层
-    await openWhiteboardBoard(context.plugin, whiteboardId, { title });
+    await openWhiteboardBoard(context.plugin, whiteboardId, { title, position: 'right' });
 }
 
 async function resolveNewWhiteboardPlacement(args: Record<string, unknown>): Promise<NewWhiteboardPlacement> {
