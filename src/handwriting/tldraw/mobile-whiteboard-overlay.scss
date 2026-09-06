@@ -17,7 +17,11 @@
         gap: 4px;
         height: 40px;
         padding: 0 8px;
-        padding-top: env(safe-area-inset-top, 0);
+        // 顶部安全区避让消费思源收敛好的变量（body 定义，body--android 时为 0），
+        // 与思源自身顶栏行为一致：Android App 无避让，iOS App 保留刘海避让。
+        // 不能直接用裸 env(safe-area-inset-top)：App 的边到边 WebView 里它等于状态栏高度，
+        // 会在标题上方渲染出一条浏览器里看不到的空隙。
+        padding-top: var(--mobile-top-safe-area, env(safe-area-inset-top));
         box-sizing: content-box;
         flex-shrink: 0;
         background-color: var(--b3-theme-surface);
