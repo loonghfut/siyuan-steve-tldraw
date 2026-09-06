@@ -8,7 +8,8 @@ import {
     useEditor,
 } from '@tldraw/tldraw';
 import { api } from '@frostime/siyuan-plugin-kits';
-import { openTab, showMessage } from 'siyuan';
+import { showMessage } from 'siyuan';
+import { openSiYuanDoc } from '../utils/mobile-open';
 import type { ICardShape } from '../CardShape/card-shape-types';
 import { insertDocRelations } from './insert-doc-relations';
 import { collectAllOutlineNodeIds, loadOutlineForDoc, outlineNodeToRelationItem, type OutlineNode } from './doc-outline-data';
@@ -302,18 +303,9 @@ export const DocOutlinePanel = track(({ isOpen, onClose, docId, selectedMainCard
         }
     }, [editor, getShapeByBlockId]);
 
-    // 跳转到文档块
+    // 跳转到文档块（移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById）
     const jumpToBlockInDoc = useCallback((blockId: string) => {
-        openTab({
-            app: window.siyuan.ws.app,
-            doc: {
-                id: blockId,
-                action: ['cb-get-hl', 'cb-get-all'],
-                zoomIn: false,
-            },
-            keepCursor: false,
-            position: 'right',
-        });
+        openSiYuanDoc(window.siyuan.ws.app, blockId);
     }, []);
 
     // 点击处理：已添加则跳转到卡片位置，未添加则跳转到文档

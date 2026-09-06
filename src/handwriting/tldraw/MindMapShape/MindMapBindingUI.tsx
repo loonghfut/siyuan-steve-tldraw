@@ -3,7 +3,8 @@
  */
 import React from 'react'
 import { TldrawUiButton, TldrawUiButtonLabel, Editor } from '@tldraw/tldraw'
-import { showMessage, openTab } from 'siyuan'
+import { showMessage } from 'siyuan'
+import { openSiYuanDoc } from '../utils/mobile-open'
 import { getBlockKramdown } from '@/api/api'
 import { parseMarkdownToMindMap } from './mind-map-markdown'
 import { inputDialog } from '@/libs/dialog'
@@ -88,15 +89,8 @@ export const MindMapBindingUI: React.FC<MindMapBindingUIProps> = ({ selectedMind
 
     const handleJumpToBlock = () => {
         if (!linkedBlockId) return
-        openTab({
-            app: window.siyuan.ws.app,
-            doc: {
-                id: linkedBlockId,
-                action: ['cb-get-hl', 'cb-get-all'],
-                zoomIn: false,
-            },
-            keepCursor: false,
-        })
+        // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
+        openSiYuanDoc(window.siyuan.ws.app, linkedBlockId)
     }
 
     const handleOpenBindDialog = () => {

@@ -8,7 +8,8 @@ import {
     TldrawUiMenuItem,
     useEditor,
 } from '@tldraw/tldraw'
-import { showMessage, openTab } from 'siyuan'
+import { showMessage } from 'siyuan'
+import { openSiYuanDoc } from '../../utils/mobile-open'
 import { settingdata } from '@/index'
 import { buildTldrawLink } from '../../utils/link-builder'
 import { resetShapeLibraryPanelPosition } from '../../shapelibrary/shape-library-manager'
@@ -44,12 +45,8 @@ export const CustomQuickActions: React.FC = () => {
             <DefaultQuickActionsContent />
             <div>
                 <TldrawUiMenuItem id="heading" icon="external-link" label="打开文档" onSelect={() => {
-                    openTab({
-                        app: window.siyuan.ws.app,
-                        doc: {
-                            id: rootId,
-                        },
-                    })
+                    // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
+                    openSiYuanDoc(window.siyuan.ws.app, rootId)
                 }} />
             </div>
             <div>

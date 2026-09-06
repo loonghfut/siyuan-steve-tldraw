@@ -3,7 +3,8 @@
  * 两个形状此前各自维护一份相同实现，已出现行为漂移，统一收敛到这里。
  */
 
-import { openTab, showMessage } from 'siyuan'
+import { showMessage } from 'siyuan'
+import { openSiYuanDoc } from './mobile-open'
 
 export const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
 export const STEVE_TOOLS_PLUGIN_URL_RE = /^(?:https:\/\/|siyuan:\/\/)plugins\/siyuan-steve-tools\//i
@@ -88,28 +89,22 @@ export function findStaticLinkTarget(target: EventTarget | null, root: HTMLEleme
 }
 
 /**
- * 打开静态预览中的链接目标：块引用走 openTab，普通链接按协议处理。
+ * 打开静态预览中的链接目标：块引用跳转对应文档，普通链接按协议处理。
+ * （移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById）
  */
 export function openStaticLinkTarget(target: { blockId: string | null; href: string }, errorPrefix = '打开链接失败') {
 	if (target.blockId) {
 		if (!window.siyuan?.ws?.app) return
-		void openTab({
-			app: window.siyuan.ws.app,
-			doc: {
-				id: target.blockId,
-				action: ['cb-get-hl', 'cb-get-all'],
-				zoomIn: false,
-			},
-			position: 'right',
-			keepCursor: false,
-		}).catch((err) => {
+		try {
+			openSiYuanDoc(window.siyuan.ws.app, target.blockId)
+		} catch (err) {
 			console.error('jump to linked block failed', err)
 			try {
 				showMessage('跳转到链接块失败', 3000, 'error')
 			} catch {
 				// ignore
 			}
-		})
+		}
 		return
 	}
 

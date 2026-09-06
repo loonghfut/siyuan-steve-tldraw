@@ -3,7 +3,8 @@
  */
 import React from 'react'
 import { TldrawUiButton, TldrawUiIcon, TldrawUiInput, StylePanelDropdownPicker, Editor } from '@tldraw/tldraw'
-import { showMessage, openTab } from 'siyuan'
+import { showMessage } from 'siyuan'
+import { openSiYuanDoc } from '../utils/mobile-open'
 import { updateBlock } from '@/api/api'
 import { buildTldrawLink } from '../utils/link-builder'
 import { captureSlideScreenshot } from './captureSlideScreenshot'
@@ -203,15 +204,8 @@ export const SlideStyleSection: React.FC<SlideStyleSectionProps> = ({
         }
 
         try {
-            await openTab({
-                app: window.siyuan.ws.app,
-                doc: {
-                    id: blockId,
-                    action: ['cb-get-hl', 'cb-get-all'],
-                    zoomIn: false,
-                },
-                keepCursor: false,
-            })
+            // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
+            openSiYuanDoc(window.siyuan.ws.app, blockId)
         } catch (err) {
             console.error('打开幻灯片关联的思源块失败', err)
             showMessage('打开关联的思源块失败', 4000, 'error')

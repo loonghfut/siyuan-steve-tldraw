@@ -6,6 +6,7 @@
      */
     import { onMount, onDestroy } from 'svelte';
     import { Plugin, showMessage, openTab } from 'siyuan';
+    import { isMobileFrontend } from '../utils/mobile-open';
     import { WhiteboardListController } from './whiteboard-list-controller';
     import { whiteboardViewMode } from './whiteboard-view-prefs';
     import { pointerMenuPosition } from '../utils/whiteboard-utils';
@@ -105,6 +106,8 @@
     }
 
     // ========== 打开高级管理 Tab ==========
+    // 高级管理依赖自定义页签（addTab），移动端 openTab/addTab 均为空操作，直接隐藏入口
+    const showManagerEntry = !isMobileFrontend();
     async function openManagerTab() {
         try {
             await openTab({
@@ -161,9 +164,11 @@
             <button type="button" class="wb-btn" aria-label="刷新" on:click={() => controller.load()}>
                 <svg><use xlink:href="#iconRefresh"></use></svg>
             </button>
-            <button type="button" class="wb-btn" aria-label="打开高级管理" on:click={openManagerTab}>
-                <svg><use xlink:href="#iconSettings"></use></svg>
-            </button>
+            {#if showManagerEntry}
+                <button type="button" class="wb-btn" aria-label="打开高级管理" on:click={openManagerTab}>
+                    <svg><use xlink:href="#iconSettings"></use></svg>
+                </button>
+            {/if}
         </div>
         <div class="wb-toolbar__row wb-toolbar__sub">
             <WhiteboardViewSwitcher />

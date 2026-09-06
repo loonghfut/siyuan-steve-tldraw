@@ -8,7 +8,8 @@ import {
     useEditor,
 } from '@tldraw/tldraw';
 import { api } from '@frostime/siyuan-plugin-kits';
-import { openTab, showMessage } from 'siyuan';
+import { showMessage } from 'siyuan';
+import { openSiYuanDoc } from '../utils/mobile-open';
 import type { ICardShape } from '../CardShape/card-shape-types';
 import { insertDocRelations } from './insert-doc-relations';
 import { loadChildDocsForDoc, type ChildDocItem } from './doc-outline-data';
@@ -278,18 +279,9 @@ export const ChildDocsPanel = track(({ isOpen, onClose, docId, selectedMainCard 
         }
     }, [editor, getShapeByDocId]);
 
-    // 跳转到文档
+    // 跳转到文档（移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById）
     const jumpToDoc = useCallback((docId: string) => {
-        openTab({
-            app: window.siyuan.ws.app,
-            doc: {
-                id: docId,
-                action: ['cb-get-hl', 'cb-get-all'],
-                zoomIn: false,
-            },
-            keepCursor: false,
-            position: 'right',
-        });
+        openSiYuanDoc(window.siyuan.ws.app, docId);
     }, []);
 
     // 点击处理：已添加则跳转到卡片位置，未添加则跳转到文档

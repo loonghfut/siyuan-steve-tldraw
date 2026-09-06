@@ -1,0 +1,65 @@
+// 移动端白板全屏覆盖层样式。
+// 仅在思源移动端挂载；桌面端不会创建对应 DOM。
+.st-mobile-whiteboard {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: var(--b3-theme-background);
+    // 思源移动端侧栏为 z-index 7，本覆盖层使用 window.siyuan.zIndex 自增值（内联样式）
+
+    &__header {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 40px;
+        padding: 0 8px;
+        padding-top: env(safe-area-inset-top, 0);
+        box-sizing: content-box;
+        flex-shrink: 0;
+        background-color: var(--b3-theme-surface);
+        border-bottom: 1px solid var(--b3-border-color);
+    }
+
+    &__back {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 36px;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: var(--b3-theme-on-surface);
+        cursor: pointer;
+
+        svg {
+            width: 18px;
+            height: 18px;
+        }
+    }
+
+    &__title {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-size: 14px;
+        color: var(--b3-theme-on-surface);
+    }
+
+    &__body {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+
+        > div {
+            width: 100%;
+            height: 100%;
+        }
+    }
+}

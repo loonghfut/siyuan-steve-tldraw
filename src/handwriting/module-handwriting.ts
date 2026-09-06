@@ -13,6 +13,8 @@ import { getCursorBlockId } from "@/api/api2";
 import { TLShapeId } from "@tldraw/tldraw";
 import { registerTab, unregisterTab } from './tldraw/tldraw-instance-manager';
 import { settingdata } from "@/index";
+import { isMobileFrontend, openWhiteboardBoard } from './tldraw/utils/mobile-open';
+import { mobileWhiteboardOverlay } from './tldraw/mobile-whiteboard-overlay';
 import { buildH6CSS, type H6StyleConfig } from "@/settings/style-h6";
 import { registerTldrawAgentActions, syncTldrawAgentActions } from "./tldraw/agent/ai/siyuan-agent-adapter";
 import { buildTldrawLink } from './tldraw/utils/link-builder';
@@ -138,19 +140,8 @@ export class M_handwriting {
                 // 如果只有 rootid（且 blockid 显式为 null），直接打开空白画板
                 if (rootid && blockid === null) {
                     const title = await this.getWhiteboardTitle(rootid);
-                    await openTab({
-                        app: this.plugin.app,
-                        custom: {
-                            id: this.plugin.name + "steveTool-whiteboard",
-                            title: title,
-                            icon: "iconSTWhiteboard",
-                            data: {
-                                text: "steveTool-whiteboard" + rootid,
-                                rootid: rootid,
-                            },
-                        },
-                        // position: "right",
-                    });
+                    // 移动端 openTab 为空操作，openWhiteboardBoard 内部会路由到全屏覆盖层
+                    await openWhiteboardBoard(this.plugin, rootid, { title });
                     return;
                 }
 
@@ -175,6 +166,12 @@ export class M_handwriting {
                         return;
                     }
                     const title = await this.getWhiteboardTitle(rootid);
+
+                    if (isMobileFrontend()) {
+                        // 移动端：openTab 为空操作，改走全屏覆盖层并自带块/形状定位
+                        await mobileWhiteboardOverlay.open(rootid, { title, blockid, shapeid });
+                        return;
+                    }
 
                     const tab = await openTab({
                         app: this.plugin.app,
@@ -542,23 +539,10 @@ export class M_handwriting {
     public async openWhiteBoard_in(protyle: IProtyle) {
         // 查找当前页面的内容容器
         const id = protyle.block.rootID;
-        const tabId = this.plugin.name + "steveTool-whiteboard";
         const titleText = protyle.title?.editElement?.textContent ?? "";
-
-        await openTab({
-            app: this.plugin.app,
-            custom: {
-                id: tabId,
-                title: titleText,
-                icon: "iconSTWhiteboard",
-                data: {
-                    text: "steveTool-whiteboard" + id,
-                    rootid: id,
-                    //时间戳
-                    // timestamp: Date.now(),
-                },
-            },
-        });
+        // 移动端 openTab 为空操作，openWhiteboardBoard 内部会路由到全屏覆盖层
+        const title = titleText || await this.getWhiteboardTitle(id);
+        await openWhiteboardBoard(this.plugin, id, { title });
     }
 
     private bindSlideScreenshotDropHandlers() {
@@ -646,6 +630,8 @@ export class M_handwriting {
     async onunload() {
         // 移除面包屑上的进入画板按钮（思源销毁插件时也会统一清理，这里显式移除一次）
         this.plugin.removeBreadcrumbButton(WHITEBOARD_BREADCRUMB_BUTTON_ID);
+        // 销毁移动端全屏白板覆盖层（内部会保存数据）
+        await mobileWhiteboardOverlay.destroy();
         this.unbindSlideScreenshotDropHandlers();
         clearActiveSlideScreenshotStore(this.slideScreenshotStore);
         // 移除链接点击拦截器

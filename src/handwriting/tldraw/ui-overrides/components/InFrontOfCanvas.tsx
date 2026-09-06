@@ -4,7 +4,8 @@
  */
 import React from 'react'
 import { useEditor, useValue, TldrawUiIcon } from '@tldraw/tldraw'
-import { showMessage, openTab } from 'siyuan'
+import { showMessage } from 'siyuan'
+import { openSiYuanDoc } from '../../utils/mobile-open'
 import { ShapeLibraryPanel } from '../../shapelibrary/ShapeLibraryPanel'
 import { DocOutlinePanel } from '../../doc-outline/DocOutlinePanel'
 import { ChildDocsPanel } from '../../doc-outline/ChildDocsPanel'
@@ -194,19 +195,13 @@ export const InFrontOfCanvas: React.FC = () => {
                 console.error('未找到块ID')
                 return
             }
-            void openTab({
-                app: window.siyuan.ws.app,
-                doc: {
-                    id: blockId,
-                    action: ['cb-get-hl', 'cb-get-all'],
-                    zoomIn: false,
-                },
-                position: 'right',
-                keepCursor: false,
-            }).catch((err) => {
+            // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
+            try {
+                openSiYuanDoc(window.siyuan.ws.app, blockId)
+            } catch (err) {
                 console.error('跳转到笔记失败', err)
                 showMessage('跳转到笔记失败', 3000, 'error')
-            })
+            }
         }
 
         container.addEventListener('pointerdown', handlePointerDown, { passive: true })
@@ -615,15 +610,8 @@ export const InFrontOfCanvas: React.FC = () => {
                                         return
                                     }
                                     const blockId = shape.props.blockId
-                                    await openTab({
-                                        app: window.siyuan.ws.app,
-                                        doc: {
-                                            id: blockId,
-                                            action: ['cb-get-hl', 'cb-get-all'],
-                                        },
-                                        position: 'right',
-                                        keepCursor: false,
-                                    })
+                                    // 移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById
+                                    openSiYuanDoc(window.siyuan.ws.app, blockId)
                                 }}
                                 title="跳转到笔记"
                             >

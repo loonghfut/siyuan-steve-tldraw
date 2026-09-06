@@ -1,4 +1,4 @@
-import { openTab } from 'siyuan';
+import { openWhiteboardBoard } from '../../../utils/mobile-open';
 import {
     createDocWithMd,
     getBlockByID,
@@ -90,19 +90,8 @@ async function createAndOpenNewWhiteboard(
 }
 
 async function openWhiteboardTab(context: AgentActionContext, whiteboardId: string, title: string) {
-    await openTab({
-        app: context.plugin.app,
-        custom: {
-            id: context.plugin.name + 'steveTool-whiteboard',
-            title,
-            icon: 'iconSTWhiteboard',
-            data: {
-                text: 'steveTool-whiteboard' + whiteboardId,
-                rootid: whiteboardId,
-            },
-        },
-        position: 'right',
-    });
+    // 移动端 openTab 为空操作，openWhiteboardBoard 内部会路由到全屏覆盖层
+    await openWhiteboardBoard(context.plugin, whiteboardId, { title });
 }
 
 async function resolveNewWhiteboardPlacement(args: Record<string, unknown>): Promise<NewWhiteboardPlacement> {

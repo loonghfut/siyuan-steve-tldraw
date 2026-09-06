@@ -1,5 +1,5 @@
 import { moduleInstances } from "@/index";
-import { openTab } from "siyuan";
+import { openWhiteboardBoard } from "@/handwriting/tldraw/utils/mobile-open";
 
 // 添加白板按钮到文档树条目
 export function addWhiteboardButtonToFileTreeItem(item: Element) {
@@ -18,26 +18,14 @@ export function addWhiteboardButtonToFileTreeItem(item: Element) {
     iconBtn.setAttribute('aria-label', '打开白板');
     iconBtn.innerHTML = '<svg><use xlink:href="#iconSTWhiteboard"></use></svg>';
 
-    // 点击事件：打开白板
+    // 点击事件：打开白板（移动端 openTab 为空操作，openWhiteboardBoard 会路由到全屏覆盖层）
     iconBtn.addEventListener('click', async (e) => {
         e.preventDefault();
         e.stopPropagation();
         const textEl = item.querySelector('.b3-list-item__text');
         const titleText = textEl?.textContent || '白板';
         const plugin = moduleInstances['M_handwriting'].pluginInstance;
-        const tabId = plugin.name + "steveTool-whiteboard";
-        await openTab({
-            app: (window as any).siyuan.ws.app,
-            custom: {
-                id: tabId,
-                title: titleText,
-                icon: "iconSTWhiteboard",
-                data: {
-                    text: "steveTool-whiteboard" + rootid,
-                    rootid: rootid,
-                },
-            },
-        });
+        await openWhiteboardBoard(plugin, rootid, { title: titleText });
     });
 
     // 插入到 "更多" 按钮之前

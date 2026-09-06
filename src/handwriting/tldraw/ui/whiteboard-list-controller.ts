@@ -14,8 +14,9 @@
  */
 import { writable, derived, get } from 'svelte/store';
 import type { Writable, Readable } from 'svelte/store';
-import { openTab, showMessage, confirm } from 'siyuan';
+import { showMessage, confirm } from 'siyuan';
 import type { Plugin } from 'siyuan';
+import { openWhiteboardBoard, openSiYuanDoc, closeMobileWhiteboard } from '../utils/mobile-open';
 import { api } from '@frostime/siyuan-plugin-kits';
 import type { WhiteboardEntry, ProjectedPrim } from '../utils/whiteboard-utils';
 import {
@@ -459,15 +460,8 @@ export class WhiteboardListController {
             return;
         }
         try {
-            await openTab({
-                app: this.plugin.app,
-                custom: {
-                    id: this.plugin.name + 'steveTool-whiteboard',
-                    title: entry.title,
-                    icon: 'iconSTWhiteboard',
-                    data: { text: 'steveTool-whiteboard' + entry.id, rootid: entry.id },
-                },
-            });
+            // 移动端 openTab 为空操作，openWhiteboardBoard 内部会路由到全屏覆盖层
+            await openWhiteboardBoard(this.plugin, entry.id, { title: entry.title });
         } catch (e) {
             console.error('打开白板失败:', e);
             showMessage('打开白板失败', 3000, 'error');
@@ -480,11 +474,8 @@ export class WhiteboardListController {
             return;
         }
         try {
-            await openTab({
-                app: this.plugin.app,
-                doc: { id: entry.docId, action: ['cb-get-hl', 'cb-get-all'], zoomIn: false },
-                keepCursor: false,
-            });
+            // 移动端 openTab 为空操作，openSiYuanDoc 内部会改走 openMobileFileById
+            openSiYuanDoc(this.plugin.app, entry.docId);
         } catch (e) {
             console.error('打开文档失败:', e);
             showMessage('打开文档失败', 3000, 'error');
@@ -541,6 +532,8 @@ export class WhiteboardListController {
                 for (const entry of entries) {
                     try {
                         closeTab(entry.id, 'user-delete');
+                        // 移动端覆盖层里的白板没有对应页签，需显式关闭，防止自动保存写回已删除文件
+                        await closeMobileWhiteboard(entry.id);
                         const res = await WhiteboardFileManager.deleteWhiteboardFile(entry.id, {
                             reason: '删除',
                             includeTimestamp: true,
