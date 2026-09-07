@@ -439,4 +439,102 @@
     max-width: 280px;
     line-height: 1.5;
   }
+
+  /* ===================== 移动端适配（窄屏） ===================== */
+  @media (max-width: 720px) {
+    /* 主面板改为纵向：顶部横向标签 + 下方内容 */
+    .config__panel {
+      flex-direction: column;
+      height: 100%;
+      border-radius: 0;
+    }
+
+    /* 侧栏变为可横向滚动的标签条 */
+    .config__panel > .b3-tab-bar {
+      width: 100%;
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      flex-shrink: 0;
+      border-right: none;
+      border-bottom: 1px solid var(--b3-border-color);
+      padding: 6px 8px;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .config__panel .b3-list-item {
+      flex-shrink: 0;
+      white-space: nowrap;
+      padding: 8px 12px;
+      min-height: 36px;
+    }
+
+    .sidebar-gate-checkbox {
+      transform: scale(0.9);
+    }
+
+    .config__tab-wrap {
+      flex: 1;
+      min-height: 0;
+      height: auto;
+    }
+
+    .config__tab-container {
+      height: auto;
+      padding: 4px 8px;
+    }
+
+    .subgroup-buttons {
+      padding: 8px;
+      gap: 8px;
+      overflow-x: auto;
+      flex-wrap: nowrap;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .subgroup-buttons .b3-button {
+      flex-shrink: 0;
+      padding: 8px 14px;
+      min-height: 36px;
+      font-size: 0.9em;
+    }
+
+    .gate-placeholder {
+      padding: 24px 16px;
+    }
+
+    /* 表单项纵向堆叠：标题在上、控件在下，控件占满宽 */
+    :global(.config__item),
+    :global(.st-item-wrap--column) {
+      flex-direction: column !important;
+      align-items: stretch !important;
+      gap: 8px;
+    }
+
+    :global(.config__item .fn__flex-1),
+    :global(.st-item-wrap--column .fn__flex-1) {
+      width: 100%;
+    }
+
+    /* 输入/选择/滑块等固定宽控件改为满宽 */
+    :global(.fn__size200) {
+      width: 100% !important;
+      max-width: 100% !important;
+    }
+
+    :global(.b3-text-field),
+    :global(.b3-select),
+    :global(.b3-slider) {
+      max-width: 100%;
+    }
+
+    /* 开关/复选框加大触控区 */
+    :global(.b3-switch) {
+      transform: scale(1.15);
+      transform-origin: left center;
+    }
+  }
 </style>

@@ -93,14 +93,6 @@
     showMessage(`已复制为「${copy.name}」`, 2500, 'info');
   }
 
-  function renamePreset(preset: TldrawUiPreset) {
-    if (preset.builtin) { showMessage('内置方案不可重命名，请先复制为自定义方案', 2500, 'warning'); return; }
-    const name = window.prompt('重命名方案', preset.name);
-    if (name === null || !name.trim()) return;
-    const list = presets.map((p) => p.id === preset.id ? { ...p, name: name.trim(), updatedAt: Date.now() } : p);
-    emit({ list, active: config.active });
-  }
-
   function deactivate() {
     emit(withActive(null));
   }
@@ -323,7 +315,6 @@
               {/if}
               {#if !preset.builtin}
                 <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => openEdit(preset)}>编辑</button>
-                <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => renamePreset(preset)}>重命名</button>
                 <button class="b3-button b3-button--text b3-button--small preset-danger" type="button" on:click={() => deletePreset(preset)}>删除</button>
               {/if}
               <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => duplicatePresetAction(preset)}>复制</button>
@@ -397,4 +388,25 @@
   .editor-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--b3-border-color); background: var(--b3-theme-background); }
 
   .b3-button--small { padding: 2px 8px; min-height: 24px; font-size: 12px; }
+
+  /* ===================== 移动端适配（窄屏） ===================== */
+  @media (max-width: 720px) {
+    /* 列表行操作按钮换行，避免挤压 */
+    .preset-item__header { flex-wrap: wrap; row-gap: 6px; }
+    .preset-item__actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
+    .preset-item__summary { display: none; }
+
+    /* 编辑器复选框网格改单/双列，加大触控区 */
+    .editor-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 2px 8px; }
+    .editor-check { padding: 6px 0; min-height: 32px; }
+    .editor-check input[type="checkbox"] { width: 18px; height: 18px; }
+
+    /* 工具栏与页脚按钮加大 */
+    .preset-toolbar, .editor-footer { gap: 8px; }
+    .b3-button--small { padding: 6px 12px; min-height: 34px; font-size: 13px; }
+
+    /* 名称输入满宽 */
+    .editor-name-row { flex-wrap: wrap; }
+    .editor-name-input { width: 100%; }
+  }
 </style>

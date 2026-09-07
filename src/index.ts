@@ -6,7 +6,7 @@ import {
     // Menu,
     // openTab,
     // adaptHotkey,
-    // getFrontend,
+    getFrontend,
     // getBackend,
     // IModel,
     // Protyle,
@@ -173,10 +173,20 @@ export default class steveTools extends Plugin {
      */
     openSetting() {
         let panel: SettingExample | undefined;
+        // 移动端使用全宽全高对话框，桌面端保持 900px 宽
+        const isMobile = (() => {
+            try {
+                const f = getFrontend();
+                return f === "mobile" || f === "browser-mobile";
+            } catch {
+                return false;
+            }
+        })();
         const dialog = new Dialog({
             title: "ST白板设置",
             content: `<div id="SettingPanel" style="height: 100%;"></div>`,
-            width: "900px",
+            width: isMobile ? "100%" : "900px",
+            height: isMobile ? "100%" : undefined,
             destroyCallback: () => {
                 panel?.$destroy();
             }
