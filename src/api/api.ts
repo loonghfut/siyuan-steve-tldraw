@@ -542,6 +542,54 @@ export async function getBlockByID(blockId: string): Promise<Block> {
     return data[0];
 }
 
+/**
+ * 判定块是否存在。内核实现为 treenode.ExistBlockTree，读 blocktrees 库，
+ * 而 blocktrees 在事务内同步写入（Transaction.writeTree -> treenode.UpsertBlockTree），
+ * 因此 appendBlock/insertBlock 返回后立即可查。
+ * 对比：/api/query/sql 查的 blocks 表由内核每 util.SQLFlushInterval(3s) 批量提交，
+ * 刚创建的块会短暂查不到，不能用它判定“块已被删除”。
+ * 返回 null 表示接口不可用/无法判定，调用方不得据此认定块不存在。
+ */
+export async function checkBlockExist(id: BlockId): Promise<boolean | null> {
+    const res = await request('/api/block/checkBlockExist', { id });
+    return typeof res === 'boolean' ? res : null;
+}
+
+/**
+ * 批量判定块是否存在，返回 id -> 是否存在。
+ * 优先用批量接口；旧内核没有该接口时（request 会返回 "<url>error" 字符串）
+ * 回退为逐个 checkBlockExist。只写入已得出判定的 id：缺失的 key 表示“无法判定”，
+ * 调用方不得当作“不存在”，以免单个请求失败牵连整批块。
+ */
+export async function checkBlocksExist(ids: BlockId[]): Promise<Map<string, boolean>> {
+    const result = new Map<string, boolean>();
+    if (!ids.length) return result;
+
+    const res = await request('/api/block/checkBlocksExist', { ids }).catch(() => null);
+    if (res && typeof res === 'object' && !Array.isArray(res)) {
+        const batchResult = res as Record<string, unknown>;
+        for (const id of ids) {
+            const value = batchResult[id];
+            if (typeof value === 'boolean') result.set(id, value);
+        }
+        if (result.size === ids.length) return result;
+    }
+
+    // 回退/补齐：分小批并发，避免旧内核上一次打出上百个请求；
+    // 单个 id 失败只影响它自己（不写入结果 = 无法判定）
+    const pending = ids.filter((id) => !result.has(id));
+    const FALLBACK_CONCURRENCY = 8;
+    for (let i = 0; i < pending.length; i += FALLBACK_CONCURRENCY) {
+        const chunk = pending.slice(i, i + FALLBACK_CONCURRENCY);
+        const flags = await Promise.all(chunk.map((id) => checkBlockExist(id).catch(() => null)));
+        chunk.forEach((id, index) => {
+            const flag = flags[index];
+            if (typeof flag === 'boolean') result.set(id, flag);
+        });
+    }
+    return result;
+}
+
 // **************************************** Template ****************************************
 
 export async function render(id: DocumentId, path: string): Promise<IResGetTemplates> {

@@ -37,7 +37,7 @@ import { exportCardShapeToSvg } from './CardShapeExport'
 import { getCardCollapsedHeight } from './card-collapse'
 import { cacheStaticPreview, getCachedPreview, invalidatePreviewCache } from './static-preview-cache'
 import { warmCardStaticPreview } from './card-preview-warmup'
-import { invalidateBlockExistenceCache, scheduleBlockCheck } from '../utils/block-existence'
+import { invalidateBlockExistenceCache, markBlockExisting, scheduleBlockCheck } from '../utils/block-existence'
 import { clearStaticTextSelectionSoon, findStaticLinkTarget, isSteveToolsPluginUrl, openStaticLinkTarget } from '../utils/static-links'
 import { safeDestroyProtyle } from '../utils/protyle-lifecycle'
 import { runExclusiveBlockCreation } from '../utils/pending-creation'
@@ -948,6 +948,9 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 							const content = buildDefaultCardBlockMarkdown(defaultBlockType, initialTitle, idid, link)
 							const redata = await api.appendBlock("markdown", content, tldrawId!);
 							const newBlockId = redata[0].doOperations[0].id as string;
+							// appendBlock 返回时内核 blocks 表可能还没提交（util.SQLFlushInterval=3s），
+							// 先登记为存在，避免退出编辑时的存在性检查误报“找不到绑定块”
+							markBlockExisting(newBlockId);
 
 							if (defaultBlockType === 'heading' && isEditingState && !shape.props.blockId && !containerRef.current?.getAttribute('blockid') && settingdata["tldraw-prompt-card-title"] && !userTitlePromptedRef.current) {
 								userTitlePromptedRef.current = true;

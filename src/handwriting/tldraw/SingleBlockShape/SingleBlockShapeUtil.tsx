@@ -34,7 +34,7 @@ import { getCachedHtml, setCachedHtml, cacheFromProtyleHost, invalidateCache, re
 import { renderAllContentIdle } from '../utils/render/content-renderer'
 import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
 import { cancelIdleRender, isIdleRenderCancelledError, isInteracting } from '../utils/idle-scheduler'
-import { scheduleBlockCheck } from '../utils/block-existence'
+import { markBlockExisting, scheduleBlockCheck } from '../utils/block-existence'
 import { clearStaticTextSelection, findStaticLinkTarget, openStaticLinkTarget } from '../utils/static-links'
 import { safeDestroyProtyle } from '../utils/protyle-lifecycle'
 import { runExclusiveBlockCreation } from '../utils/pending-creation'
@@ -585,7 +585,11 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 							`\n{: id="${idid}" custom-st-tldraw-single="1" custom-tldraw-link="${link}" }\n\n`,
 							tldrawId!
 						)
-						return redata[0].doOperations[0].id as string
+						const newBlockId = redata[0].doOperations[0].id as string
+						// appendBlock 返回时内核 blocks 表可能还没提交（util.SQLFlushInterval=3s），
+						// 先登记为存在，避免退出编辑时的存在性检查误报“找不到绑定块”
+						markBlockExisting(newBlockId)
+						return newBlockId
 					})
 				} catch (err) {
 					console.error('创建块失败', err)
