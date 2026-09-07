@@ -66,6 +66,32 @@ export async function renderBlockQueryEmbeds(container: HTMLElement, signal?: Ab
 }
 
 /**
+ * mermaid 渲染前的防御性预处理（对齐思源内核 mermaidRender 行为）：
+ * 1) 内核对 firstElementChild.clientWidth===0 的节点走“隐藏等待”，仅监听 fold / .card__block 变化；
+ *    白板卡片中两者都不存在，命中即永不渲染 → 对 0 宽占位符强制最小宽度。
+ * 2) 静态预览缓存可能在 mermaid 异步渲染完成前写入（data-render="true" 但无 SVG），
+ *    命中后内核直接跳过 → 永久灰卡 → 对无 SVG 的 mermaid 节点摘除 data-render 强制重渲染。
+ */
+function prepareMermaidNodesForRender(container: HTMLElement): void {
+	const nodes = Array.from(container.querySelectorAll<HTMLElement>('[data-subtype="mermaid"]'))
+	for (const node of nodes) {
+		if (node.querySelector('svg')) continue
+		// 已渲染为错误态（语法错误）的节点不再强制重渲染，避免每次渲染都重复失败/闪烁
+		if (node.querySelector('.ft__error')) continue
+		// 未渲染/毒缓存：摘除标记强制内核重渲染
+		if (node.getAttribute('data-render') === 'true') node.removeAttribute('data-render')
+		// 0 宽占位符强制最小宽度，避免内核进入隐藏等待死锁
+		const placeholder = node.firstElementChild as HTMLElement | null
+		if (placeholder && placeholder.clientWidth === 0 && !placeholder.style.minWidth) {
+			placeholder.style.minWidth = '160px'
+		}
+		if (node.clientWidth === 0 && !node.style.minWidth) {
+			node.style.minWidth = '160px'
+		}
+	}
+}
+
+/**
  * 渲染容器内的所有内容
  * @param container 容器元素
  */
@@ -83,6 +109,7 @@ export async function renderAllContent(container: HTMLElement, signal?: AbortSig
 
 		// 使用思源的渲染方法
 		ProtyleMethod.mathRender(container, CDN, false)
+		prepareMermaidNodesForRender(container)
 		ProtyleMethod.mermaidRender(container, CDN)
 		ProtyleMethod.chartRender(container, CDN)
 		ProtyleMethod.mindmapRender(container, CDN)

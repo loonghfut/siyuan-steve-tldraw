@@ -83,6 +83,97 @@ const customBindingUtils = [...defaultBindingUtils, SingleBlockBindingUtil, Bezi
 const customTools = [CardShapeTool, SingleBlockShapeTool, SlideShapeTool, JsShapeTool, MindMapShapeTool, BranchShapeTool]
 const customOverlayUtils: readonly TLOverlayUtilConstructor[] = [InteractionHintOverlayUtil]
 
+// ==================== 删除思源块的预览与二次确认 ====================
+
+const BLOCK_TYPE_LABELS: Record<string, string> = {
+    d: '文档', h: '标题', p: '段落', l: '列表', i: '列表项', b: '引用块', s: '超级块',
+    c: '代码块', m: '公式', t: '表格', html: 'HTML', widget: '挂件', iframe: 'iframe', av: '数据库',
+};
+
+interface BlockDeletionPreviewItem { id: string; type: string; content: string }
+interface BlockDeletionPreview { total: number; items: BlockDeletionPreviewItem[] }
+
+function escapeHtmlText(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * 收集删除某个块时会一并删除的所有块（目标块 + 全部后代）。
+ * 删除容器块（标题/列表/引用/超级块等）会连带删除其子树，故用递归 CTE 展开。
+ */
+async function collectBlockDeletionPreview(blockId: string, limit = 20): Promise<BlockDeletionPreview> {
+    // 仅允许合法块 ID 字符，避免拼接 SQL 引入注入
+    if (!/^\d{14}-[0-9a-z]{7}$/i.test(blockId)) return { total: 0, items: [] };
+    const cte = `WITH RECURSIVE sub(id, type, content) AS (SELECT id, type, content FROM blocks WHERE id='${blockId}' UNION ALL SELECT b.id, b.type, b.content FROM blocks b JOIN sub s ON b.parent_id = s.id)`;
+    try {
+        // api.request 在 code!==0 时返回字符串而非抛异常，需显式数组判定，避免 total/items 不一致
+        const countRows = await api.sql(`${cte} SELECT COUNT(*) AS c FROM sub`);
+        if (!Array.isArray(countRows)) throw new Error('sql count failed');
+        const total = Number(countRows[0]?.c ?? 0) || 0;
+        const rows = await api.sql(`${cte} SELECT id, type, content FROM sub LIMIT ${limit}`);
+        if (!Array.isArray(rows)) throw new Error('sql list failed');
+        const items = rows.map((r: any) => ({ id: String(r.id), type: String(r.type || ''), content: String(r.content || '') }));
+        return { total, items };
+    } catch (err) {
+        console.warn('收集删除预览失败，回退为单块预览', err);
+        const block = await api.getBlockByID(blockId);
+        if (!block) return { total: 0, items: [] };
+        return { total: 1, items: [{ id: blockId, type: String(block.type || ''), content: String(block.content || '') }] };
+    }
+}
+
+/**
+ * 弹出二次确认对话框，预览将被删除的块列表。
+ * 返回 true 表示用户确认删除；取消/关闭/无可删除块返回 false。
+ */
+function confirmDeleteBlocksWithPreview(preview: BlockDeletionPreview): Promise<boolean> {
+    // 无可删除块（预览为空）时不弹窗，直接视为取消，避免对不存在的块调 deleteBlock
+    if (preview.total <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (v: boolean) => { if (!settled) { settled = true; resolve(v); } };
+
+        const rowsHtml = preview.items.map((it) => {
+            const label = BLOCK_TYPE_LABELS[it.type] || it.type || '块';
+            const snippet = (it.content || '').replace(/\s+/g, ' ').trim().slice(0, 60) || '(无内容)';
+            return `<li style="margin:2px 0;"><b>[${escapeHtmlText(label)}]</b> ${escapeHtmlText(snippet)} <code style="opacity:.6;font-size:11px">${escapeHtmlText(it.id)}</code></li>`;
+        }).join('');
+        const moreHtml = preview.total > preview.items.length
+            ? `<li style="opacity:.7">… 及其余 ${preview.total - preview.items.length} 个子块</li>`
+            : '';
+
+        const content = `
+<div style="padding:4px 2px;">
+  <p style="margin:0 0 8px;">删除该形状将同步删除 <b style="color:var(--b3-theme-error)">${preview.total}</b> 个思源块（容器块会连带其全部子块），<b>此操作不可撤销</b>：</p>
+  <div style="max-height:280px;overflow:auto;border:1px solid var(--b3-border-color);border-radius:6px;padding:8px 10px;background:var(--b3-theme-background);">
+    <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.6;">${rowsHtml}${moreHtml}</ul>
+  </div>
+  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
+    <button id="st-del-cancel" class="b3-button" type="button">取消（保留块）</button>
+    <button id="st-del-ok" class="b3-button" type="button" style="color:var(--b3-theme-error);border:1px solid var(--b3-theme-error);">确认删除 ${preview.total} 个块</button>
+  </div>
+</div>`;
+
+        const dialog = new Dialog({
+            title: '确认删除思源块',
+            content,
+            width: '480px',
+            destroyCallback: () => finish(false),
+        });
+        dialog.element.querySelector('#st-del-cancel')?.addEventListener('click', () => { finish(false); dialog.destroy(); });
+        dialog.element.querySelector('#st-del-ok')?.addEventListener('click', () => { finish(true); dialog.destroy(); });
+    });
+}
+
+// 串行化删除确认：批量删除多个 shape 时每个 shape 各触发一次删除处理，
+// 若并发弹窗会叠加 N 个模态框；用 promise 链保证同一时刻只弹一个、逐个处理。
+let deletionConfirmChain: Promise<unknown> = Promise.resolve();
+function runSerializedConfirm(task: () => Promise<boolean>): Promise<boolean> {
+    const result = deletionConfirmChain.then(task, task);
+    deletionConfirmChain = result.catch(() => false);
+    return result;
+}
+
 /**
  * TldrawManager类，用于管理tldraw实例和操作
  */
@@ -845,7 +936,12 @@ export class TldrawManager {
                         document.addEventListener('dragend', this._dragEndHandler, true);
 
                         // 添加拖放事件监听器
-                        container.addEventListener('drop', handleDrop);
+                        // handleDrop 为 async：拒绝需兜底捕获，避免未捕获异常中断拖拽流程或触发意外重载
+                        container.addEventListener('drop', (e) => {
+                            Promise.resolve(handleDrop(e)).catch((err) => {
+                                console.error('handle drop failed', err);
+                            });
+                        });
 
                         // 删除组件块逻辑 — 将不同类型的 Shape 分开处理
                         editor.sideEffects.registerAfterDeleteHandler('shape', async (shape) => {
@@ -1815,17 +1911,22 @@ export class TldrawManager {
             // 只检查其他 card 类型是否仍然引用同一 blockId
             const remainingCardsCount = this.countRemainingShapesReferencingBlock(editor, blockId, ['card']);
             if (remainingCardsCount === 0) {
-                // 如果没有其他 card 引用，可执行删除或更新属性
                 if (await api.getBlockByID(blockId)) {
+                    // SyncDelete 开启时才考虑删块，且必须经二次确认（预览将被删除的块）；
+                    // 未开启或用户取消则仅重置属性，保留原块。
                     if (settingdata['SyncDelete']) {
-                        // SyncDelete=true 的情况：删除块
-                        await api.deleteBlock(blockId);
-                        console.debug(`Deleted block ${blockId} because no other cards reference it.`);
-                    } else {
-                        // 否则只重置属性，保留块
-                        await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
-                        console.debug(`Block attribute updated for ${blockId} as no other cards reference it.`);
+                        const confirmed = await runSerializedConfirm(async () => {
+                            const preview = await collectBlockDeletionPreview(blockId);
+                            return confirmDeleteBlocksWithPreview(preview);
+                        });
+                        if (confirmed) {
+                            await api.deleteBlock(blockId);
+                            console.debug(`Deleted block ${blockId} after user confirmation.`);
+                            return;
+                        }
                     }
+                    await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0', 'custom-tldraw-link': '' });
+                    console.debug(`Block attribute updated for ${blockId} as no other cards reference it.`);
                 }
             } else {
                 console.debug(`Card deletion: ${remainingCardsCount} remaining card(s) reference block ${blockId}; skipping block update.`);
@@ -1849,13 +1950,20 @@ export class TldrawManager {
             if (remainingSingleBlockCount === 0) {
                 const block = await api.getBlockKramdown(blockId);
                 if (block) {
-                    // single-block 删除行为：默认与 card 保持一致。
+                    // SyncDelete 开启时才考虑删块，且必须经二次确认（预览将被删除的块）。
+                    let willDelete = false;
                     if (settingdata['SyncDelete']) {
+                        willDelete = await runSerializedConfirm(async () => {
+                            const preview = await collectBlockDeletionPreview(blockId);
+                            return confirmDeleteBlocksWithPreview(preview);
+                        });
+                    }
+                    if (willDelete) {
                         await api.deleteBlock(blockId);
-                        console.debug(`Deleted block ${blockId} because no other single-blocks reference it.`);
+                        console.debug(`Deleted block ${blockId} after user confirmation.`);
                     } else {
-                        await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0' , 'custom-tldraw-link': ''});
-                        // console.debug("%%%",block.markdown);
+                        // 未开启或用户取消：仅重置属性 + 清理指向本画板的链接，保留原块。
+                        await api.setBlockAttrs(blockId, { 'custom-st-tldraw': '0', 'custom-tldraw-link': '' });
                         // 只删除指向当前画板(this.id) 与该块(blockId) 的[*](...)链接
                         // 支持 https:// 和 siyuan:// 两种协议
                         const replacedMarkdown = block.kramdown.replace(/\[\*\]\(((https|siyuan):\/\/plugins\/siyuan-steve-tools\/\?[^)]+)\)/g, (match, url) => {

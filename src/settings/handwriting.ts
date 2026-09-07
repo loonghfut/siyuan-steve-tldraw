@@ -32,6 +32,7 @@ export const handwritingDefaults: Record<string, any> = {
     "copyLinkTitle": true,
     // 画板引用链接协议：https://plugins/... 或 siyuan://plugins/...
     "tldraw-link-scheme": "https",
+    // 删除卡片/单块时是否同步删除其绑定的思源块（默认关闭；开启后删除前会弹窗预览并二次确认）
     "SyncDelete": false,
     "tldraw-viewport-culling": true,
     // 白板内 Card / 单块总数达到该值后才启用"仅加载视野内形状"；0 表示不受数量限制。
@@ -138,7 +139,7 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
         {
             name: "高级设置", items: [
                 { type: "select", title: "画板数据块备用创建位置", description: "选择日记本", key: "tl-draw-create-note-id", value: ctx.settings["tl-draw-create-note-id"], options: (() => { const nb = (window as any).siyuan?.notebooks; if (!Array.isArray(nb) || !nb.length) return { "": "无可用日记本" }; return Object.fromEntries(nb.map((n: any) => [n.id, n.name])); })() },
-                { type: "checkbox", title: "同步删除(不建议启用)", description: "删除画板块时同步删除笔记块", key: "SyncDelete", value: ctx.settings["SyncDelete"] },
+                { type: "checkbox", title: "同步删除思源块", description: "删除卡片/单块且无其它形状引用时，同步删除其绑定的思源块。删除前会弹窗预览将被删除的块（含容器子块）并需二次确认；关闭则仅解除绑定、保留原块。", key: "SyncDelete", value: ctx.settings["SyncDelete"] },
                 { type: "checkbox", title: "全局禁止 JS 块执行脚本", description: "启用后所有 JS 形状将不执行脚本代码（安全模式）", key: "js-shape-disable-execution", value: ctx.settings["js-shape-disable-execution"] },
                 { type: "number", title: "最大激活形状数", description: "视口内与准入环（视口外扩区域）内各自允许保持完整内容（不进入轻量预览）的形状数量上限，两层分别计数。默认 40。", key: "tldraw-max-active-shapes", value: ctx.settings["tldraw-max-active-shapes"] },
                 { type: "number", title: "Card / 单块轻量预览阈值", description: "Card 或单块的屏幕最小边小于此像素值时只显示轻量预览；设为 0 可关闭。默认 48。", key: "tldraw-card-low-detail-threshold", value: ctx.settings["tldraw-card-low-detail-threshold"] },

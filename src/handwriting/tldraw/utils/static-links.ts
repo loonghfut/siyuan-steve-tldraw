@@ -3,7 +3,7 @@
  * 两个形状此前各自维护一份相同实现，已出现行为漂移，统一收敛到这里。
  */
 
-import { showMessage } from 'siyuan'
+import { fetchSyncPost, showMessage } from 'siyuan'
 import { openSiYuanDoc } from './mobile-open'
 
 export const SIYUAN_BLOCK_ID_RE = /\b\d{14}-[0-9a-z]{7}\b/i
@@ -88,6 +88,53 @@ export function findStaticLinkTarget(target: EventTarget | null, root: HTMLEleme
 	return null
 }
 
+/** 获取 electron ipcRenderer（仅桌面端且开启 node 集成时可用；浏览器/远程内核返回 null） */
+function getIpcRenderer(): { send: (channel: string, ...args: any[]) => void } | null {
+	try {
+		const w = window as any
+		const electron = w.require?.('electron') ?? w.electron
+		return electron?.ipcRenderer ?? null
+	} catch {
+		return null
+	}
+}
+
+/** 是否为本地附件链接（/assets/... 或 assets/...） */
+export function isAssetLink(href: string): boolean {
+	try {
+		const parsed = new URL(href, window.location.href)
+		return parsed.pathname.startsWith('/assets/')
+	} catch {
+		return href.startsWith('/assets/') || href.startsWith('assets/')
+	}
+}
+
+/**
+ * 尝试在本地用系统默认程序打开附件。
+ * 附件链接形如 https://127.0.0.1:64486/assets/xxx.xlsx，window.open 会走系统浏览器撞自签证书；
+ * 这里先经内核 /api/asset/resolveAssetPath 换算绝对路径，再经 ipc 调主进程 shell.openPath。
+ * 返回 true 表示已接管打开；false 表示调用方应回退到 window.open。
+ */
+export async function tryOpenAssetLocally(href: string): Promise<boolean> {
+	if (!isAssetLink(href)) return false
+	const ipc = getIpcRenderer()
+	if (!ipc) return false
+	try {
+		const parsed = new URL(href, window.location.href)
+		// pathname 为百分号编码，内核按字面路径查找，需先解码（中文/空格文件名）
+		const assetPath = decodeURIComponent(parsed.pathname).replace(/^\/+/, '')
+		if (!assetPath) return false
+		const res = await fetchSyncPost('/api/asset/resolveAssetPath', { path: assetPath })
+		const filePath = res?.code === 0 ? res.data : null
+		if (!filePath || typeof filePath !== 'string') return false
+		ipc.send('siyuan-cmd', { cmd: 'openPath', filePath })
+		return true
+	} catch (err) {
+		console.warn('resolve/open asset locally failed', err)
+		return false
+	}
+}
+
 /**
  * 打开静态预览中的链接目标：块引用跳转对应文档，普通链接按协议处理。
  * （移动端 openTab 为空操作，openSiYuanDoc 内部改走 openMobileFileById）
@@ -106,9 +153,12 @@ export function openStaticLinkTarget(target: { blockId: string | null; href: str
 	try {
 		if (href.startsWith('siyuan://')) {
 			window.location.href = href
-		} else {
-			window.open(href, '_blank', 'noopener')
+			return
 		}
+		// 附件链接优先本地打开（桌面端 shell.openPath），不可用时回退 window.open
+		void tryOpenAssetLocally(href).then((handled) => {
+			if (!handled) window.open(href, '_blank', 'noopener')
+		})
 	} catch (err) {
 		console.error('open static link failed', err)
 		try {
