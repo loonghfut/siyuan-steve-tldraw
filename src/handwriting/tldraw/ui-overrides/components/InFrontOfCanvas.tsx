@@ -28,7 +28,7 @@ import { armAddConnectedSingleBlock, isArmed as isAddPending } from '../../utils
 import { SlideFocusOverlay } from '../../SlideShape/SlideFocusOverlay'
 import { MermaidPasteHandler } from '../../mermaid/MermaidPasteHandler'
 import { buildCardCollapseUpdate } from '../../CardShape/card-collapse'
-import { openCardContentEditorDialog } from '../../CardShape/card-content-editor-dialog'
+import { openBlockContentEditorDialog } from '../../CardShape/card-content-editor-dialog'
 import {
     createCenterBranchForShape,
     createCenterBranchForCard,
@@ -483,10 +483,9 @@ export const InFrontOfCanvas: React.FC = () => {
                             <HoverButton
                                 style={buttonStyle}
                                 onClick={() => {
-                                    // Existing cards edit in a modal so the full Siyuan editor
-                                    // does not need to be mounted inside the canvas. New cards and
-                                    // SingleBlock shapes keep their inline creation/edit workflow.
-                                    if (!openCardContentEditorDialog(editor, selectionInfo.id)) {
+                                    // 卡片与单块统一弹窗编辑（移动端为抽屉），
+                                    // 无块 ID 的新建形状回退内联编辑以走懒创建流程
+                                    if (!openBlockContentEditorDialog(editor, selectionInfo.id)) {
                                         editor.setEditingShape(selectionInfo.id)
                                     }
                                 }}

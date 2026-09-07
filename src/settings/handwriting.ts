@@ -1,6 +1,24 @@
 import type { SettingGroupDefinition, BuildContext } from "./types";
 import { h6StyleDefaults, h6StyleGroup } from "./style-h6";
 import { DEFAULT_TLDRAW_AGENT_ACTION_NAMES } from "@/handwriting/tldraw/agent/tools/metadata";
+import {
+    ALL_TOOLBAR_TOOL_IDS,
+    ALL_UI_VISIBILITY_KEYS,
+    toolSettingKey,
+    uiSettingKey,
+} from "@/handwriting/tldraw/ui-overrides/ui-visibility";
+import {
+    UI_PRESETS_SETTING_KEY,
+    defaultPresetsConfig,
+} from "@/handwriting/tldraw/ui-overrides/ui-presets";
+
+// 工具栏工具与画板 UI 按钮显隐：全部默认显示（运行时仍通过这些 key 读取，由 UI 方案管理器统一写入）
+const toolbarVisibilityDefaults: Record<string, any> = Object.fromEntries(
+    ALL_TOOLBAR_TOOL_IDS.map((id) => [toolSettingKey(id), true])
+);
+const uiVisibilityDefaults: Record<string, any> = Object.fromEntries(
+    ALL_UI_VISIBILITY_KEYS.map((k) => [uiSettingKey(k), true])
+);
 
 export const handwritingDefaults: Record<string, any> = {
     "handwriting-enable": false,
@@ -52,6 +70,10 @@ export const handwritingDefaults: Record<string, any> = {
     "tldraw-branch-collapse-animation": false,
     "tldraw-agent-actions-enable": false,
     "tldraw-agent-enabled-actions": DEFAULT_TLDRAW_AGENT_ACTION_NAMES,
+    // UI 显隐预设方案：{ list: TldrawUiPreset[], activeId: string | null }
+    [UI_PRESETS_SETTING_KEY]: defaultPresetsConfig(),
+    ...toolbarVisibilityDefaults,
+    ...uiVisibilityDefaults,
     ...h6StyleDefaults,
 };
 
@@ -89,6 +111,17 @@ export const handwritingGroup = (ctx: BuildContext): SettingGroupDefinition => (
                 { type: "checkbox", title: "编辑新卡片时询问标题", description: "启用后，仅在编辑没有绑定思源块 ID 的普通 Card 时询问标题；Agent 创建卡片不受此设置影响", key: "tldraw-prompt-card-title", value: ctx.settings["tldraw-prompt-card-title"] },
                 { type: "checkbox", title: "文档树显示白板按钮", description: "在文档树每个条目左侧显示白板图标按钮", key: "tldraw-show-in-file-tree", value: ctx.settings["tldraw-show-in-file-tree"] },
             ]
+        },
+        {
+            name: "UI 方案",
+            items: [{
+                type: "custom",
+                title: "UI 显隐预设方案",
+                description: "管理工具栏与界面按钮的显隐方案：新建、编辑、应用、复制、删除。应用方案后需重新打开白板生效。",
+                key: UI_PRESETS_SETTING_KEY,
+                value: ctx.settings[UI_PRESETS_SETTING_KEY],
+                component: "TldrawUiPresetManager",
+            }],
         },
         {
             name: "样式设置", items: [

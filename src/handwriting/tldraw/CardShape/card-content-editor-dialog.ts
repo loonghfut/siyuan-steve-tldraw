@@ -1,20 +1,35 @@
 import { Dialog, Protyle, showMessage, TProtyleAction } from 'siyuan'
 import type { Editor, TLShapeId } from '@tldraw/tldraw'
 import type { ICardShape } from './card-shape-types'
+import type { ISingleBlockShape } from '../SingleBlockShape/single-block-shape-types'
+import { isMobileFrontend } from '../utils/mobile-open'
+
+/** 弹窗编辑支持的块形状：Card / 单块 */
+type BlockLikeShape = ICardShape | ISingleBlockShape
+
+function resolveBlockLikeShape(editor: Editor, shapeId: TLShapeId): BlockLikeShape | null {
+	const shape = editor.getShape(shapeId)
+	if (!shape) return null
+	if (shape.type !== 'card' && shape.type !== 'single-block') return null
+	const blockLike = shape as BlockLikeShape
+	// 新建但尚未落块的形状走内联编辑的懒创建流程，这里不处理
+	if (!blockLike.props.blockId) return null
+	return blockLike
+}
 
 /**
- * Opens a full-sized Siyuan editor for an existing card block.
- *
- * Card previews intentionally use a lightweight static DOM in many cases, so
- * mounting the editor in a dialog keeps editing responsive without changing
- * the canvas card's render mode. Closing the dialog refreshes the preview.
+ * 以弹窗打开块内容编辑器（Card / 单块通用）。
+ * 桌面端为居中对话框；移动端为底部抽屉，避免画布内联编辑。
+ * 关闭弹窗后通过 refreshNonce 刷新形状预览。
+ * 返回 false 表示形状不支持弹窗编辑（无块 ID 的新建形状等），调用方可回退内联编辑。
  */
-export function openCardContentEditorDialog(editor: Editor, shapeId: TLShapeId): boolean {
-	const selectedShape = editor.getShape(shapeId)
-	if (!selectedShape || selectedShape.type !== 'card') return false
+export function openBlockContentEditorDialog(editor: Editor, shapeId: TLShapeId): boolean {
+	const shape = resolveBlockLikeShape(editor, shapeId)
+	if (!shape) return false
 
-	const card = selectedShape as ICardShape
-	if (!card.props.blockId) return false
+	const isCard = shape.type === 'card'
+	const isMain = isCard ? Boolean((shape as ICardShape).props.isMain) : false
+	const isMobile = isMobileFrontend()
 
 	let protyle: Protyle | null = null
 	let cleanedUp = false
@@ -30,7 +45,7 @@ export function openCardContentEditorDialog(editor: Editor, shapeId: TLShapeId):
 		}
 
 		const latestShape = editor.getShape(shapeId)
-		if (!latestShape || latestShape.type !== 'card') return
+		if (!latestShape || (latestShape.type !== 'card' && latestShape.type !== 'single-block')) return
 
 		editor.updateShape({
 			id: latestShape.id,
@@ -43,31 +58,36 @@ export function openCardContentEditorDialog(editor: Editor, shapeId: TLShapeId):
 	}
 
 	const dialog = new Dialog({
-		title: '编辑卡片内容',
+		title: isCard ? '编辑卡片内容' : '编辑单块内容',
 		content: '<div class="b3-dialog__content" style="height: 100%; padding: 0;"><div data-card-content-editor style="height: 100%;"></div></div>',
-		width: '860px',
-		height: '70vh',
+		width: isMobile ? '100%' : '860px',
+		height: isMobile ? '78vh' : '70vh',
 		destroyCallback: cleanup,
 	})
 
+	// 移动端改为底部抽屉样式（npm 类型声明未含 containerClassName，创建后补挂）
+	if (isMobile) {
+		dialog.element.querySelector('.b3-dialog__container')?.classList.add('st-block-editor-drawer')
+	}
+
 	const host = dialog.element.querySelector<HTMLElement>('[data-card-content-editor]')
 	if (!host) {
-		showMessage('无法打开卡片编辑器', 3000, 'error')
+		showMessage('无法打开内容编辑器', 3000, 'error')
 		dialog.destroy()
 		return false
 	}
 
 	try {
 		protyle = new Protyle(window.siyuan.ws.app, host, {
-			blockId: card.props.blockId,
-			rootId: card.props.blockId,
+			blockId: shape.props.blockId,
+			rootId: shape.props.blockId,
 			mode: 'wysiwyg',
 			action: ['cb-get-all', 'cb-get-focus'] as TProtyleAction[],
 			render: {
 				breadcrumb: false,
 				gutter: true,
-				title: Boolean(card.props.isMain),
-				breadcrumbDocName: Boolean(card.props.isMain),
+				title: isMain,
+				breadcrumbDocName: isMain,
 			},
 			click: {
 				/** 点击末尾是否阻止插入新块 */
@@ -75,8 +95,8 @@ export function openCardContentEditorDialog(editor: Editor, shapeId: TLShapeId):
 			}
 		})
 	} catch (error) {
-		console.error('打开卡片编辑器失败', error)
-		showMessage('打开卡片编辑器失败', 3000, 'error')
+		console.error('打开内容编辑器失败', error)
+		showMessage('打开内容编辑器失败', 3000, 'error')
 		dialog.destroy()
 		return false
 	}

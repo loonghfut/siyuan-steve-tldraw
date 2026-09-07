@@ -5,7 +5,10 @@ import { CardShapeUtil } from './CardShape/CardShapeUtil'
 import { SingleBlockShapeTool } from './SingleBlockShape/SingleBlockShapeTool'
 import { SingleBlockShapeUtil, SingleBlockBindingUtil } from './SingleBlockShape/SingleBlockShapeUtil'
 import { BezierConnectorShapeUtil, BezierConnectorBindingUtil, PointingPort } from './BezierConnectorShape'
-import { components, uiOverrides } from './ui-overrides'
+import { buildComponents, uiOverrides } from './ui-overrides'
+import { isTldrawUiVisible } from './ui-overrides/ui-visibility'
+import { isMobileFrontend } from './utils/mobile-open'
+import { openBlockContentEditorDialog } from './CardShape/card-content-editor-dialog'
 import {
     Tldraw,
     TldrawOptions,
@@ -416,7 +419,7 @@ export class TldrawManager {
         // 生成 tldraw 组件
         const tldrawComponent = (
             <div style={{ position: 'relative', width: '100%', height: '100%' }}
-                className="tldraw__editor"
+                className={`tldraw__editor${isTldrawUiVisible('tool-lock') ? '' : ' st-hide-tool-lock'}`}
                 data-tldraw-id={this.id}
                 data-tldraw-title={this.title}>
                 <Tldraw
@@ -429,7 +432,7 @@ export class TldrawManager {
                     getShapeVisibility={getBranchShapeVisibility}
                     overrides={uiOverrides}
                     options={this.options}
-                    components={components}
+                    components={buildComponents()}
                     onMount={(editor) => {
                         this.editor = editor;
                         this.setupAgentFocusTracking(editor);
@@ -439,6 +442,25 @@ export class TldrawManager {
                         // 设置自动保存功能
                         this.setupAutosave();
                         this.setupRealtimeSync(editor);
+                        // 移动端：双击卡片/单块进入内联编辑时，改为抽屉式弹窗编辑。
+                        // 'event' 在工具状态机处理完双击后同步触发，此时先撤销编辑态，
+                        // React 提交渲染前即恢复，画布不会闪现内联编辑器。
+                        if (isMobileFrontend()) {
+                            editor.on('event', (info) => {
+                                if (info?.name !== 'double_click') return
+                                const editingId = editor.getEditingShapeId()
+                                if (!editingId) return
+                                const editingShape = editor.getShape(editingId)
+                                if (!editingShape || (editingShape.type !== 'card' && editingShape.type !== 'single-block')) return
+                                const blockId = (editingShape as { props: { blockId?: string } }).props.blockId
+                                if (!blockId) return
+                                // 同步撤销编辑态避免闪现内联编辑器，弹窗延后到事件分发结束后打开
+                                editor.setEditingShape(undefined)
+                                window.setTimeout(() => {
+                                    openBlockContentEditorDialog(editor, editingId)
+                                }, 0)
+                            })
+                        }
                         editor.on('sttools:importData', () => {
                             this.importData().catch(err => {
                                 console.error('导入数据失败:', err);

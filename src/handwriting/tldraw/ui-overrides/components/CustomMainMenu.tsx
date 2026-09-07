@@ -1,5 +1,6 @@
 /**
  * 自定义主菜单组件
+ * "更多"子菜单内各按钮的显隐由 ui-visibility 设置控制
  */
 import React from 'react'
 import {
@@ -10,14 +11,19 @@ import {
     useEditor,
 } from '@tldraw/tldraw'
 import { showMessage, confirm as syConfirm } from 'siyuan'
+import { isTldrawUiVisible, MAIN_MENU_MORE_KEYS } from '../ui-visibility'
 
 export const CustomMainMenu: React.FC = () => {
     const editor = useEditor()
+    // "更多"子菜单内的按钮全部隐藏时，整个子菜单不渲染
+    const showMoreSubmenu = MAIN_MENU_MORE_KEYS.some((key) => isTldrawUiVisible(key))
 
     return (
         <DefaultMainMenu>
             <DefaultMainMenuContent />
+            {showMoreSubmenu && (
             <TldrawUiMenuSubmenu id="sttools" label="更多">
+                {isTldrawUiVisible('backup') && (
                 <TldrawUiMenuItem
                     id="backupData"
                     label="备份数据"
@@ -26,6 +32,8 @@ export const CustomMainMenu: React.FC = () => {
                         editor.emit('sttools:backupData')
                     }}
                 />
+                )}
+                {isTldrawUiVisible('rollback') && (
                 <TldrawUiMenuItem
                     id="rollbackData"
                     label="回滚数据"
@@ -34,6 +42,8 @@ export const CustomMainMenu: React.FC = () => {
                         editor.emit('sttools:rollbackData')
                     }}
                 />
+                )}
+                {isTldrawUiVisible('import') && (
                 <TldrawUiMenuItem
                     id="importData"
                     label="导入备份数据"
@@ -42,6 +52,8 @@ export const CustomMainMenu: React.FC = () => {
                         editor.emit('sttools:importData')
                     }}
                 />
+                )}
+                {isTldrawUiVisible('export') && (
                 <TldrawUiMenuItem
                     id="exportData"
                     label="导出数据"
@@ -50,6 +62,8 @@ export const CustomMainMenu: React.FC = () => {
                         editor.emit('sttools:exportData')
                     }}
                 />
+                )}
+                {isTldrawUiVisible('prune-assets') && (
                 <TldrawUiMenuItem
                     id="pruneAssets"
                     label="清理未使用资源"
@@ -75,7 +89,9 @@ export const CustomMainMenu: React.FC = () => {
                         }
                     }}
                 />
+                )}
             </TldrawUiMenuSubmenu>
+            )}
         </DefaultMainMenu>
     )
 }

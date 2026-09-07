@@ -20,6 +20,7 @@
     import TemplateEditor from '@/settings/components/TemplateEditor.svelte';
     import StyleEditor from '@/settings/components/StyleEditor.svelte';
     import TldrawAgentActionsSettings from '@/settings/components/TldrawAgentActionsSettings.svelte';
+    import TldrawUiPresetManager from '@/settings/components/TldrawUiPresetManager.svelte';
 
     export let group: string;
     export let settingItems: ISettingItem[];
@@ -149,6 +150,14 @@
             <div class="fn__flex-1 fn__flex-column">
                 <TldrawAgentActionsSettings group={group} key={item.key} value={item.value}
                   on:changed={(e)=>dispatch('changed', { group, key: item.key, value: e.detail.value })} />
+            </div>
+        </div>
+        {/if}
+        {#if item.type === "custom" && item.component === "TldrawUiPresetManager"}
+        <div class="b3-label">
+            <div class="fn__flex-1 fn__flex-column">
+                <TldrawUiPresetManager group={group} key={item.key} value={item.value}
+                  on:changed={(e)=>dispatch('changed', { group, key: item.key, value: e.detail.value, extraUpdates: e.detail.extraUpdates })} />
             </div>
         </div>
         {/if}

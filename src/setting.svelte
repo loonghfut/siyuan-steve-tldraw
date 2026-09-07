@@ -76,6 +76,11 @@
     group: string;
     key: string;
     value: any;
+    /**
+     * 批量更新：一次写入多个设置 key（如应用 UI 预设方案时同时写入所有显隐开关）。
+     * 与主 key/value 一起在同一次 saveSettings 中持久化，避免多次写盘。
+     */
+    extraUpdates?: Record<string, any>;
   }
 
   const onChanged = ({ detail }: { detail: ChangeEvent }) => {
@@ -83,7 +88,21 @@
     const setting = settings[detail.key];
     if (setting !== undefined) {
       settings[detail.key] = detail.value;
+    }
+    // 批量更新：即使主 key 不在 settings 中（如自定义组件的复合值），extraUpdates 也要写入
+    if (detail.extraUpdates) {
+      for (const [k, v] of Object.entries(detail.extraUpdates)) {
+        settings[k] = v;
+      }
+    }
+    if (setting !== undefined || detail.extraUpdates) {
+      // 先持久化：saveSettings 内部 Object.assign(runtimeSettingdata, settings) 同步执行，
+      // 确保后续 updateGroupItems 触发的组件响应式读取到最新 settingdata
       saveSettings();
+    }
+    // 批量写入后重新同步所有面板项的显示值（如应用 UI 方案后工具栏/按钮复选框需刷新）
+    if (detail.extraUpdates) {
+      updateGroupItems();
     }
     isrefresh(detail.key);
     if (detail.key === "invert-page-enable") {
