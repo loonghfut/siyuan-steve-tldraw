@@ -18,11 +18,10 @@ import {
 	VecModel,
 	useValue,
 } from '@tldraw/tldraw'
-import { openAttributePanel, Protyle, showMessage, TProtyleAction } from 'siyuan'
+import { Protyle, showMessage, TProtyleAction } from 'siyuan'
 import * as api from '@/api/api'
 import { settingdata } from '@/index'
 import { buildTldrawLink } from '../utils/link-builder';
-import { DbAttributeBar } from './single-block-db-attributes'
 import { singleBlockShapeProps } from './single-block-shape-props'
 import { singleBlockShapeMigrations } from './single-block-shape-migrations'
 import { ISingleBlockShape } from './single-block-shape-types'
@@ -952,43 +951,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 			[isEditingState]
 		)
 
-		const handleAttrIconClick = useCallback(
-			async (e: React.MouseEvent<HTMLDivElement>) => {
-				e.preventDefault()
-				e.stopPropagation()
-				try {
-					// console.debug('打开属性面板:', shape.props.blockId)
-					const container = containerRef.current
-					const blockId = shape.props.blockId || container?.getAttribute('blockid') || ''
-					if (!blockId) return
-					if (!window.siyuan?.ws?.app) return
-					const data = await (api as any).getBlockAttrs(blockId)
-					const tempContainer = document.createElement('div')
-					const tempProtyle = new Protyle(window.siyuan.ws.app, tempContainer, {
-						blockId,
-						rootId: blockId,
-					})
-					const protyle = tempProtyle.protyle
-					openAttributePanel({
-						data,
-						focusName: 'av',
-						protyle,
-					})
-					window.setTimeout(() => {
-						safeDestroyProtyle(tempProtyle)
-					}, 0)
-				} catch (err) {
-					console.error('open attribute panel failed', err)
-					try {
-						showMessage('打开属性面板失败')
-					} catch {
-						// ignore
-					}
-				}
-			},
-			[shape.props.blockId]
-		)
-
 		// 计算当前是否需要绘制边框
 		const borderPx = shape.props.transparentBackground ? 0 : BORDER_PX
 
@@ -1022,62 +984,6 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 				onPointerMove={handlePointerEvent}
 				onPointerUp={handlePointerEvent}
 			>
-				{/* 小尺寸时不挂载属性栏及其交互 DOM。 */}
-				{!isSmallSingleBlock && <div
-					style={{
-						position: 'absolute',
-						top: '-16px',
-						right: '0px',
-						display: 'flex',
-						alignItems: 'center',
-						gap: '4px',
-						zIndex: 1000,
-						pointerEvents: 'auto',
-						minHeight: '20px',
-					}}
-				>
-					{/* 数据库属性内容 - 使用新组件 */}
-					<DbAttributeBar
-						blockId={shape.props.blockId}
-						themeColor={{
-							solid: theme[shape.props.color].solid,
-							semi: theme[shape.props.color].semi,
-						}}
-						shapeWidth={shape.props.w}
-						refreshNonce={shape.props.refreshNonce}
-					/>
-					{/* 数据库图标按钮：显示与否由 CSS :has() 依据内容中的属性视图图标决定，
-					    替代此前每个形状一个的 MutationObserver（样式在 custom-tldraw.css） */}
-					<div
-						className="st-single-block-attr-icon"
-						onClick={handleAttrIconClick}
-						onPointerDown={(e) => {
-							e.preventDefault()
-							e.stopPropagation()
-						}}
-						style={{
-							width: '20px',
-							height: '20px',
-							borderRadius: '999px',
-							backgroundColor: theme[shape.props.color].solid,
-							boxShadow: '0 0 4px rgba(0,0,0,0.3)',
-							alignItems: 'center',
-							justifyContent: 'center',
-							pointerEvents: 'auto',
-							cursor: 'pointer',
-							flexShrink: 0,
-						}}
-					>
-						<svg
-							viewBox="0 0 32 32"
-							width={14}
-							height={14}
-							style={{ fill: theme[shape.props.color].semi }}
-						>
-							<use xlinkHref="#iconDatabase" />
-						</svg>
-					</div>
-				</div>}
 				<div
 					ref={containerRef}
 					className="st-single-block-shape__content"

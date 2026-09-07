@@ -1594,12 +1594,3 @@ div.bq[data-type="NodeBlockquote"][custom-st-tldraw="1"] {
 	pointer-events: auto !important;
 	cursor: pointer;
 }
-
-/* 数据库属性图标：用 :has() 依据内容中的属性视图图标显隐，
-   替代此前每个形状一个的 subtree MutationObserver */
-.st-single-block-attr-icon {
-	display: none;
-}
-.st-single-block-shape:has(.protyle-attr--av) .st-single-block-attr-icon {
-	display: flex;
-}
