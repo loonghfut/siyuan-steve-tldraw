@@ -11,10 +11,10 @@ import {
 import { cardShapeMigrations } from './card-shape-migrations'
 import { cardShapeProps, getCardShapeDefaultProps } from './card-shape-props'
 import { CardRenderMode, ICardShape } from './card-shape-types'
-import { Protyle, showMessage, TProtyleAction } from 'siyuan';
+import { Protyle, TProtyleAction } from 'siyuan';
 import * as api from '@/api/api';
 import { settingdata } from '@/index';
-import { buildTldrawLink } from '../utils/link-builder';
+import { createCardLinkedBlock, getDefaultCardBlockType, resolveTldrawRootId } from '../utils/linked-block-creation'
 import { ContentLoadHandle, enqueueProtyleLoad, ProtyleLoadHandle } from '../protyle-load-queue'
 import { shapeLoadManager } from '../shape-load-manager'
 import { enqueueStaticPreviewLoad } from '../static-preview-load-queue'
@@ -37,14 +37,12 @@ import { exportCardShapeToSvg } from './CardShapeExport'
 import { getCardCollapsedHeight } from './card-collapse'
 import { cacheStaticPreview, getCachedPreview, invalidatePreviewCache } from './static-preview-cache'
 import { warmCardStaticPreview } from './card-preview-warmup'
-import { invalidateBlockExistenceCache, markBlockExisting, scheduleBlockCheck } from '../utils/block-existence'
+import { invalidateBlockExistenceCache, scheduleBlockCheck } from '../utils/block-existence'
 import { clearStaticTextSelectionSoon, findStaticLinkTarget, isSteveToolsPluginUrl, openStaticLinkTarget } from '../utils/static-links'
 import { safeDestroyProtyle } from '../utils/protyle-lifecycle'
-import { runExclusiveBlockCreation } from '../utils/pending-creation'
 import { MissingBlockOverlay } from '../ui/MissingBlockOverlay'
 import { useRestoreCameraOnEdit } from '../utils/use-restore-camera-on-edit'
 import { getDefaultColorTheme } from '../utils/color-theme'
-import { inputDialogSync } from '@/libs/dialog'
 import {
 	beginBranchAttachmentDrag,
 	beginBranchResize,
@@ -80,7 +78,6 @@ const NON_VIRTUALIZABLE_MEDIA_SELECTOR = [
 	'audio',
 	'iframe',
 ].join(', ')
-type DefaultCardBlockType = 'heading' | 'blockquote'
 
 function containsNonVirtualizableMedia(element: HTMLElement) {
 	return element.matches(NON_VIRTUALIZABLE_MEDIA_SELECTOR) || Boolean(element.querySelector(NON_VIRTUALIZABLE_MEDIA_SELECTOR))
@@ -97,27 +94,6 @@ function getStaticPreviewBlockLimit(height: number, fontSize: number): number {
 	const estimatedRowHeight = Math.max(28, fontSize * 1.7)
 	const visibleRows = Math.max(1, Math.ceil(Math.max(1, height) / estimatedRowHeight))
 	return Math.min(MAX_STATIC_PREVIEW_BLOCKS, Math.max(MIN_STATIC_PREVIEW_BLOCKS, visibleRows * 3))
-}
-
-function getDefaultCardBlockType(): DefaultCardBlockType {
-	return settingdata['tldraw-card-default-block-type'] === 'blockquote' ? 'blockquote' : 'heading'
-}
-
-function buildDefaultCardBlockMarkdown(
-	blockType: DefaultCardBlockType,
-	title: string,
-	blockId: string,
-	link: string,
-) {
-	const firstLine = blockType === 'blockquote' ? `> ` : `###### ${title}`
-	return (
-		firstLine +
-		'\n' +
-		'{: id="' + blockId + '" custom-st-tldraw="1" custom-tldraw-link="' + link + '" }' +
-		'\n\n' +
-		'{: custom-st-tldraw-none="1" }' +
-		'\n'
-	)
 }
 
 export class CardShapeUtil extends ShapeUtil<ICardShape> {
@@ -930,59 +906,22 @@ export class CardShapeUtil extends ShapeUtil<ICardShape> {
 				if (cancelled) return null;
 				let currentBlockId: string | null = containerRef.current?.getAttribute('blockid') || shape.props.blockId || null;
 				if (!currentBlockId) {
-					const editorElement = containerRef.current?.closest('.tldraw__editor');
-					const tldrawId = editorElement?.getAttribute('data-tldraw-id');
-					if (!settingdata["tl-draw-create-note-id"] && !tldrawId) {
-						showMessage('配置不完整,请检查设置');
-						return null;
-					}
-					try {
-						currentBlockId = await runExclusiveBlockCreation(shape.id as string, async () => {
-							const idid = await api.generateSiyuanID() as string;
-							const link = buildTldrawLink(tldrawId, idid);
-							const defaultBlockType = getDefaultCardBlockType();
-							const initialTitle = defaultBlockType === 'heading'
-								? String(settingdata["tldraw-custom-card-title"] || "${timestamp}")
-									.replace(/\$\{timestamp\}/g, () => new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }))
-								: '';
-							const content = buildDefaultCardBlockMarkdown(defaultBlockType, initialTitle, idid, link)
-							const redata = await api.appendBlock("markdown", content, tldrawId!);
-							const newBlockId = redata[0].doOperations[0].id as string;
-							// appendBlock 返回时内核 blocks 表可能还没提交（util.SQLFlushInterval=3s），
-							// 先登记为存在，避免退出编辑时的存在性检查误报“找不到绑定块”
-							markBlockExisting(newBlockId);
-
-							if (defaultBlockType === 'heading' && isEditingState && !shape.props.blockId && !containerRef.current?.getAttribute('blockid') && settingdata["tldraw-prompt-card-title"] && !userTitlePromptedRef.current) {
-								userTitlePromptedRef.current = true;
-								try {
-									const input = await inputDialogSync({
-										title: '输入卡片标题',
-										placeholder: '请输入标题',
-										width: '520px',
-										confirmOnEnter: true,
-									});
-									const userTitle = input?.replace(/[\r\n]+/g, ' ').trim() || '';
-									if (userTitle) {
-										// updateBlock 会整体替换块内容，因此必须重新附带 Card 的 IAL。
-										await api.updateBlock('markdown', buildDefaultCardBlockMarkdown(defaultBlockType, userTitle, idid, link), newBlockId);
-									}
-								} catch (err) {
-									// 标题更新失败不应影响已创建块与 Card 的绑定。
-									console.log('更新卡片标题失败，继续使用默认标题', err);
-								}
-							}
-							return newBlockId;
-						});
-					} catch (err) {
-						console.error('创建块失败', err);
-					}
+					// 建块逻辑抽到 utils/linked-block-creation，与移动端抽屉编辑共用同一次创建
+					const tldrawId = resolveTldrawRootId(containerRef.current);
+					// 标题询问只在内联编辑新建卡片时触发一次（抽屉流程可直接在抽屉里改标题），
+					// 条件与建块内部的判定保持一致，避免白白烧掉“只问一次”标记
+					const shouldPromptTitle = isEditingState && !shape.props.blockId &&
+						!containerRef.current?.getAttribute('blockid') &&
+						getDefaultCardBlockType() === 'heading' &&
+						Boolean(settingdata['tldraw-prompt-card-title']) &&
+						!userTitlePromptedRef.current;
+					if (shouldPromptTitle) userTitlePromptedRef.current = true;
+					currentBlockId = await createCardLinkedBlock(tldrawId, shape.id as string, { promptTitle: shouldPromptTitle });
 					if (cancelled) return null;
 				}
 
-				if (!currentBlockId) {
-					showMessage('未找到块');
-					return null;
-				}
+				// 失败原因（配置不完整 / 未找到块）已由 createCardLinkedBlock 提示
+				if (!currentBlockId) return null;
 
 				if (cancelled) return null;
 				containerRef.current?.setAttribute('blockid', currentBlockId);

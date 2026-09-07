@@ -67,7 +67,18 @@ export function openBlockContentEditorDialog(editor: Editor, shapeId: TLShapeId)
 
 	// 移动端改为底部抽屉样式（npm 类型声明未含 containerClassName，创建后补挂）
 	if (isMobile) {
-		dialog.element.querySelector('.b3-dialog__container')?.classList.add('st-block-editor-drawer')
+		const drawer = dialog.element.querySelector<HTMLElement>('.b3-dialog__container')
+		drawer?.classList.add('st-block-editor-drawer')
+		if (drawer) {
+			// Dialog.destroy() 只去掉外层的 b3-dialog--open，190ms(Constants.TIMEOUT_DBLCLICK)
+			// 之后才移除 DOM；遮罩点击、关闭图标、Esc、移动端返回键都走 destroy，
+			// 这里包一层给抽屉补上向下收起的过渡动画。
+			const destroyDialog = dialog.destroy.bind(dialog)
+			dialog.destroy = (options?: Parameters<typeof destroyDialog>[0]) => {
+				drawer.classList.add('st-block-editor-drawer--closing')
+				destroyDialog(options)
+			}
+		}
 	}
 
 	const host = dialog.element.querySelector<HTMLElement>('[data-card-content-editor]')

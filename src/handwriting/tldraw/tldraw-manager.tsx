@@ -9,6 +9,7 @@ import { buildComponents, uiOverrides } from './ui-overrides'
 import { isTldrawUiVisible } from './ui-overrides/ui-visibility'
 import { isMobileFrontend } from './utils/mobile-open'
 import { openBlockContentEditorDialog } from './CardShape/card-content-editor-dialog'
+import { createCardLinkedBlock, createSingleBlockLinkedBlock } from './utils/linked-block-creation'
 import {
     Tldraw,
     TldrawOptions,
@@ -480,6 +481,49 @@ export class TldrawManager {
         }, this.AUTOSAVE_DEBOUNCE_MS);
     }
 
+    /** 正在“懒创建块 + 开抽屉”的形状，用于拦住建块期间的重复双击 */
+    private readonly _mobileDrawerPendingShapeIds = new Set<string>();
+
+    /**
+     * 移动端：为还没有绑定思源块的新建 Card / 单块先懒创建块，再打开抽屉编辑器。
+     * 不再回退内联编辑，避免闪现内联编辑器并弹起软键盘；创建与形状内部流程
+     * 共用 runExclusiveBlockCreation 的互斥键，并发时不会重复建块。
+     */
+    private async openDrawerForNewBlockShape(editor: Editor, shapeId: TLShapeId, shapeType: 'card' | 'single-block') {
+        // 建块期间抽屉还没弹出、画布仍可交互，用户连续双击会重入；
+        // runExclusiveBlockCreation 只能保证不重复建块，这里再拦一层避免叠出两个抽屉
+        const pendingKey = shapeId as string;
+        if (this._mobileDrawerPendingShapeIds.has(pendingKey)) return;
+        this._mobileDrawerPendingShapeIds.add(pendingKey);
+        try {
+            // 抽屉里可以直接改标题，不再叠加一次标题输入弹窗
+            const blockId = shapeType === 'card'
+                ? await createCardLinkedBlock(this.id, pendingKey)
+                : await createSingleBlockLinkedBlock(this.id, pendingKey);
+            // 创建失败已弹过提示，不再打开空抽屉
+            if (!blockId) return;
+
+            const shape = editor.getShape(shapeId);
+            if (!shape) return;
+            if (shape.type === 'card') {
+                if (shape.props.blockId !== blockId) {
+                    // isNewlyCreated 一并置否：块已落地，不该再展示“双击编辑以创建笔记块”占位
+                    editor.updateShape({ id: shape.id, type: 'card', props: { ...shape.props, blockId, isNewlyCreated: false } });
+                }
+            } else if (shape.type === 'single-block') {
+                if (shape.props.blockId !== blockId) {
+                    editor.updateShape({ id: shape.id, type: 'single-block', props: { ...shape.props, blockId, isNewlyCreated: false } });
+                }
+            } else {
+                return;
+            }
+
+            openBlockContentEditorDialog(editor, shapeId);
+        } finally {
+            this._mobileDrawerPendingShapeIds.delete(pendingKey);
+        }
+    }
+
 
     // 兼容旧版布尔设置：true 创建单块，false 创建文本。
     private readonly doubleClickCreationType: DoubleClickCreationType = settingdata['enableDoubleClickCreateSingleBlock'] === 'text'
@@ -543,12 +587,17 @@ export class TldrawManager {
                                 if (!editingId) return
                                 const editingShape = editor.getShape(editingId)
                                 if (!editingShape || (editingShape.type !== 'card' && editingShape.type !== 'single-block')) return
+                                const shapeType = editingShape.type
                                 const blockId = (editingShape as { props: { blockId?: string } }).props.blockId
-                                if (!blockId) return
                                 // 同步撤销编辑态避免闪现内联编辑器，弹窗延后到事件分发结束后打开
                                 editor.setEditingShape(undefined)
                                 window.setTimeout(() => {
-                                    openBlockContentEditorDialog(editor, editingId)
+                                    if (blockId) {
+                                        openBlockContentEditorDialog(editor, editingId)
+                                        return
+                                    }
+                                    // 新建形状还没有绑定块：先懒创建再开抽屉，不回退内联编辑
+                                    void this.openDrawerForNewBlockShape(editor, editingId, shapeType)
                                 }, 0)
                             })
                         }

@@ -67,6 +67,22 @@
     }
 }
 
+/* 关闭：Dialog.destroy() 去掉 b3-dialog--open 后到移除 DOM 之间只有
+   190ms(Constants.TIMEOUT_DBLCLICK)，动画时长必须小于该窗口否则会被截断。
+   与 .st-block-editor-drawer 权重相同，靠后置覆盖它的 animation 与 transform */
+.b3-dialog__container.st-block-editor-drawer--closing {
+    animation: st-block-editor-drawer-down 180ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+
+@keyframes st-block-editor-drawer-down {
+    from {
+        transform: translateY(0);
+    }
+    to {
+        transform: translateY(100%);
+    }
+}
+
 /* 添加以下样式 */
 .tldraw__editor {
   .protyle-gutters {

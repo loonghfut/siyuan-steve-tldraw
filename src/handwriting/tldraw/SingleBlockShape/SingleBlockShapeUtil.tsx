@@ -18,10 +18,9 @@ import {
 	VecModel,
 	useValue,
 } from '@tldraw/tldraw'
-import { Protyle, showMessage, TProtyleAction } from 'siyuan'
-import * as api from '@/api/api'
+import { Protyle, TProtyleAction } from 'siyuan'
 import { settingdata } from '@/index'
-import { buildTldrawLink } from '../utils/link-builder';
+import { createSingleBlockLinkedBlock, resolveTldrawRootId } from '../utils/linked-block-creation'
 import { singleBlockShapeProps } from './single-block-shape-props'
 import { singleBlockShapeMigrations } from './single-block-shape-migrations'
 import { ISingleBlockShape } from './single-block-shape-types'
@@ -34,10 +33,9 @@ import { getCachedHtml, setCachedHtml, cacheFromProtyleHost, invalidateCache, re
 import { renderAllContentIdle } from '../utils/render/content-renderer'
 import { convertProtyleHtmlToDom } from '../utils/render/content-html-converter'
 import { cancelIdleRender, isIdleRenderCancelledError, isInteracting } from '../utils/idle-scheduler'
-import { markBlockExisting, scheduleBlockCheck } from '../utils/block-existence'
+import { scheduleBlockCheck } from '../utils/block-existence'
 import { clearStaticTextSelection, findStaticLinkTarget, openStaticLinkTarget } from '../utils/static-links'
 import { safeDestroyProtyle } from '../utils/protyle-lifecycle'
-import { runExclusiveBlockCreation } from '../utils/pending-creation'
 import { MissingBlockOverlay } from '../ui/MissingBlockOverlay'
 import { useRestoreCameraOnEdit } from '../utils/use-restore-camera-on-edit'
 import {
@@ -568,37 +566,11 @@ export class SingleBlockShapeUtil extends ShapeUtil<ISingleBlockShape> {
 					}
 				}
 
-				const editorElement = container.closest('.tldraw__editor')
-				const tldrawId = editorElement?.getAttribute('data-tldraw-id')
-				if (!settingdata['tl-draw-create-note-id'] && !tldrawId) {
-					showMessage('配置不完整,请检查设置')
-					return null
-				}
+				// 建块逻辑抽到 utils/linked-block-creation，与移动端抽屉编辑共用同一次创建；
+				// 失败原因（配置不完整 / 未找到块）已在内部提示
+				blockId = await createSingleBlockLinkedBlock(resolveTldrawRootId(container), shape.id as string)
 
-				try {
-					blockId = await runExclusiveBlockCreation(shape.id as string, async () => {
-						const idid = (await api.generateSiyuanID()) as string
-						const link = buildTldrawLink(tldrawId, idid)
-						// 将链接保存到自定义属性中
-						const redata = await api.appendBlock(
-							'markdown',
-							`\n{: id="${idid}" custom-st-tldraw-single="1" custom-tldraw-link="${link}" }\n\n`,
-							tldrawId!
-						)
-						const newBlockId = redata[0].doOperations[0].id as string
-						// appendBlock 返回时内核 blocks 表可能还没提交（util.SQLFlushInterval=3s），
-						// 先登记为存在，避免退出编辑时的存在性检查误报“找不到绑定块”
-						markBlockExisting(newBlockId)
-						return newBlockId
-					})
-				} catch (err) {
-					console.error('创建块失败', err)
-				}
-
-				if (!blockId) {
-					showMessage('未找到块')
-					return null
-				}
+				if (!blockId) return null
 
 				editor.updateShape({
 					id: shape.id,
