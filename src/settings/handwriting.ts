@@ -70,7 +70,7 @@ export const handwritingDefaults: Record<string, any> = {
     "tldraw-branch-collapse-animation": false,
     "tldraw-agent-actions-enable": false,
     "tldraw-agent-enabled-actions": DEFAULT_TLDRAW_AGENT_ACTION_NAMES,
-    // UI 显隐预设方案：{ list: TldrawUiPreset[], activeId: string | null }
+    // UI 显隐预设方案：{ list: TldrawUiPreset[], active: { desktop, mobile } }
     [UI_PRESETS_SETTING_KEY]: defaultPresetsConfig(),
     ...toolbarVisibilityDefaults,
     ...uiVisibilityDefaults,

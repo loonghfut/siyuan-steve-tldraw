@@ -7,6 +7,7 @@
  *
  * 内置方案不可删除/重命名，但可以被「更新」覆盖（覆盖后变为自定义方案）。
  */
+import { getFrontend } from 'siyuan'
 import {
     ALL_TOOLBAR_TOOL_IDS,
     ALL_UI_VISIBILITY_KEYS,
@@ -34,11 +35,14 @@ export interface TldrawUiPreset {
     updatedAt: number
 }
 
+/** 平台标识：桌面端 / 移动端 */
+export type UiPresetPlatform = 'desktop' | 'mobile'
+
 /** `tldraw-ui-presets` 设置项的完整结构 */
 export interface TldrawUiPresetsConfig {
     list: TldrawUiPreset[]
-    /** 当前激活的方案 id；null 表示「自定义」（未绑定任何方案） */
-    activeId: string | null
+    /** 各平台各自激活的方案 id；null 表示该平台为「自定义」（未绑定方案） */
+    active: Record<UiPresetPlatform, string | null>
 }
 
 /** 显隐快照：工具 + UI 按钮的当前布尔值集合 */
@@ -140,11 +144,11 @@ export const BUILTIN_UI_PRESETS: readonly TldrawUiPreset[] = [
     BUILTIN_DRAWING,
 ]
 
-/** 默认设置值：内置方案 + 无激活方案 */
+/** 默认设置值：内置方案 + 各平台均无激活方案 */
 export function defaultPresetsConfig(): TldrawUiPresetsConfig {
     return {
         list: BUILTIN_UI_PRESETS.map(p => ({ ...p, tools: { ...p.tools }, ui: { ...p.ui } })),
-        activeId: null,
+        active: { desktop: null, mobile: null },
     }
 }
 
@@ -291,9 +295,58 @@ export function normalizePresetsConfig(raw: unknown): TldrawUiPresetsConfig {
         }
     }
 
-    const activeId = typeof obj.activeId === 'string' && list.some(p => p.id === obj.activeId)
-        ? obj.activeId
-        : null
+    // 兼容旧版全局 activeId：迁移为两个平台共用同一方案
+    let active: Record<UiPresetPlatform, string | null>
+    if (obj.active && typeof obj.active === 'object') {
+        const pick = (v: any): string | null =>
+            typeof v === 'string' && list.some(p => p.id === v) ? v : null
+        active = { desktop: pick(obj.active.desktop), mobile: pick(obj.active.mobile) }
+    } else {
+        const legacy = typeof obj.activeId === 'string' && list.some(p => p.id === obj.activeId)
+            ? obj.activeId
+            : null
+        active = { desktop: legacy, mobile: legacy }
+    }
 
-    return { list, activeId }
+    return { list, active }
+}
+
+// ==================== 平台检测与启动应用 ====================
+
+/**
+ * 检测当前运行平台。
+ * 依赖 siyuan getFrontend()；在无法获取时默认 desktop。
+ */
+export function getCurrentPlatform(): UiPresetPlatform {
+    try {
+        const f = getFrontend()
+        return f === 'mobile' || f === 'browser-mobile' ? 'mobile' : 'desktop'
+    } catch {
+        return 'desktop'
+    }
+}
+
+/** 获取指定平台当前激活的方案（未绑定返回 null） */
+export function getActivePreset(
+    config: TldrawUiPresetsConfig,
+    platform: UiPresetPlatform,
+): TldrawUiPreset | null {
+    const id = config.active?.[platform] ?? null
+    if (!id) return null
+    return config.list.find(p => p.id === id) ?? null
+}
+
+/**
+ * 启动时将当前平台激活方案的显隐配置应用到设置对象（原地修改，不持久化）。
+ * 使各设备在加载插件后即按本平台方案渲染 UI，无需手动点击「应用」。
+ * 返回是否实际应用了某个方案。
+ */
+export function applyActivePresetOnStartup(settings: Record<string, any>): boolean {
+    if (!settings || typeof settings !== 'object') return false
+    const config = normalizePresetsConfig(settings[UI_PRESETS_SETTING_KEY])
+    const platform = getCurrentPlatform()
+    const preset = getActivePreset(config, platform)
+    if (!preset) return false
+    applyPresetToSettings(preset, settings)
+    return true
 }

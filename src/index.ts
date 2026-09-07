@@ -28,6 +28,7 @@ import { check, trackFeatureUsage } from "./stats/public-stats";
 // import * as api from "@/api"
 import SettingExample from "@/setting.svelte";
 import { PluginConfig } from "./savedata";
+import { applyActivePresetOnStartup } from "@/handwriting/tldraw/ui-overrides/ui-presets";
 
 declare global {
     interface Window {
@@ -77,6 +78,8 @@ export default class steveTools extends Plugin {
         frontEnd = window.siyuan.config.system.os;
 
         settingdata = await this.loadData(myfile);
+        // 启动时按当前平台（桌面/移动）激活的 UI 方案覆盖显隐开关（仅内存，不写盘）
+        applyActivePresetOnStartup(settingdata);
         this.runloadModule(settingdata);
         for (const moduleName in moduleInstances) {
             await moduleInstances[moduleName]?.init?.(settingdata);

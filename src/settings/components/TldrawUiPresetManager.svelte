@@ -2,9 +2,9 @@
   /**
    * 画板 UI 显隐预设方案管理器（唯一入口）
    *
-   * 列表模式：展示所有方案，支持应用/编辑/复制/重命名/删除。
+   * 列表模式：展示所有方案，支持应用/编辑/复制/重命名/删除（内置方案仅可应用/复制）。
    * 编辑模式：内嵌全部工具栏 + 界面按钮复选框，新建或修改方案后保存并应用。
-   * 数据：value = TldrawUiPresetsConfig { list, activeId }
+   * 数据：value = TldrawUiPresetsConfig { list, active: { desktop, mobile } }（按平台各自激活）
    * 应用方案时通过 extraUpdates 一次性写入所有 tldraw-tool-* / tldraw-ui-* 开关。
    */
   import { createEventDispatcher } from 'svelte';
@@ -22,8 +22,10 @@
     snapshotVisibility,
     generatePresetId,
     duplicatePreset,
+    getCurrentPlatform,
     type TldrawUiPreset,
     type TldrawUiPresetsConfig,
+    type UiPresetPlatform,
   } from '@/handwriting/tldraw/ui-overrides/ui-presets';
   import { settingdata } from '@/index';
 
@@ -33,14 +35,23 @@
 
   const dispatch = createEventDispatcher();
 
+  /** 当前运行平台（设置面板在哪个设备打开就是哪个平台） */
+  const platform: UiPresetPlatform = getCurrentPlatform();
+  const platformLabel = platform === 'mobile' ? '移动端' : '桌面端';
+
   // ==================== 派生状态 ====================
 
   $: config = normalizePresetsConfig(value);
   $: presets = config.list;
-  $: activeId = config.activeId;
+  $: activeId = config.active?.[platform] ?? null;
   $: activePreset = presets.find((p) => p.id === activeId) ?? null;
   $: currentSnapshot = (config, snapshotVisibility(settingdata as Record<string, any>));
   $: isDirty = activePreset ? !presetMatchesSnapshot(activePreset, currentSnapshot) : false;
+
+  /** 生成将当前平台激活 id 设为 next 的新 config（其它平台保持不变） */
+  function withActive(next: string | null): TldrawUiPresetsConfig {
+    return { list: presets, active: { ...config.active, [platform]: next } };
+  }
 
   function presetSummary(p: TldrawUiPreset): string {
     const toolCount = ALL_TOOLBAR_TOOL_IDS.filter((id) => p.tools[id] !== false).length;
@@ -60,22 +71,25 @@
   function applyPreset(preset: TldrawUiPreset) {
     const tmp: Record<string, any> = {};
     const updates = applyPresetToSettings(preset, tmp);
-    emit({ list: presets, activeId: preset.id }, updates);
-    showMessage(`已应用方案「${preset.name}」，重新打开白板后生效`, 3000, 'info');
+    emit(withActive(preset.id), updates);
+    showMessage(`已在${platformLabel}应用方案「${preset.name}」，重新打开白板后生效`, 3000, 'info');
   }
 
   function deletePreset(preset: TldrawUiPreset) {
     if (preset.builtin) { showMessage('内置方案不可删除', 2500, 'warning'); return; }
     syConfirm('删除方案', `确定删除方案「${preset.name}」吗？此操作不可撤销。`, () => {
       const list = presets.filter((p) => p.id !== preset.id);
-      emit({ list, activeId: activeId === preset.id ? null : activeId });
+      const active = { ...config.active };
+      if (active.desktop === preset.id) active.desktop = null;
+      if (active.mobile === preset.id) active.mobile = null;
+      emit({ list, active });
       showMessage(`方案「${preset.name}」已删除`, 2500, 'info');
     });
   }
 
   function duplicatePresetAction(preset: TldrawUiPreset) {
     const copy = duplicatePreset(preset, presets);
-    emit({ list: [...presets, copy], activeId });
+    emit({ list: [...presets, copy], active: config.active });
     showMessage(`已复制为「${copy.name}」`, 2500, 'info');
   }
 
@@ -84,11 +98,11 @@
     const name = window.prompt('重命名方案', preset.name);
     if (name === null || !name.trim()) return;
     const list = presets.map((p) => p.id === preset.id ? { ...p, name: name.trim(), updatedAt: Date.now() } : p);
-    emit({ list, activeId });
+    emit({ list, active: config.active });
   }
 
   function deactivate() {
-    emit({ list: presets, activeId: null });
+    emit(withActive(null));
   }
 
   // ==================== 编辑模式 ====================
@@ -111,8 +125,9 @@
     editorOpen = true;
   }
 
-  /** 打开编辑器：编辑已有方案 */
+  /** 打开编辑器：编辑已有方案（内置方案不可编辑） */
   function openEdit(preset: TldrawUiPreset) {
+    if (preset.builtin) { showMessage('内置方案不可编辑，可点击「复制」后编辑副本', 2500, 'warning'); return; }
     editorMode = 'edit';
     editorId = preset.id;
     editorName = preset.name;
@@ -157,9 +172,9 @@
     const preset: TldrawUiPreset = { id: savedId, name, tools: editorTools, ui: editorUi, createdAt: now, updatedAt: now };
     const tmp: Record<string, any> = {};
     const updates = applyPresetToSettings(preset, tmp);
-    emit({ list, activeId: savedId }, updates);
+    emit({ list, active: { ...config.active, [platform]: savedId } }, updates);
     editorOpen = false;
-    showMessage(`方案「${name}」已保存并应用，重新打开白板后生效`, 3000, 'info');
+    showMessage(`方案「${name}」已保存并在${platformLabel}应用，重新打开白板后生效`, 3000, 'info');
   }
 
   /** 仅保存不应用 */
@@ -179,7 +194,7 @@
         builtin: false, createdAt: now, updatedAt: now,
       }];
     }
-    emit({ list, activeId });
+    emit({ list, active: config.active });
     editorOpen = false;
     showMessage(`方案「${name}」已保存`, 2500, 'info');
   }
@@ -272,6 +287,7 @@
     <!-- ==================== 列表模式 ==================== -->
     <div class="preset-toolbar">
       <div class="preset-toolbar__info">
+        <span class="preset-platform-tag" title="当前设置面板运行平台">{platformLabel}</span>
         {#if activePreset}
           <span class="preset-active-badge">当前方案：{activePreset.name}</span>
           {#if isDirty}<span class="preset-dirty-badge" title="当前显隐设置与方案不一致">已修改</span>{/if}
@@ -305,10 +321,12 @@
               {:else}
                 <span class="preset-applied-mark">✓ 已应用</span>
               {/if}
-              <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => openEdit(preset)}>编辑</button>
+              {#if !preset.builtin}
+                <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => openEdit(preset)}>编辑</button>
+                <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => renamePreset(preset)}>重命名</button>
+                <button class="b3-button b3-button--text b3-button--small preset-danger" type="button" on:click={() => deletePreset(preset)}>删除</button>
+              {/if}
               <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => duplicatePresetAction(preset)}>复制</button>
-              <button class="b3-button b3-button--text b3-button--small" type="button" on:click={() => renamePreset(preset)}>重命名</button>
-              <button class="b3-button b3-button--text b3-button--small preset-danger" type="button" on:click={() => deletePreset(preset)}>删除</button>
             </div>
           </div>
           {#if expandedId === preset.id}
@@ -328,7 +346,7 @@
     </div>
 
     <p class="preset-hint">
-      提示：应用方案后需重新打开白板才能看到界面变化。点击「编辑」可修改方案的显隐配置，点击「＋ 新建方案」可从零创建自定义方案。
+      提示：应用方案后需重新打开白板才能看到界面变化。桌面端与移动端可各自绑定不同方案，插件启动时自动按本平台方案生效。内置方案不可编辑/重命名/删除，可「复制」后修改副本。
     </p>
   {/if}
 </div>
@@ -339,6 +357,7 @@
   /* ===== 列表模式 ===== */
   .preset-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
   .preset-toolbar__info { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .preset-platform-tag { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; border-radius: 9px; font-size: 11px; font-weight: 600; color: #fff; background: var(--b3-theme-primary); flex-shrink: 0; }
   .preset-active-badge { font-weight: 600; color: var(--b3-theme-primary); font-size: 13px; }
   .preset-active-badge--none { color: var(--b3-theme-on-surface-light); font-weight: 400; }
   .preset-dirty-badge { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: 4px; font-size: 11px; color: #fff; background: var(--b3-theme-warning, #e6a23c); }

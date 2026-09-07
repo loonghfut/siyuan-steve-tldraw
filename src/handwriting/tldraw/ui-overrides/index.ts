@@ -41,11 +41,15 @@ export {
     updatePresetFromSnapshot,
     duplicatePreset,
     normalizePresetsConfig,
+    getCurrentPlatform,
+    getActivePreset,
+    applyActivePresetOnStartup,
 } from './ui-presets'
 export type {
     TldrawUiPreset,
     TldrawUiPresetsConfig,
     VisibilitySnapshot,
+    UiPresetPlatform,
 } from './ui-presets'
 
 // 面板状态管理
